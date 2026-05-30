@@ -559,8 +559,11 @@ BEGIN
     ),
     q AS (
         SELECT *,
+            -- GREATEST(reltuples,1) guards empty/never-analyzed tables: there the base
+            -- term dominates, sf_cont clamps to sf_min, and the sf lever (rightly) has
+            -- little authority -- the threshold lever (Phase 1 follow-up) is the tool.
             pgfc_govern.snap_sf(
-                LEAST(GREATEST(eff_f - cur_base::float8 / NULLIF(reltuples, 0), v_sf_min), v_sf_max)
+                LEAST(GREATEST(eff_f - cur_base::float8 / GREATEST(reltuples, 1), v_sf_min), v_sf_max)
             ) AS sf_target
         FROM decided
     )
@@ -669,3 +672,214 @@ BEGIN
         WHERE f.relid = d.relid AND f.inhibitor_class IS NOT DISTINCT FROM d.inhibitor_class);
 END
 $fn$;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- apply(): actuate one relation's approved change (Phase 1: present but only ever
+-- called when policy.advisory_only = false, which is not the default).
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Phase 1 implements the scale-factor lever with the real safety mechanics
+-- (live-catalog no-op, ownership, baseline capture, 100ms non-blocking lock,
+-- failure recording). Batching across objectives and the actuation-economy gates
+-- (rate limits) are Phase 2.
+CREATE SEQUENCE IF NOT EXISTS pgfc_govern.batch_seq;
+
+CREATE OR REPLACE FUNCTION pgfc_govern.apply(p_tick_id bigint, p_relid oid)
+RETURNS boolean LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_act   text := 'autovacuum_vacuum_scale_factor';
+    v_dec   text;
+    v_prop  text;
+    v_live  text[];
+    v_cur   text;
+    v_relname text;
+    v_batch bigint;
+    v_base_explicit boolean;
+    v_base_value    text;
+    v_decid bigint;
+BEGIN
+    SELECT decision_id, decision, proposed_value INTO v_decid, v_dec, v_prop
+    FROM pgfc_govern.decision_log
+    WHERE tick_id = p_tick_id AND relid = p_relid AND actuator = v_act
+    ORDER BY decision_id DESC LIMIT 1;
+    IF v_dec IS DISTINCT FROM 'adjust' THEN RETURN false; END IF;
+
+    SELECT relname, reloptions INTO v_relname, v_live FROM pg_class WHERE oid = p_relid;
+    IF v_relname IS NULL THEN RETURN false; END IF;                 -- relation vanished
+
+    -- complementary to lock_timeout: don't even attempt against a busy table
+    IF EXISTS (SELECT 1 FROM pg_stat_progress_vacuum WHERE relid = p_relid) THEN
+        RETURN false;                                               -- retried next cycle
+    END IF;
+
+    v_cur := pgfc_observe.effective_reloption(v_live, v_act);       -- live ground truth
+    IF v_cur IS NOT DISTINCT FROM v_prop THEN RETURN false; END IF; -- no-op vs live
+
+    -- baseline: capture pre-governor state on first touch, never overwrite
+    SELECT baseline_explicit, baseline_value INTO v_base_explicit, v_base_value
+    FROM pgfc_govern.actuator_state WHERE relid = p_relid AND actuator = v_act;
+    IF NOT FOUND THEN
+        v_base_explicit := (v_cur IS NOT NULL);
+        v_base_value    := v_cur;
+    END IF;
+
+    v_batch := nextval('pgfc_govern.batch_seq');
+
+    BEGIN
+        SET LOCAL lock_timeout = '100ms';                           -- never wait
+        EXECUTE format('ALTER TABLE %s SET (%I = %s)', p_relid::regclass, v_act, v_prop);
+    EXCEPTION
+        WHEN lock_not_available THEN
+            INSERT INTO pgfc_govern.action_history
+              (batch_id, decision_id, relid, relname, actuator, old_value, new_value,
+               prev_reloptions, status, failure_reason, lock_wait_outcome, budget_consumed)
+            VALUES (v_batch, v_decid, p_relid, v_relname, v_act, v_cur, v_prop,
+                    v_live, 'failed', 'lock_timeout', 'timeout', false);
+            RETURN false;
+        WHEN insufficient_privilege THEN
+            INSERT INTO pgfc_govern.action_history
+              (batch_id, decision_id, relid, relname, actuator, old_value, new_value,
+               prev_reloptions, status, failure_reason, budget_consumed)
+            VALUES (v_batch, v_decid, p_relid, v_relname, v_act, v_cur, v_prop,
+                    v_live, 'failed', 'insufficient_privilege', false);
+            RETURN false;
+    END;
+
+    -- success: record baseline (first time), the action, and update actuator state
+    INSERT INTO pgfc_govern.actuator_state
+        (relid, actuator, current_value, baseline_explicit, baseline_value,
+         set_at_snapshot, av_count_at_apply)
+    VALUES (p_relid, v_act, v_prop, v_base_explicit, v_base_value,
+            (SELECT max(snapshot_id) FROM pgfc_observe.snapshots),
+            (SELECT autovacuum_count FROM pg_stat_all_tables WHERE relid = p_relid))
+    ON CONFLICT (relid, actuator) DO UPDATE SET
+        current_value     = EXCLUDED.current_value,
+        set_at_snapshot   = EXCLUDED.set_at_snapshot,
+        av_count_at_apply = EXCLUDED.av_count_at_apply;
+
+    INSERT INTO pgfc_govern.action_history
+      (batch_id, decision_id, relid, relname, actuator, old_value, new_value,
+       prev_reloptions, revert_kind, revert_value, status, lock_wait_outcome, budget_consumed)
+    VALUES (v_batch, v_decid, p_relid, v_relname, v_act, v_cur, v_prop, v_live,
+            CASE WHEN v_base_explicit THEN 'SET' ELSE 'RESET' END, v_base_value,
+            'applied', 'acquired', true);
+
+    UPDATE pgfc_govern.decision_log SET applied = true WHERE decision_id = v_decid;
+    RETURN true;
+END
+$fn$;
+COMMENT ON FUNCTION pgfc_govern.apply(bigint, oid) IS
+  'Actuate one relation''s approved scale-factor change (gated by advisory_only).';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- verify(): close the loop on past actions. Phase 1 has nothing applied to verify;
+-- expanded in Phase 2 to attribute realized outcomes against predictions.
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION pgfc_govern.verify(p_tick_id bigint)
+RETURNS integer LANGUAGE sql AS $fn$
+    SELECT 0;   -- Phase 2: attribute outcomes of earlier applied actions
+$fn$;
+COMMENT ON FUNCTION pgfc_govern.verify(bigint) IS
+  'Close the control loop on past actions (Phase 1: no-op; expanded in Phase 2).';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Orchestrators (driven by pg_cron in production; see README)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Fast loop (~1 min): observe + classify + estimate. Never actuates.
+CREATE OR REPLACE FUNCTION pgfc_govern.observe_tick()
+RETURNS bigint LANGUAGE plpgsql AS $fn$
+DECLARE v_snap bigint;
+BEGIN
+    v_snap := pgfc_observe.observe();
+    PERFORM pgfc_govern.classify(v_snap);
+    PERFORM pgfc_govern.estimate(v_snap);
+    RETURN v_snap;
+END
+$fn$;
+
+-- Control loop (~5 min): plan + (apply, only if not advisory_only) + verify.
+CREATE OR REPLACE FUNCTION pgfc_govern.control_tick()
+RETURNS bigint LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_tick bigint; v_snap bigint; v_adv boolean; v_applied integer := 0; r record;
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext('pgfc_govern.control_tick'));  -- no overlap
+    SELECT advisory_only INTO v_adv FROM pgfc_govern.policy
+      WHERE enabled ORDER BY policy_name LIMIT 1;
+    v_adv := COALESCE(v_adv, true);
+
+    SELECT max(snapshot_id) INTO v_snap FROM pgfc_observe.snapshots;
+    INSERT INTO pgfc_govern.tick_log (snapshot_id) VALUES (v_snap) RETURNING tick_id INTO v_tick;
+
+    PERFORM pgfc_govern.plan(v_tick, v_snap);
+
+    IF NOT v_adv THEN
+        FOR r IN SELECT relid FROM pgfc_govern.decision_log
+                 WHERE tick_id = v_tick AND decision = 'adjust'
+        LOOP
+            IF pgfc_govern.apply(v_tick, r.relid) THEN v_applied := v_applied + 1; END IF;
+        END LOOP;
+    END IF;
+
+    PERFORM pgfc_govern.verify(v_tick);
+
+    UPDATE pgfc_govern.tick_log SET
+        finished_at = now(), n_applied = v_applied,
+        n_decisions = (SELECT count(*) FROM pgfc_govern.decision_log WHERE tick_id = v_tick),
+        n_relations = (SELECT count(DISTINCT relid) FROM pgfc_govern.decision_log WHERE tick_id = v_tick)
+    WHERE tick_id = v_tick;
+    RETURN v_tick;
+END
+$fn$;
+COMMENT ON FUNCTION pgfc_govern.control_tick() IS
+  'One control cycle: plan, apply (only if not advisory_only), verify.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Views
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Per-relation operator view: class, target, observed state, last decision.
+CREATE OR REPLACE VIEW pgfc_govern.governor_status AS
+WITH pol AS (SELECT aggressiveness FROM pgfc_govern.policy
+             WHERE enabled ORDER BY policy_name LIMIT 1)
+SELECT rc.relid, rc.schemaname, rc.relname, rc.kind,
+       re.f_trigger_ewma AS observed_dead_fraction,          -- diagnostic (biased)
+       LEAST(GREATEST(
+           (CASE rc.kind WHEN 'queue' THEN 0.05 WHEN 'delete_heavy' THEN 0.10
+                         WHEN 'oltp' THEN 0.20 WHEN 'mixed' THEN 0.20
+                         WHEN 'append_only' THEN 0.40 WHEN 'archive' THEN 0.50 END)
+           / COALESCE(p.aggressiveness, 1.0), 0.01), 0.50)    AS target_dead_fraction,
+       re.vacuum_debt_ratio, re.freeze_debt, re.saturation_cause,
+       d.decision, d.proposed_value, d.applied, d.created_at AS last_decision_at,
+       a.current_value AS current_scale_factor
+FROM pgfc_govern.relation_class rc
+CROSS JOIN pol p
+LEFT JOIN pgfc_govern.relation_estimate re USING (relid)
+LEFT JOIN LATERAL (
+    SELECT * FROM pgfc_govern.decision_log dl
+    WHERE dl.relid = rc.relid ORDER BY dl.decision_id DESC LIMIT 1
+) d ON true
+LEFT JOIN pgfc_govern.actuator_state a
+       ON a.relid = rc.relid AND a.actuator = 'autovacuum_vacuum_scale_factor';
+
+-- Catalog-mutation health: the governor's own DDL footprint + live pg_class state.
+CREATE OR REPLACE VIEW pgfc_govern.catalog_health AS
+SELECT
+    (SELECT count(*) FROM pgfc_govern.action_history
+      WHERE status='applied' AND applied_at > now() - interval '1 hour')  AS mutations_last_hour,
+    (SELECT count(*) FROM pgfc_govern.action_history
+      WHERE status='applied' AND applied_at > now() - interval '1 day')   AS mutations_last_day,
+    (SELECT count(*) FROM pgfc_govern.action_history
+      WHERE status='failed'  AND applied_at > now() - interval '1 day')   AS failed_last_day,
+    (SELECT count(DISTINCT relid) FROM pgfc_govern.action_history
+      WHERE status='applied' AND applied_at > now() - interval '1 day')   AS relations_changed_last_day,
+    sn.pg_class_size_bytes, sn.pg_class_n_dead_tup, sn.pg_class_n_live_tup,
+    sn.pg_class_last_autovacuum, sn.collected_at
+FROM pgfc_observe.snapshots sn ORDER BY sn.snapshot_id DESC LIMIT 1;
+
+-- Unresolved maintenance-inhibitor / saturation findings, critical first.
+CREATE OR REPLACE VIEW pgfc_govern.active_diagnostics AS
+SELECT diagnostic_id, detected_at, severity, relid, inhibitor_class, recommendation, evidence
+FROM pgfc_govern.diagnostics
+WHERE resolved_at IS NULL
+ORDER BY (severity = 'critical') DESC, detected_at DESC;
