@@ -3,6 +3,6 @@
 services:
   db:
     volumes:
-      - ./pgfc_observe/install.sql:/sql/install.sql:ro
-      - ./pgfc_observe/uninstall.sql:/sql/uninstall.sql:ro
-      - ./pgfc_observe/tests:/sql/tests:ro
+      - ./pgfc_observe/install.sql:/sql/pgfc_observe/install.sql:ro
+      - ./pgfc_observe/uninstall.sql:/sql/pgfc_observe/uninstall.sql:ro
+      - ./pgfc_observe/tests:/sql/pgfc_observe/tests:ro
