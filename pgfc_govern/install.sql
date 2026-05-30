@@ -975,3 +975,194 @@ END;
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.retain(interval, interval, interval, interval) IS
   'Prune audit tables by time cutoff (decisions/actions 180d, ticks 180d, resolved diagnostics 365d); policy_history is never pruned. Returns per-table delete counts.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Storage budget + self-health + graceful degrade  (Phase 1.5 S6)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- The full governor (observe + govern) must bound its own worst-case storage. These
+-- surfaces are cross-schema and therefore live HERE, in the dependent layer: govern
+-- already reads pgfc_observe (see catalog_health), but pgfc_observe must never depend
+-- on pgfc_govern (it ships standalone as a monitoring tool). An observe-only install
+-- uses pgfc_observe.storage_budget()/self_health and the pgfc_observe prune primitives
+-- directly; this block adds the whole-system view on top.
+
+-- Operator-set total-bytes cap over BOTH schemas. NULL (default) = no cap configured,
+-- so degrade() is a no-op until an operator opts in — the governor never silently
+-- destroys telemetry. Enforced singleton (constant-true PK), mirroring
+-- pgfc_observe.collection_policy.
+CREATE TABLE IF NOT EXISTS pgfc_govern.storage_config (
+    singleton    boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    budget_bytes bigint CHECK (budget_bytes IS NULL OR budget_bytes >= 0)
+);
+COMMENT ON TABLE pgfc_govern.storage_config IS
+  'Single-row storage config (S6): budget_bytes is the total-bytes cap over both schemas that degrade() enforces. NULL = no cap (degrade is a no-op).';
+COMMENT ON COLUMN pgfc_govern.storage_config.budget_bytes IS
+  'Total on-disk cap across pgfc_observe + pgfc_govern. NULL disables degrade().';
+
+INSERT INTO pgfc_govern.storage_config (singleton) VALUES (true)
+ON CONFLICT (singleton) DO NOTHING;
+
+-- Whole-governor storage report: pgfc_observe's per-relation budget (child partitions
+-- folded into parents) plus pgfc_govern's own tables, each tagged with its schema.
+CREATE OR REPLACE FUNCTION pgfc_govern.storage_budget()
+RETURNS TABLE(schema_name text, relation text, bytes bigint, dead_tuples bigint)
+LANGUAGE sql STABLE AS $fn$
+    SELECT 'pgfc_observe'::text, ob.relation, ob.bytes, ob.dead_tuples
+    FROM pgfc_observe.storage_budget() ob
+    UNION ALL
+    SELECT 'pgfc_govern'::text, top.relname::text,
+           COALESCE(sum(pg_total_relation_size(m.relid)), 0)::bigint,
+           COALESCE(sum(st.n_dead_tup), 0)::bigint
+    FROM pg_class top
+    JOIN pg_namespace n ON n.oid = top.relnamespace
+    CROSS JOIN LATERAL (
+        SELECT top.oid AS relid
+        UNION
+        SELECT pt.relid FROM pg_partition_tree(top.oid) pt WHERE pt.relid <> top.oid
+    ) m
+    LEFT JOIN pg_stat_all_tables st ON st.relid = m.relid
+    WHERE n.nspname = 'pgfc_govern'
+      AND top.relkind IN ('r', 'p')
+      AND NOT top.relispartition
+    GROUP BY top.relname
+    ORDER BY 1, 2;
+$fn$;
+COMMENT ON FUNCTION pgfc_govern.storage_budget() IS
+  'Whole-governor storage report (S6): per-relation bytes + dead tuples across pgfc_observe and pgfc_govern, tagged by schema.';
+
+-- One-row whole-governor self-health: footprint vs configured budget. over_budget is
+-- the signal an operator (or a scheduled job) acts on by calling degrade().
+CREATE OR REPLACE VIEW pgfc_govern.self_health AS
+WITH b AS (
+    SELECT COALESCE(sum(bytes), 0)       AS total_bytes,
+           COALESCE(sum(dead_tuples), 0) AS total_dead_tuples
+    FROM pgfc_govern.storage_budget()
+), c AS (
+    SELECT budget_bytes FROM pgfc_govern.storage_config
+)
+SELECT b.total_bytes, b.total_dead_tuples, c.budget_bytes,
+       (c.budget_bytes - b.total_bytes)                                   AS bytes_under_budget,
+       (c.budget_bytes IS NOT NULL AND b.total_bytes > c.budget_bytes)    AS over_budget
+FROM b CROSS JOIN c;
+COMMENT ON VIEW pgfc_govern.self_health IS
+  'One-row whole-governor self-health (S6): total bytes + dead tuples across both schemas vs the configured budget; over_budget flags when degrade() should run.';
+
+-- Graceful-degrade prune order. When the governor's own footprint exceeds the budget,
+-- shed storage in a FIXED order from most to least disposable —
+--   raw → fine rollups → coarse rollups → routine diagnostics → actions → policy(never)
+-- — stopping as soon as the footprint is back under budget. Each level reuses the
+-- existing prune primitive with a tighter-than-routine window (this is pressure
+-- relief, not the daily job). Levels reached while already under budget are recorded
+-- as skipped, so the order is always auditable; policy_history is NEVER pruned (it is
+-- the human-owned record of intent) and is reported last as 'preserved'.
+--
+-- pgfc_observe has no separate "derived state" table to prune (S3's relation_last_state
+-- is a reconstructable cache, not durable history), so that documented tier is absent
+-- here; the order is otherwise exactly as specified.
+CREATE OR REPLACE FUNCTION pgfc_govern.degrade(
+    p_budget_bytes     bigint   DEFAULT NULL,   -- NULL => read storage_config
+    keep_raw           interval DEFAULT '1 day',
+    keep_rollup_fine   interval DEFAULT '2 days',
+    keep_rollup_coarse interval DEFAULT '30 days',
+    keep_diagnostics   interval DEFAULT '30 days',
+    keep_actions       interval DEFAULT '30 days')
+RETURNS TABLE(step integer, level text, action text, bytes_after bigint)
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_budget bigint := COALESCE(p_budget_bytes,
+                                (SELECT budget_bytes FROM pgfc_govern.storage_config));
+    v_total  bigint;
+    v_step   integer := 0;
+    v_far    interval := '1000 years';   -- "do not touch this tier" sentinel window
+BEGIN
+    -- No cap configured: nothing to enforce. Return no rows (a clean no-op).
+    IF v_budget IS NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT COALESCE(sum(bytes), 0) INTO v_total FROM pgfc_govern.storage_budget();
+
+    -- 1. Raw observations (most disposable).
+    v_step := v_step + 1;
+    IF v_total > v_budget THEN
+        PERFORM pgfc_observe.retain(keep_raw);
+        PERFORM pgfc_observe.drop_empty_partitions(keep_raw);
+        SELECT COALESCE(sum(bytes), 0) INTO v_total FROM pgfc_govern.storage_budget();
+        RETURN QUERY SELECT v_step, 'raw'::text, 'pruned'::text, v_total;
+    ELSE
+        RETURN QUERY SELECT v_step, 'raw'::text, 'skipped:under_budget'::text, v_total;
+    END IF;
+
+    -- 2. Fine (1m) rollups.
+    v_step := v_step + 1;
+    IF v_total > v_budget THEN
+        PERFORM pgfc_observe.rollup_retain(keep_rollup_fine, v_far, v_far);
+        SELECT COALESCE(sum(bytes), 0) INTO v_total FROM pgfc_govern.storage_budget();
+        RETURN QUERY SELECT v_step, 'rollups_fine'::text, 'pruned'::text, v_total;
+    ELSE
+        RETURN QUERY SELECT v_step, 'rollups_fine'::text, 'skipped:under_budget'::text, v_total;
+    END IF;
+
+    -- 3. Coarse (1h/1d) rollups.
+    v_step := v_step + 1;
+    IF v_total > v_budget THEN
+        PERFORM pgfc_observe.rollup_retain(v_far, keep_rollup_coarse, keep_rollup_coarse);
+        SELECT COALESCE(sum(bytes), 0) INTO v_total FROM pgfc_govern.storage_budget();
+        RETURN QUERY SELECT v_step, 'rollups_coarse'::text, 'pruned'::text, v_total;
+    ELSE
+        RETURN QUERY SELECT v_step, 'rollups_coarse'::text, 'skipped:under_budget'::text, v_total;
+    END IF;
+
+    -- 4. Routine (resolved) diagnostics.
+    v_step := v_step + 1;
+    IF v_total > v_budget THEN
+        PERFORM pgfc_govern.retain(v_far, v_far, v_far, keep_diagnostics);
+        SELECT COALESCE(sum(bytes), 0) INTO v_total FROM pgfc_govern.storage_budget();
+        RETURN QUERY SELECT v_step, 'diagnostics'::text, 'pruned'::text, v_total;
+    ELSE
+        RETURN QUERY SELECT v_step, 'diagnostics'::text, 'skipped:under_budget'::text, v_total;
+    END IF;
+
+    -- 5. Decisions / actions / ticks.
+    v_step := v_step + 1;
+    IF v_total > v_budget THEN
+        PERFORM pgfc_govern.retain(keep_actions, keep_actions, keep_actions, v_far);
+        SELECT COALESCE(sum(bytes), 0) INTO v_total FROM pgfc_govern.storage_budget();
+        RETURN QUERY SELECT v_step, 'actions'::text, 'pruned'::text, v_total;
+    ELSE
+        RETURN QUERY SELECT v_step, 'actions'::text, 'skipped:under_budget'::text, v_total;
+    END IF;
+
+    -- 6. Policy / policy_history — the human-owned record of intent. NEVER pruned.
+    v_step := v_step + 1;
+    RETURN QUERY SELECT v_step, 'policy'::text, 'preserved'::text, v_total;
+END
+$fn$;
+COMMENT ON FUNCTION pgfc_govern.degrade(bigint, interval, interval, interval, interval, interval) IS
+  'Graceful-degrade prune order (S6): shed storage raw→fine→coarse rollups→diagnostics→actions until under budget; policy is never pruned. No-op when no budget is configured. Returns the ordered prune log.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Additive upgrades
+-- ─────────────────────────────────────────────────────────────────────────────
+-- S6: static autovacuum reloptions on the governor's own audit/state tables. Unlike
+-- the partition-rotated observe tables, these are mutated in place (UPDATE-heavy state
+-- tables; DELETE-pruned audit tables by retain()/degrade()), so they DO accrue dead
+-- tuples and need predictable cleanup. scale_factor=0 makes the trigger a fixed row
+-- count (static, not drifting with table size). ALTER ... SET is idempotent, so this
+-- covers both fresh installs and upgrades.
+DO $reloptions$
+DECLARE
+    t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY[
+        'policy', 'policy_history', 'relation_class', 'relation_estimate',
+        'actuator_state', 'decision_log', 'action_history', 'tick_log',
+        'diagnostics', 'storage_config'
+    ] LOOP
+        EXECUTE format(
+            'ALTER TABLE pgfc_govern.%I SET ('
+            'autovacuum_vacuum_scale_factor=0, autovacuum_vacuum_threshold=200, '
+            'autovacuum_analyze_scale_factor=0, autovacuum_analyze_threshold=200)', t);
+    END LOOP;
+END
+$reloptions$;

@@ -65,6 +65,26 @@ $$;
 COMMENT ON FUNCTION pgfc_observe._month_start(integer) IS
   'UTC instant at the start of epoch-month k (inverse of _epoch_month).';
 
+-- Static autovacuum reloptions for the partitioned telemetry tables (S6). The
+-- governor maintains its own schema with EXPLICIT, STATIC settings — it must not
+-- govern itself (a control loop observing its own actuator). scale_factor=0 makes the
+-- trigger a fixed row count rather than a fraction that drifts as the table grows, so
+-- behavior is predictable regardless of size; the insert-vacuum knobs keep
+-- append-only partitions frozen well inside the retention window (anti-wraparound
+-- insurance on a high-txn cluster). The governor never samples or actuates these
+-- tables anyway — S5's own-schema and extension-owned filters exclude them — so this
+-- is purely about predictable self-maintenance, not defeating self-actuation.
+-- One source of truth, used by _ensure_partition()/_ensure_part() (new partitions)
+-- and the additive-upgrade backfill (existing partitions).
+CREATE OR REPLACE FUNCTION pgfc_observe._telemetry_reloptions()
+RETURNS text IMMUTABLE LANGUAGE sql AS $$
+    SELECT 'autovacuum_vacuum_scale_factor=0, autovacuum_vacuum_threshold=1000, '
+         || 'autovacuum_analyze_scale_factor=0, autovacuum_analyze_threshold=1000, '
+         || 'autovacuum_vacuum_insert_scale_factor=0, autovacuum_vacuum_insert_threshold=1000'
+$$;
+COMMENT ON FUNCTION pgfc_observe._telemetry_reloptions() IS
+  'Static autovacuum reloptions string applied to every telemetry/rollup partition (S6).';
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Destructive recreate  (Phase 1.5 S2 — one-time; see header)
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -486,15 +506,17 @@ BEGIN
     BEGIN
         EXECUTE format(
             'CREATE TABLE IF NOT EXISTS pgfc_observe.snapshots_p%s '
-            'PARTITION OF pgfc_observe.snapshots FOR VALUES FROM (%s) TO (%s)',
-            v_suffix, p_day, p_day + 1);
+            'PARTITION OF pgfc_observe.snapshots FOR VALUES FROM (%s) TO (%s) '
+            'WITH (%s)',
+            v_suffix, p_day, p_day + 1, pgfc_observe._telemetry_reloptions());
     EXCEPTION WHEN duplicate_table THEN NULL;   -- concurrent run created it first
     END;
     BEGIN
         EXECUTE format(
             'CREATE TABLE IF NOT EXISTS pgfc_observe.relation_samples_p%s '
-            'PARTITION OF pgfc_observe.relation_samples FOR VALUES FROM (%s) TO (%s)',
-            v_suffix, p_day, p_day + 1);
+            'PARTITION OF pgfc_observe.relation_samples FOR VALUES FROM (%s) TO (%s) '
+            'WITH (%s)',
+            v_suffix, p_day, p_day + 1, pgfc_observe._telemetry_reloptions());
     EXCEPTION WHEN duplicate_table THEN NULL;
     END;
 END
@@ -550,8 +572,9 @@ DECLARE
 BEGIN
     EXECUTE format(
         'CREATE TABLE IF NOT EXISTS pgfc_observe.%I PARTITION OF pgfc_observe.%I '
-        'FOR VALUES FROM (%s) TO (%s)',
-        p_parent || '_p' || v_suffix, p_parent, p_key, p_key + 1);
+        'FOR VALUES FROM (%s) TO (%s) WITH (%s)',
+        p_parent || '_p' || v_suffix, p_parent, p_key, p_key + 1,
+        pgfc_observe._telemetry_reloptions());
 EXCEPTION WHEN duplicate_table THEN NULL;   -- concurrent run created it first
 END
 $fn$;
@@ -1178,6 +1201,56 @@ SELECT relid, schemaname, relname,
 FROM eff;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Storage budget + self-health  (Phase 1.5 S6)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- The governor that watches the database every minute is a storage problem of its
+-- own; these two surfaces make that footprint observable so it can be bounded.
+--   storage_budget(): on-disk bytes and dead tuples per logical relation in this
+--     schema. pg_partition_tree folds every child partition into its parent, so a
+--     daily-partitioned table reports once (summed), not once per day. dead_tuples
+--     should stay near zero by construction — raw/rollup tables rotate by
+--     TRUNCATE/DROP, never DELETE — so a rising count is the signal that something is
+--     wrong (the cross-schema pgfc_govern.degrade() reads bytes to enforce a cap).
+CREATE OR REPLACE FUNCTION pgfc_observe.storage_budget()
+RETURNS TABLE(relation text, bytes bigint, dead_tuples bigint)
+LANGUAGE sql STABLE AS $fn$
+    SELECT top.relname::text,
+           COALESCE(sum(pg_total_relation_size(m.relid)), 0)::bigint,
+           COALESCE(sum(st.n_dead_tup), 0)::bigint
+    FROM pg_class top
+    JOIN pg_namespace n ON n.oid = top.relnamespace
+    -- The relation itself, plus its child partitions when partitioned. (pg_partition_tree
+    -- returns NO rows for a plain table, so it cannot stand alone here — we always seed
+    -- with top.oid and add only the descendant partitions.)
+    CROSS JOIN LATERAL (
+        SELECT top.oid AS relid
+        UNION
+        SELECT pt.relid FROM pg_partition_tree(top.oid) pt WHERE pt.relid <> top.oid
+    ) m
+    LEFT JOIN pg_stat_all_tables st ON st.relid = m.relid
+    WHERE n.nspname = 'pgfc_observe'
+      AND top.relkind IN ('r', 'p')      -- ordinary + partitioned parents
+      AND NOT top.relispartition          -- children folded in via the tree
+    GROUP BY top.relname
+    ORDER BY top.relname;
+$fn$;
+COMMENT ON FUNCTION pgfc_observe.storage_budget() IS
+  'Per-logical-relation on-disk bytes + dead tuples for the pgfc_observe schema (S6); child partitions folded into their parent.';
+
+-- Single-row self-maintenance summary: is the storage model holding? total footprint,
+-- aggregate dead tuples (should be ~0 — rotation, not DELETE), and partition counts /
+-- oldest raw partition so an operator sees rotation is actually happening.
+CREATE OR REPLACE VIEW pgfc_observe.self_health AS
+SELECT
+    (SELECT COALESCE(sum(bytes), 0)       FROM pgfc_observe.storage_budget()) AS total_bytes,
+    (SELECT COALESCE(sum(dead_tuples), 0) FROM pgfc_observe.storage_budget()) AS total_dead_tuples,
+    (SELECT count(*)        FROM pgfc_observe._partition_inventory())          AS raw_partitions,
+    (SELECT count(*)        FROM pgfc_observe._rollup_inventory())             AS rollup_partitions,
+    (SELECT min(range_start) FROM pgfc_observe._partition_inventory())         AS oldest_raw_partition;
+COMMENT ON VIEW pgfc_observe.self_health IS
+  'One-row self-maintenance summary for pgfc_observe (S6): total bytes, aggregate dead tuples, partition counts, oldest raw partition.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Retention — two-tier partition GC  (Phase 1.5 S2)
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Retention is whole-partition rotation, never row-by-row DELETE: that produces zero
@@ -1303,3 +1376,23 @@ SELECT pgfc_observe._ensure_part('rollup_1d', pgfc_observe._epoch_month(now()), 
 -- created by its CREATE UNLOGGED TABLE IF NOT EXISTS above, so it needs no ALTER here.
 ALTER TABLE pgfc_observe.relation_samples ADD COLUMN IF NOT EXISTS relfrozenxid xid;
 ALTER TABLE pgfc_observe.relation_samples ADD COLUMN IF NOT EXISTS relminmxid  xid;
+
+-- S6: static autovacuum reloptions. New partitions get them in their WITH clause
+-- (via _telemetry_reloptions in _ensure_partition/_ensure_part), but partitions
+-- created before S6 won't — parent reloptions never propagate to children. Backfill
+-- every existing raw and rollup partition idempotently (ALTER SET is a no-op when the
+-- options already match). The partitioned parents themselves have no storage, so they
+-- are skipped; the bootstrapped current-day partitions below are created with the
+-- options already set.
+DO $reloptions$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN SELECT partition FROM pgfc_observe._partition_inventory()
+             UNION ALL
+             SELECT partition FROM pgfc_observe._rollup_inventory() LOOP
+        EXECUTE format('ALTER TABLE pgfc_observe.%I SET (%s)',
+                       r.partition, pgfc_observe._telemetry_reloptions());
+    END LOOP;
+END
+$reloptions$;

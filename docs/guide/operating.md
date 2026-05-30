@@ -175,6 +175,46 @@ UPDATE pgfc_observe.collection_policy
 The filters apply at collection, so rollups and the `pgfc_govern` views inherit the
 filtered set automatically.
 
+## Watch the governor's own footprint
+
+A system that watches the database every minute is a storage liability of its own, so
+it reports and bounds its own footprint. Every telemetry and rollup partition carries
+**static** autovacuum reloptions (`scale_factor = 0` plus a fixed threshold) and the
+`pgfc_govern` audit/state tables carry matching settings — the governor maintains its
+own schema explicitly rather than governing itself. See it with:
+
+```sql
+-- per-relation bytes + dead tuples (dead tuples should stay near zero — the raw and
+-- rollup tables rotate by TRUNCATE/DROP, never DELETE):
+SELECT * FROM pgfc_observe.storage_budget();      -- observe schema only
+SELECT * FROM pgfc_govern.storage_budget();       -- both schemas, tagged
+
+-- one-row summaries:
+SELECT * FROM pgfc_observe.self_health;            -- observe footprint + partition counts
+SELECT * FROM pgfc_govern.self_health;             -- whole-governor footprint vs the cap
+```
+
+By default there is no cap and nothing is ever auto-pruned beyond the routine
+retention above. To bound worst-case growth, set a total-bytes cap (across **both**
+schemas) and let `degrade()` enforce it:
+
+```sql
+UPDATE pgfc_govern.storage_config SET budget_bytes = 2 * 1024 * 1024 * 1024;  -- 2 GB
+SELECT * FROM pgfc_govern.degrade();   -- prunes only while over budget
+```
+
+`degrade()` sheds storage in a **fixed order, most disposable first** — raw
+observations → fine (1m) rollups → coarse (1h/1d) rollups → resolved diagnostics →
+decisions/actions — and stops the moment the footprint is back under budget; the
+levels it never reached are reported as `skipped`. Policy and `policy_history` (the
+human-owned record of intent) are **never** pruned. With no `budget_bytes` configured
+`degrade()` does nothing, so it can never silently destroy telemetry. Drive it off the
+`over_budget` flag, or schedule it after the routine retention jobs:
+
+```sql
+SELECT cron.schedule('pgfc_govern_degrade', '27 3 * * *', $$SELECT pgfc_govern.degrade()$$);
+```
+
 ## Enabling active control
 
 > **Phase status.** Active control is **experimental** in this release. `apply()`
