@@ -2,7 +2,7 @@
 -- Synthetic snapshots with known deltas; estimate() is always called on the newest
 -- snapshot (matching production), so maintenance_debt's "latest" lines up.
 BEGIN;
-SELECT plan(12);
+SELECT plan(14);
 
 -- helper header values reused below
 -- thresholds: vacuum = 50 + 0.2*1000 = 250 ; analyze = 50 + 0.1*1000 = 150
@@ -126,6 +126,33 @@ SELECT is((SELECT saturation_cause FROM pgfc_govern.relation_estimate WHERE reli
           'inhibited', 'inhibited cause declared after the candidate persists 3 cycles');
 SELECT is((SELECT saturation_streak FROM pgfc_govern.relation_estimate WHERE relid = 90004),
           3, 'saturation_streak reached 3');
+
+-- ── live freeze debt across a skipped (quiet) snapshot (S3 safety property) ────
+-- 90005 is sampled once with a RAW relfrozenxid (an old xid => large live age) and a
+-- deliberately stale stored relfrozenxid_age (5); the next snapshot omits it (it went
+-- quiet). estimate() on that later snapshot must derive its freeze debt from the LIVE
+-- age of the raw xid, not the stale stored age -- the wraparound-safety justification
+-- for sparse storage, exercised end-to-end through current_relation_state ->
+-- maintenance_debt -> estimate. (Within one test txn the cluster xid is fixed, so
+-- age('100') is identical on both sides of the equality.)
+INSERT INTO pgfc_observe.snapshots (server_version_num, def_freeze_max_age, collected_at)
+VALUES (170000, 200000000, now() - interval '120 seconds');
+INSERT INTO pgfc_observe.relation_samples
+  (snapshot_id, relid, schemaname, relname, n_dead_tup, reltuples, relfrozenxid_age, relfrozenxid)
+VALUES ((SELECT max(snapshot_id) FROM pgfc_observe.snapshots),
+        90005, 'public', 'frz_quiet', 0, 1000, 5, '100'::xid);
+INSERT INTO pgfc_observe.snapshots (server_version_num, def_freeze_max_age, collected_at)
+VALUES (170000, 200000000, now());     -- later snapshot, no sample for 90005
+SELECT pgfc_govern.estimate((SELECT max(snapshot_id) FROM pgfc_observe.snapshots));
+
+SELECT is(
+    (SELECT round(freeze_debt::numeric, 9) FROM pgfc_govern.relation_estimate WHERE relid = 90005),
+    round((age('100'::xid)::float8 / 200000000)::numeric, 9),
+    'estimate() freeze_debt tracks the LIVE freeze age across a skipped quiet snapshot');
+SELECT cmp_ok(
+    (SELECT freeze_debt FROM pgfc_govern.relation_estimate WHERE relid = 90005),
+    '>', (5::float8 / 200000000),
+    'live freeze_debt exceeds the stale stored-age value (raw-xid path, not the fallback)');
 
 SELECT * FROM finish();
 ROLLBACK;

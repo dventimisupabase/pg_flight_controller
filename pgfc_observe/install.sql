@@ -1,4 +1,4 @@
--- pgfc_observe — Observe + Orient (Phase 0; partition storage Phase 1.5 S2)
+-- pgfc_observe — Observe + Orient (Phase 0; partition storage 1.5 S2; sparse 1.5 S3)
 --
 -- Read-only telemetry for the pg_flight_controller autovacuum governor: periodic
 -- snapshots of autovacuum-relevant state. Writes only to its own schema.
@@ -142,8 +142,15 @@ CREATE TABLE IF NOT EXISTS pgfc_observe.relation_samples (
     reltuples            real,
     relpages             integer,
     relallvisible        integer,
-    relfrozenxid_age     bigint,         -- age(relfrozenxid)
-    relminmxid_age       bigint,         -- mxid_age(relminmxid)
+    relfrozenxid_age     bigint,         -- age(relfrozenxid) at write time (legacy; readers recompute live)
+    relminmxid_age       bigint,         -- mxid_age(relminmxid) at write time (legacy; readers recompute live)
+    -- Raw frozen xids (S3). age()/mxid_age() tick up globally every minute, so the
+    -- *_age columns above cannot be part of the change signature without making every
+    -- relation look changed every run. The raw xids are stable until the table is
+    -- frozen, so they ARE the signature key; readers compute the current age live from
+    -- them (see current_relation_state()). Nullable: pre-S3 rows have only the ages.
+    relfrozenxid         xid,
+    relminmxid           xid,
     relation_size_bytes  bigint,
     total_size_bytes     bigint,
     -- rollback baseline for the governor: the table's explicit autovacuum reloptions
@@ -165,6 +172,50 @@ CREATE INDEX IF NOT EXISTS snapshots_collected_day_brin
     ON pgfc_observe.snapshots USING brin (collected_day);
 CREATE INDEX IF NOT EXISTS relation_samples_collected_day_brin
     ON pgfc_observe.relation_samples USING brin (collected_day);
+
+-- Last observed state per relation — the O(1) "did this change?" side table (S3).
+-- One row per live relation, holding exactly the columns that form the change
+-- signature (every event-driven observable, plus the raw frozen xids — never the
+-- derived ages, which tick up globally). observe() upserts it every run and writes a
+-- relation_samples row only where the current state differs from the stored row.
+--   UNLOGGED: it is a cache that is exactly reconstructable from the catalogs, so it
+--             need not survive a crash. After a crash it is empty and the next
+--             observe() simply re-samples every relation once (a self-healing rebuild).
+--   fillfactor=70 + only the relid PK (no index on the mutable columns): every update
+--             is the same row's columns changing, so HOT updates keep it tiny and
+--             effectively bloat-free between its own (aggressive, static) autovacuums.
+CREATE UNLOGGED TABLE IF NOT EXISTS pgfc_observe.relation_last_state (
+    relid                oid PRIMARY KEY,
+    schemaname           name,
+    relname              name,
+    n_live_tup           bigint,
+    n_dead_tup           bigint,
+    n_mod_since_analyze  bigint,
+    n_ins_since_vacuum   bigint,
+    n_tup_ins            bigint,
+    n_tup_upd            bigint,
+    n_tup_del            bigint,
+    n_tup_hot_upd        bigint,
+    last_autovacuum      timestamptz,
+    last_autoanalyze     timestamptz,
+    vacuum_count         bigint,
+    autovacuum_count     bigint,
+    analyze_count        bigint,
+    autoanalyze_count    bigint,
+    total_autovacuum_time double precision,
+    reltuples            real,
+    relpages             integer,
+    relallvisible        integer,
+    relfrozenxid         xid,
+    relminmxid           xid,
+    relation_size_bytes  bigint,
+    total_size_bytes     bigint,
+    reloptions           text[]
+) WITH (fillfactor = 70,
+        autovacuum_vacuum_scale_factor   = 0.0, autovacuum_vacuum_threshold   = 50,
+        autovacuum_analyze_scale_factor  = 0.0, autovacuum_analyze_threshold  = 50);
+COMMENT ON TABLE pgfc_observe.relation_last_state IS
+  'UNLOGGED last-observed state per relation: the change-signature cache for sparse logging (S3). Rebuilt from the catalogs after a crash.';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Helpers
@@ -345,75 +396,213 @@ BEGIN
     WHERE c.relid = 'pg_catalog.pg_class'::regclass
     RETURNING snapshot_id INTO v_snapshot_id;
 
-    -- Per-relation samples. total_autovacuum_time exists only on PG18+, so the
-    -- column reference is built per major version (one code path, not dynamic DML).
+    -- Per-relation samples, sparse (S3): write a relation_samples row only where the
+    -- current observed state differs from relation_last_state, then refresh the side
+    -- table. One data-modifying statement: `cur` (current catalog state) is computed
+    -- once and shared; `chg` diffs it against the PRIOR last_state (CTEs see the
+    -- statement-start snapshot, so the upsert below does not perturb the diff); `ins`
+    -- writes the changed rows; the trailing INSERT upserts last_state for EVERY current
+    -- relation (data-modifying CTEs always run to completion even when unreferenced).
+    -- The change signature is every event-driven observable plus the RAW frozen xids;
+    -- the derived *_age columns are deliberately excluded (they tick up globally every
+    -- run and would defeat sparsity), and are stored only for human/legacy reads —
+    -- current_relation_state() recomputes them live. total_autovacuum_time is a PG18+
+    -- column, so its source expression is built per major version.
     v_tat_expr := CASE WHEN current_setting('server_version_num')::int >= 180000
                        THEN 's.total_autovacuum_time'
                        ELSE 'NULL::double precision' END;
 
     EXECUTE format($q$
-        INSERT INTO pgfc_observe.relation_samples (
-            snapshot_id, collected_day, relid, schemaname, relname,
+        WITH cur AS (
+            SELECT
+                s.relid, s.schemaname, s.relname,
+                s.n_live_tup, s.n_dead_tup, s.n_mod_since_analyze, s.n_ins_since_vacuum,
+                s.n_tup_ins, s.n_tup_upd, s.n_tup_del, s.n_tup_hot_upd,
+                s.last_autovacuum, s.last_autoanalyze,
+                s.vacuum_count, s.autovacuum_count, s.analyze_count, s.autoanalyze_count,
+                %s                              AS total_autovacuum_time,
+                c.reltuples, c.relpages, c.relallvisible,
+                c.relfrozenxid, c.relminmxid,
+                pg_relation_size(s.relid)       AS relation_size_bytes,
+                pg_total_relation_size(s.relid) AS total_size_bytes,
+                c.reloptions
+            FROM pg_stat_all_tables s
+            JOIN pg_class c ON c.oid = s.relid
+            WHERE s.schemaname NOT IN
+                  ('pg_catalog','information_schema','pgfc_observe','pgfc_govern')
+              AND c.relkind IN ('r','m','p')
+        ),
+        chg AS (
+            SELECT cur.* FROM cur
+            LEFT JOIN pgfc_observe.relation_last_state ls ON ls.relid = cur.relid
+            WHERE ls.relid IS NULL
+               OR ROW(ls.schemaname, ls.relname,
+                      ls.n_live_tup, ls.n_dead_tup, ls.n_mod_since_analyze, ls.n_ins_since_vacuum,
+                      ls.n_tup_ins, ls.n_tup_upd, ls.n_tup_del, ls.n_tup_hot_upd,
+                      ls.last_autovacuum, ls.last_autoanalyze,
+                      ls.vacuum_count, ls.autovacuum_count, ls.analyze_count, ls.autoanalyze_count,
+                      ls.total_autovacuum_time, ls.reltuples, ls.relpages, ls.relallvisible,
+                      ls.relfrozenxid, ls.relminmxid,
+                      ls.relation_size_bytes, ls.total_size_bytes, ls.reloptions)
+                  IS DISTINCT FROM
+                  ROW(cur.schemaname, cur.relname,
+                      cur.n_live_tup, cur.n_dead_tup, cur.n_mod_since_analyze, cur.n_ins_since_vacuum,
+                      cur.n_tup_ins, cur.n_tup_upd, cur.n_tup_del, cur.n_tup_hot_upd,
+                      cur.last_autovacuum, cur.last_autoanalyze,
+                      cur.vacuum_count, cur.autovacuum_count, cur.analyze_count, cur.autoanalyze_count,
+                      cur.total_autovacuum_time, cur.reltuples, cur.relpages, cur.relallvisible,
+                      cur.relfrozenxid, cur.relminmxid,
+                      cur.relation_size_bytes, cur.total_size_bytes, cur.reloptions)
+        ),
+        ins AS (
+            INSERT INTO pgfc_observe.relation_samples (
+                snapshot_id, collected_day, relid, schemaname, relname,
+                n_live_tup, n_dead_tup, n_mod_since_analyze, n_ins_since_vacuum,
+                n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd,
+                last_autovacuum, last_autoanalyze,
+                vacuum_count, autovacuum_count, analyze_count, autoanalyze_count,
+                total_autovacuum_time, reltuples, relpages, relallvisible,
+                relfrozenxid_age, relminmxid_age, relfrozenxid, relminmxid,
+                relation_size_bytes, total_size_bytes, reloptions)
+            SELECT
+                $1, $2, chg.relid, chg.schemaname, chg.relname,
+                chg.n_live_tup, chg.n_dead_tup, chg.n_mod_since_analyze, chg.n_ins_since_vacuum,
+                chg.n_tup_ins, chg.n_tup_upd, chg.n_tup_del, chg.n_tup_hot_upd,
+                chg.last_autovacuum, chg.last_autoanalyze,
+                chg.vacuum_count, chg.autovacuum_count, chg.analyze_count, chg.autoanalyze_count,
+                chg.total_autovacuum_time, chg.reltuples, chg.relpages, chg.relallvisible,
+                CASE WHEN chg.relfrozenxid::text <> '0' THEN age(chg.relfrozenxid) END,
+                CASE WHEN chg.relminmxid::text  <> '0' THEN mxid_age(chg.relminmxid) END,
+                chg.relfrozenxid, chg.relminmxid,
+                chg.relation_size_bytes, chg.total_size_bytes, chg.reloptions
+            FROM chg
+            RETURNING 1
+        )
+        INSERT INTO pgfc_observe.relation_last_state AS ls (
+            relid, schemaname, relname,
             n_live_tup, n_dead_tup, n_mod_since_analyze, n_ins_since_vacuum,
             n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd,
             last_autovacuum, last_autoanalyze,
             vacuum_count, autovacuum_count, analyze_count, autoanalyze_count,
-            total_autovacuum_time,
-            reltuples, relpages, relallvisible,
-            relfrozenxid_age, relminmxid_age,
-            relation_size_bytes, total_size_bytes, reloptions)
+            total_autovacuum_time, reltuples, relpages, relallvisible,
+            relfrozenxid, relminmxid, relation_size_bytes, total_size_bytes, reloptions)
         SELECT
-            $1, $2, s.relid, s.schemaname, s.relname,
-            s.n_live_tup, s.n_dead_tup, s.n_mod_since_analyze, s.n_ins_since_vacuum,
-            s.n_tup_ins, s.n_tup_upd, s.n_tup_del, s.n_tup_hot_upd,
-            s.last_autovacuum, s.last_autoanalyze,
-            s.vacuum_count, s.autovacuum_count, s.analyze_count, s.autoanalyze_count,
-            %s,
-            c.reltuples, c.relpages, c.relallvisible,
-            CASE WHEN c.relfrozenxid::text <> '0' THEN age(c.relfrozenxid) END,
-            CASE WHEN c.relminmxid::text  <> '0' THEN mxid_age(c.relminmxid) END,
-            pg_relation_size(s.relid), pg_total_relation_size(s.relid),
-            c.reloptions
-        FROM pg_stat_all_tables s
-        JOIN pg_class c ON c.oid = s.relid
-        WHERE s.schemaname NOT IN
-              ('pg_catalog','information_schema','pgfc_observe','pgfc_govern')
-          AND c.relkind IN ('r','m','p')
+            cur.relid, cur.schemaname, cur.relname,
+            cur.n_live_tup, cur.n_dead_tup, cur.n_mod_since_analyze, cur.n_ins_since_vacuum,
+            cur.n_tup_ins, cur.n_tup_upd, cur.n_tup_del, cur.n_tup_hot_upd,
+            cur.last_autovacuum, cur.last_autoanalyze,
+            cur.vacuum_count, cur.autovacuum_count, cur.analyze_count, cur.autoanalyze_count,
+            cur.total_autovacuum_time, cur.reltuples, cur.relpages, cur.relallvisible,
+            cur.relfrozenxid, cur.relminmxid, cur.relation_size_bytes, cur.total_size_bytes, cur.reloptions
+        FROM cur
+        ON CONFLICT (relid) DO UPDATE SET
+            schemaname = EXCLUDED.schemaname, relname = EXCLUDED.relname,
+            n_live_tup = EXCLUDED.n_live_tup, n_dead_tup = EXCLUDED.n_dead_tup,
+            n_mod_since_analyze = EXCLUDED.n_mod_since_analyze,
+            n_ins_since_vacuum = EXCLUDED.n_ins_since_vacuum,
+            n_tup_ins = EXCLUDED.n_tup_ins, n_tup_upd = EXCLUDED.n_tup_upd,
+            n_tup_del = EXCLUDED.n_tup_del, n_tup_hot_upd = EXCLUDED.n_tup_hot_upd,
+            last_autovacuum = EXCLUDED.last_autovacuum, last_autoanalyze = EXCLUDED.last_autoanalyze,
+            vacuum_count = EXCLUDED.vacuum_count, autovacuum_count = EXCLUDED.autovacuum_count,
+            analyze_count = EXCLUDED.analyze_count, autoanalyze_count = EXCLUDED.autoanalyze_count,
+            total_autovacuum_time = EXCLUDED.total_autovacuum_time,
+            reltuples = EXCLUDED.reltuples, relpages = EXCLUDED.relpages,
+            relallvisible = EXCLUDED.relallvisible,
+            relfrozenxid = EXCLUDED.relfrozenxid, relminmxid = EXCLUDED.relminmxid,
+            relation_size_bytes = EXCLUDED.relation_size_bytes,
+            total_size_bytes = EXCLUDED.total_size_bytes, reloptions = EXCLUDED.reloptions
     $q$, v_tat_expr)
     USING v_snapshot_id, v_day;
+
+    -- Drop side-table entries for relations that no longer exist (dropped tables).
+    -- Keeps last_state == the live relation set; a stale row is never a correctness
+    -- bug (it can only match its own vanished relid), just unbounded growth over DDL.
+    DELETE FROM pgfc_observe.relation_last_state ls
+     WHERE NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = ls.relid);
 
     RETURN v_snapshot_id;
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_observe.observe() IS
-  'Collect one snapshot: header (GUC defaults + pg_class health) and per-relation samples.';
+  'Collect one snapshot: header (always) + per-relation samples only for relations whose observed state changed (sparse change-logging, S3).';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Reader reconciliation  (Phase 1.5 S3)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- The dense "current state of every relation as of snapshot p_as_of", reconstructed
+-- from sparse storage. Sparse logging means a given snapshot only contains the
+-- relations that CHANGED that run; the current state of a quiet relation is its most
+-- recent earlier sample. So: DISTINCT ON (relid) the latest sample with
+-- snapshot_id <= p_as_of (default: the newest snapshot).
+--
+-- Two reconciliations make the result equal to what dense collection would have stored
+-- at p_as_of, so callers can swap `relation_samples WHERE snapshot_id = p` for this
+-- function mechanically:
+--   1. Live ages. relfrozenxid_age/relminmxid_age tick up globally every run and are
+--      therefore not logged on change; recompute them live from the stored raw xids
+--      (COALESCE back to the stored age for pre-S3 rows whose raw xid is NULL).
+--   2. Stamp-as-of-p. The returned snapshot_id is p_as_of (not the older snapshot the
+--      sample physically lives in), so a caller's `JOIN snapshots USING (snapshot_id)`
+--      resolves the CURRENT cluster context (GUC defaults, horizons, collected_at) and
+--      a `prev` query keyed on `snapshot_id < p` still finds the true prior sample —
+--      a quiet relation then reads as delta 0 over a positive dt (rate 0), as intended.
+CREATE OR REPLACE FUNCTION pgfc_observe.current_relation_state(p_as_of bigint DEFAULT NULL)
+RETURNS TABLE (
+    snapshot_id bigint, collected_day integer, relid oid, schemaname name, relname name,
+    n_live_tup bigint, n_dead_tup bigint, n_mod_since_analyze bigint, n_ins_since_vacuum bigint,
+    n_tup_ins bigint, n_tup_upd bigint, n_tup_del bigint, n_tup_hot_upd bigint,
+    last_autovacuum timestamptz, last_autoanalyze timestamptz,
+    vacuum_count bigint, autovacuum_count bigint, analyze_count bigint, autoanalyze_count bigint,
+    total_autovacuum_time double precision, reltuples real, relpages integer, relallvisible integer,
+    relfrozenxid_age bigint, relminmxid_age bigint,
+    relation_size_bytes bigint, total_size_bytes bigint, reloptions text[])
+LANGUAGE sql STABLE AS $fn$
+    WITH target AS (
+        SELECT COALESCE(p_as_of, (SELECT max(snapshot_id) FROM pgfc_observe.snapshots)) AS snap
+    )
+    SELECT DISTINCT ON (rs.relid)
+        t.snap, rs.collected_day, rs.relid, rs.schemaname, rs.relname,
+        rs.n_live_tup, rs.n_dead_tup, rs.n_mod_since_analyze, rs.n_ins_since_vacuum,
+        rs.n_tup_ins, rs.n_tup_upd, rs.n_tup_del, rs.n_tup_hot_upd,
+        rs.last_autovacuum, rs.last_autoanalyze,
+        rs.vacuum_count, rs.autovacuum_count, rs.analyze_count, rs.autoanalyze_count,
+        rs.total_autovacuum_time, rs.reltuples, rs.relpages, rs.relallvisible,
+        COALESCE(age(NULLIF(rs.relfrozenxid, '0'::xid))::bigint, rs.relfrozenxid_age),
+        COALESCE(mxid_age(NULLIF(rs.relminmxid, '0'::xid))::bigint, rs.relminmxid_age),
+        rs.relation_size_bytes, rs.total_size_bytes, rs.reloptions
+    FROM pgfc_observe.relation_samples rs, target t
+    WHERE rs.snapshot_id <= t.snap
+    ORDER BY rs.relid, rs.snapshot_id DESC
+$fn$;
+COMMENT ON FUNCTION pgfc_observe.current_relation_state(bigint) IS
+  'Dense current state per relation as-of a snapshot, reconstructed from sparse storage with live-computed freeze ages (S3).';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Views (latest sample per relation; human-readable debt)
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- Latest observed state per relation.
+-- Latest observed state per relation (dense reconstruction over sparse storage).
 CREATE OR REPLACE VIEW pgfc_observe.relation_health AS
-SELECT DISTINCT ON (rs.relid)
-       rs.relid, rs.schemaname, rs.relname,
+SELECT rs.relid, rs.schemaname, rs.relname,
        rs.n_dead_tup, rs.n_live_tup, rs.reltuples,
        rs.relfrozenxid_age, rs.relminmxid_age,
        rs.last_autovacuum, rs.autovacuum_count,
        sn.collected_at
-FROM pgfc_observe.relation_samples rs
-JOIN pgfc_observe.snapshots sn USING (snapshot_id)
-ORDER BY rs.relid, sn.snapshot_id DESC;
+FROM pgfc_observe.current_relation_state() rs
+JOIN pgfc_observe.snapshots sn USING (snapshot_id);
 
 -- Target-space quantities (dead/stale fractions) and overdue indicators, using the
--- effective threshold = explicit reloption (this relation) ?? snapshot global default.
+-- effective threshold = explicit reloption (this relation) ?? global default. The
+-- defaults come from the LATEST snapshot (current_relation_state stamps snapshot_id =
+-- newest), so a quiet relation's debt is computed against today's GUCs, not the stale
+-- ones from whenever it last changed.
 CREATE OR REPLACE VIEW pgfc_observe.maintenance_debt AS
 WITH latest AS (
-    SELECT DISTINCT ON (rs.relid)
-           rs.*, sn.def_vac_threshold, sn.def_vac_scale_factor,
+    SELECT rs.*, sn.def_vac_threshold, sn.def_vac_scale_factor,
            sn.def_ana_threshold, sn.def_ana_scale_factor, sn.def_freeze_max_age
-    FROM pgfc_observe.relation_samples rs
+    FROM pgfc_observe.current_relation_state() rs
     JOIN pgfc_observe.snapshots sn USING (snapshot_id)
-    ORDER BY rs.relid, sn.snapshot_id DESC
 ), eff AS (
     -- reltuples is -1 for a never-analyzed table (PG14+); clamp to 0 so it reads as
     -- "unknown" (NULL fractions, threshold = base) rather than producing negatives.
@@ -521,4 +710,10 @@ SELECT pgfc_observe._ensure_partition();
 -- installs gain it on re-run, e.g.:
 --   ALTER TABLE pgfc_observe.relation_samples
 --       ADD COLUMN IF NOT EXISTS n_tup_newpage_upd bigint;   -- PG16+, v0.0.2
--- v0.0.1 is the initial shape; nothing to reconcile yet.
+
+-- S3: raw frozen xids backing the change signature + live age reconciliation. On an
+-- existing (already-partitioned) install these add the columns; on a fresh install the
+-- CREATE TABLE above already has them and these are no-ops. relation_last_state is
+-- created by its CREATE UNLOGGED TABLE IF NOT EXISTS above, so it needs no ALTER here.
+ALTER TABLE pgfc_observe.relation_samples ADD COLUMN IF NOT EXISTS relfrozenxid xid;
+ALTER TABLE pgfc_observe.relation_samples ADD COLUMN IF NOT EXISTS relminmxid  xid;

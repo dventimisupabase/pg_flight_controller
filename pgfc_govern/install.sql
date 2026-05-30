@@ -260,12 +260,15 @@ BEGIN
         effectiveness, freeze_progressing,
         saturation_cause, saturation_candidate, saturation_streak, estimated_at)
     WITH
-    cur AS (   -- the relations in this snapshot, with header context
+    cur AS (   -- current state of EVERY relation as of this snapshot, with header context.
+        -- current_relation_state() reconciles sparse storage (S3): it carries quiet
+        -- relations forward and stamps snapshot_id = p_snapshot_id, so the header join
+        -- resolves the latest cluster context and `prev` (below) still finds the true
+        -- prior sample. Freeze ages are live, so a quiet table's freeze debt stays fresh.
         SELECT rs.*, sn.collected_at, sn.def_mxid_freeze_max_age,
                sn.oldest_xmin_owner, sn.oldest_xmin_age
-        FROM pgfc_observe.relation_samples rs
+        FROM pgfc_observe.current_relation_state(p_snapshot_id) rs
         JOIN pgfc_observe.snapshots sn USING (snapshot_id)
-        WHERE rs.snapshot_id = p_snapshot_id
     ),
     prev AS (  -- each relation's most recent EARLIER sample (not snapshot_id-1!)
         SELECT DISTINCT ON (rs.relid)
@@ -428,9 +431,9 @@ BEGIN
     INSERT INTO pgfc_govern.relation_class AS rc
         (relid, schemaname, relname, kind, source, candidate, candidate_streak, classified_at)
     WITH
-    cur AS (
+    cur AS (   -- every relation as of this snapshot (sparse-reconciled, S3)
         SELECT relid, schemaname, relname, n_tup_ins, n_tup_upd, n_tup_del, reltuples
-        FROM pgfc_observe.relation_samples WHERE snapshot_id = p_snapshot_id
+        FROM pgfc_observe.current_relation_state(p_snapshot_id)
     ),
     prev AS (
         SELECT DISTINCT ON (relid) relid, n_tup_ins, n_tup_upd, n_tup_del
@@ -561,8 +564,7 @@ BEGIN
                re.vacuum_debt_ratio, re.effectiveness
         FROM pgfc_govern.relation_class rc
         JOIN pgfc_govern.relation_estimate re ON re.relid = rc.relid
-        JOIN pgfc_observe.relation_samples rs
-             ON rs.relid = rc.relid AND rs.snapshot_id = p_snapshot_id
+        JOIN pgfc_observe.current_relation_state(p_snapshot_id) rs ON rs.relid = rc.relid
         JOIN pgfc_observe.snapshots sn ON sn.snapshot_id = p_snapshot_id
     ),
     tgt AS (
@@ -675,8 +677,7 @@ LANGUAGE sql STABLE AS $fn$
                            'horizon_age', sn.oldest_xmin_age)
     FROM pgfc_govern.relation_estimate re
     JOIN pgfc_observe.snapshots sn ON sn.snapshot_id = p_snapshot_id
-    WHERE re.relid IN (SELECT relid FROM pgfc_observe.relation_samples
-                        WHERE snapshot_id = p_snapshot_id)
+    WHERE re.relid IN (SELECT relid FROM pgfc_observe.current_relation_state(p_snapshot_id))
       AND (re.saturation_cause IN ('inhibited','io_limited','config')
            OR ((re.freeze_debt > 0.6 OR COALESCE(re.mxid_freeze_debt,0) > 0.6)
                AND sn.oldest_xmin_owner <> 'none'));
@@ -700,7 +701,7 @@ BEGIN
     -- resolve open findings whose condition cleared this cycle
     UPDATE pgfc_govern.diagnostics d SET resolved_at = now()
     WHERE d.resolved_at IS NULL
-      AND d.relid IN (SELECT relid FROM pgfc_observe.relation_samples WHERE snapshot_id = p_snapshot_id)
+      AND d.relid IN (SELECT relid FROM pgfc_observe.current_relation_state(p_snapshot_id))
       AND NOT EXISTS (
         SELECT 1 FROM pgfc_govern._findings(p_snapshot_id) f
         WHERE f.relid = d.relid AND f.inhibitor_class IS NOT DISTINCT FROM d.inhibitor_class);

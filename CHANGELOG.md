@@ -46,6 +46,21 @@ section in the same pull request as your change (this is a convention, not a CI 
   generated-reference script now lists partitioned parents once instead of flooding
   with child partitions.
 
+- **Storage Phase 1.5 — S3 (sparse change-logging).** `observe()` now writes a
+  `relation_samples` row only for relations whose observed state **changed** since
+  their last sample; quiet relations produce no rows. A new `UNLOGGED`
+  `relation_last_state` side table (HOT-friendly `fillfactor=70`, only the `relid`
+  primary key, aggressive static autovacuum) gives the O(1) "did this change?"
+  comparison and is self-healingly rebuilt from the catalogs after a crash. The
+  globally-ticking `relfrozenxid_age`/`relminmxid_age` are deliberately excluded from
+  the change signature; the **raw** `relfrozenxid`/`relminmxid` xids are stored
+  instead, and a new `current_relation_state(p_as_of)` function reconstructs the dense
+  "current state per relation" view from sparse storage with freeze ages computed
+  **live** — so a quiet table's wraparound debt never goes stale. `relation_health`,
+  `maintenance_debt`, and the `pgfc_govern` readers (`estimate()`, `classify()`,
+  `plan()`, diagnostics) now reconcile through this function. Subsumes the reloptions
+  data-minimization goal: the `reloptions` array is re-stored only when it changes.
+
 ### Changed
 
 - **`pgfc_observe.retain(interval)` is no longer row-by-row `DELETE`** — it `TRUNCATE`s
