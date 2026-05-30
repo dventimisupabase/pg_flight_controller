@@ -47,6 +47,21 @@ Core steps: `classify()`, `estimate()`, `plan()`, `apply()`, `verify()`, plus th
   baseline capture, 100 ms non-blocking lock, failure recording) but only ever runs
   when `advisory_only = false`.
 
+### Recorded hazards to address when Phase 2 turns on active control
+
+- **Loop ordering contract.** `control_tick()` plans against `max(snapshot_id)`, so
+  `estimate()` for that snapshot must have completed before the control loop
+  consumes it. The advisory lock serializes `control_tick()` against itself but
+  **not** against `observe_tick()`; on two independent cron schedules a control
+  cycle could read a snapshot whose estimate hasn't run yet (those relations are
+  skipped via the LEFT JOIN, not mis-planned). Make the ordering explicit before
+  actuation depends on it.
+- **`apply()` stale-window downgrade is untested.** `apply()` re-reads live
+  `pg_class.reloptions` and is the authoritative arbiter (can downgrade
+  `adjust → no_op` when a human changed the value between observe and apply), but no
+  test yet exercises the case where the live value differs from what `plan()` saw.
+  Add it when `apply()` goes live.
+
 ## Tests
 
 From the project root (installs both extensions, runs both suites):
