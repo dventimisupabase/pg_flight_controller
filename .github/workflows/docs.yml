@@ -28,3 +28,16 @@ jobs:
             exit 1
           fi
           echo "docs/reference is up to date with the installed schema."
+
+  doctests:
+    name: Doctests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run documentation doctests
+        run: ./scripts/run-doctests.sh
