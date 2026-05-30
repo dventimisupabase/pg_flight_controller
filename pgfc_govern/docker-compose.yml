@@ -1,0 +1,8 @@
+# Extension-specific mounts, merged over the root docker-compose.yml by test.sh.
+# Volume source paths are relative to the project root (the first -f file's dir).
+services:
+  db:
+    volumes:
+      - ./pgfc_govern/install.sql:/sql/pgfc_govern/install.sql:ro
+      - ./pgfc_govern/uninstall.sql:/sql/pgfc_govern/uninstall.sql:ro
+      - ./pgfc_govern/tests:/sql/pgfc_govern/tests:ro
