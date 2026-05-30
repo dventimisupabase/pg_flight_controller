@@ -8,6 +8,18 @@ pg_flight_controller telemetry: snapshots of autovacuum-relevant state (read-onl
 
 ## Tables
 
+### pgfc_observe.collection_policy
+
+Single-row cardinality filter config for observe() (S5): which relations are sampled. System schemas are always excluded.
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `singleton` | `boolean` |  |
+| `exclude_temp` | `boolean` | Exclude temporary tables (relpersistence = 't'). Default true. |
+| `include_extension_owned` | `boolean` | Include relations owned by an extension (pg_depend deptype 'e'). Default false (excluded). |
+| `min_partition_size_bytes` | `bigint` | Exclude CHILD partitions whose total size is below this many bytes. 0 disables the filter. |
+| `excluded_schemas` | `name[]` | Additional schemas to exclude, on top of the always-excluded system schemas. |
+
 ### pgfc_observe.relation_last_state
 
 UNLOGGED last-observed state per relation: the change-signature cache for sparse logging (S3). Rebuilt from the catalogs after a crash.
@@ -293,7 +305,7 @@ Value of storage parameter opt in reloptions, or NULL if not explicitly set.
 
 ### `pgfc_observe.observe() → bigint`
 
-Collect one snapshot: header (always) + per-relation samples only for relations whose observed state changed (sparse change-logging, S3).
+Collect one snapshot: header (always) + per-relation samples for relations that pass collection_policy (S5) and whose observed state changed (sparse change-logging, S3).
 
 ### `pgfc_observe.removability_horizons() → TABLE(oldest_xmin_age bigint, oldest_xmin_owner text, oldest_xmin_owner_detail text, oldest_catalog_xmin_age bigint, oldest_catalog_xmin_owner text)`
 

@@ -21,16 +21,19 @@ jobs:
     if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Review for documentation drift
         uses: anthropics/claude-code-action@v1
+        # Advisory only: a transient API/SDK error (e.g. the model hitting the
+        # turn limit) must never fail the job and block the merge.
+        continue-on-error: true
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          claude_args: "--max-turns 20"
+          claude_args: "--max-turns 40"
           prompt: |
             You are a documentation-drift reviewer for the pg_flight_controller repo.
 

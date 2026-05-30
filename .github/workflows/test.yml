@@ -16,7 +16,7 @@ jobs:
         pg_version: [15, 16, 17, 18]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

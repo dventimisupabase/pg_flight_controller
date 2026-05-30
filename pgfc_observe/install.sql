@@ -1,4 +1,4 @@
--- pgfc_observe — Observe + Orient (Phase 0; partition storage 1.5 S2; sparse 1.5 S3; rollups 1.5 S4)
+-- pgfc_observe — Observe + Orient (Phase 0; partition storage 1.5 S2; sparse 1.5 S3; rollups 1.5 S4; cardinality filters 1.5 S5)
 --
 -- Read-only telemetry for the pg_flight_controller autovacuum governor: periodic
 -- snapshots of autovacuum-relevant state. Writes only to its own schema.
@@ -239,6 +239,40 @@ CREATE UNLOGGED TABLE IF NOT EXISTS pgfc_observe.relation_last_state (
         autovacuum_analyze_scale_factor  = 0.0, autovacuum_analyze_threshold  = 50);
 COMMENT ON TABLE pgfc_observe.relation_last_state IS
   'UNLOGGED last-observed state per relation: the change-signature cache for sparse logging (S3). Rebuilt from the catalogs after a crash.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Collection policy — cardinality filters  (Phase 1.5 S5)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Single-row config controlling WHICH relations observe() samples. S5 exists for
+-- databases with thousands of relations, where sampling every relation every run is
+-- itself the storage problem. The filters are applied SET-BASED inside observe()'s
+-- collection query (never a per-row function — that would be N catalog lookups a
+-- minute), so they stay cheap at high relation counts. Rollups and pgfc_govern's
+-- readers inherit the filtered set automatically, because they read what observe()
+-- wrote. System schemas are ALWAYS excluded regardless of this row; excluded_schemas
+-- is additive on top, so config can never re-include pg_catalog.
+CREATE TABLE IF NOT EXISTS pgfc_observe.collection_policy (
+    -- Enforced singleton: the PK is a constant-true flag, so at most one row can exist.
+    singleton                 boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    exclude_temp              boolean NOT NULL DEFAULT true,
+    include_extension_owned   boolean NOT NULL DEFAULT false,
+    min_partition_size_bytes  bigint  NOT NULL DEFAULT 0 CHECK (min_partition_size_bytes >= 0),
+    excluded_schemas          name[]  NOT NULL DEFAULT '{}'
+);
+COMMENT ON TABLE pgfc_observe.collection_policy IS
+  'Single-row cardinality filter config for observe() (S5): which relations are sampled. System schemas are always excluded.';
+COMMENT ON COLUMN pgfc_observe.collection_policy.exclude_temp IS
+  'Exclude temporary tables (relpersistence = ''t''). Default true.';
+COMMENT ON COLUMN pgfc_observe.collection_policy.include_extension_owned IS
+  'Include relations owned by an extension (pg_depend deptype ''e''). Default false (excluded).';
+COMMENT ON COLUMN pgfc_observe.collection_policy.min_partition_size_bytes IS
+  'Exclude CHILD partitions whose total size is below this many bytes. 0 disables the filter.';
+COMMENT ON COLUMN pgfc_observe.collection_policy.excluded_schemas IS
+  'Additional schemas to exclude, on top of the always-excluded system schemas.';
+
+-- Seed the singleton with defaults so observe() always finds a policy row. Idempotent.
+INSERT INTO pgfc_observe.collection_policy (singleton) VALUES (true)
+ON CONFLICT (singleton) DO NOTHING;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Rollup tables  (Phase 1.5 S4 — long-range history after raw rotates away)
@@ -624,7 +658,22 @@ BEGIN
                        ELSE 'NULL::double precision' END;
 
     EXECUTE format($q$
-        WITH cur AS (
+        WITH cfg AS (
+            -- Collection policy (S5) as exactly one row, with safe defaults even if the
+            -- singleton row was deleted (each scalar subquery yields at most one value, so
+            -- a missing row reads as the default rather than collecting NOTHING). CROSS
+            -- JOINed into relset so the filters read config without a join key.
+            SELECT
+                COALESCE((SELECT exclude_temp             FROM pgfc_observe.collection_policy WHERE singleton), true)         AS exclude_temp,
+                COALESCE((SELECT include_extension_owned  FROM pgfc_observe.collection_policy WHERE singleton), false)        AS include_extension_owned,
+                COALESCE((SELECT min_partition_size_bytes FROM pgfc_observe.collection_policy WHERE singleton), 0)            AS min_partition_size_bytes,
+                COALESCE((SELECT excluded_schemas         FROM pgfc_observe.collection_policy WHERE singleton), '{}'::name[]) AS excluded_schemas
+        ),
+        relset AS (
+            -- Candidate relations + observed state, after the non-size cardinality filters
+            -- (S5). System schemas are ALWAYS excluded (literal list); excluded_schemas is
+            -- additive on top so config can never re-include pg_catalog. The size threshold
+            -- is applied one level out (cur) because it needs the computed total_size_bytes.
             SELECT
                 s.relid, s.schemaname, s.relname,
                 s.n_live_tup, s.n_dead_tup, s.n_mod_since_analyze, s.n_ins_since_vacuum,
@@ -636,12 +685,51 @@ BEGIN
                 c.relfrozenxid, c.relminmxid,
                 pg_relation_size(s.relid)       AS relation_size_bytes,
                 pg_total_relation_size(s.relid) AS total_size_bytes,
-                c.reloptions
+                c.reloptions,
+                c.relispartition                AS _relispartition,   -- filter helpers, not propagated
+                cfg.min_partition_size_bytes    AS _min_part
             FROM pg_stat_all_tables s
             JOIN pg_class c ON c.oid = s.relid
+            CROSS JOIN cfg
             WHERE s.schemaname NOT IN
                   ('pg_catalog','information_schema','pgfc_observe','pgfc_govern')
               AND c.relkind IN ('r','m','p')
+              -- temporary tables: session-local churn, not the governor's concern. observe()
+              -- runs in its own (cron) session and cannot see OTHER sessions' temp tables
+              -- anyway, so this is cheap insurance against the caller's own pg_temp_N relations.
+              AND (NOT cfg.exclude_temp OR c.relpersistence <> 't')
+              -- additional operator-excluded schemas (additive to the system list above;
+              -- <> ALL ('{}') is vacuously true, so an empty list excludes nothing extra)
+              AND s.schemaname <> ALL (cfg.excluded_schemas)
+              -- extension-owned relations (pg_depend deptype 'e') unless explicitly included
+              AND (cfg.include_extension_owned
+                   OR NOT EXISTS (SELECT 1 FROM pg_depend d
+                                   WHERE d.classid     = 'pg_class'::regclass
+                                     AND d.objid       = c.oid
+                                     AND d.refclassid  = 'pg_extension'::regclass
+                                     AND d.deptype     = 'e'))
+        ),
+        cur AS (
+            -- Sub-threshold partition filter (S5): needs total_size_bytes from relset, so it
+            -- is applied here rather than in relset's WHERE. Drop CHILD partitions
+            -- (relispartition) smaller than the configured floor; 0 disables it; non-partition
+            -- relations and partitioned parents are never size-filtered. The projection is
+            -- exactly the dense per-relation signature (relset's helper columns are dropped),
+            -- so chg/ins and the relation_last_state upsert below are unchanged.
+            -- NOTE: a relation that still exists but is now EXCLUDED keeps its stale
+            -- relation_last_state row — the end-of-observe() DELETE only purges VANISHED
+            -- relids. Harmless and bounded by relation count; it re-samples correctly if
+            -- later re-included. Deliberate (S5), not an oversight.
+            SELECT
+                relid, schemaname, relname,
+                n_live_tup, n_dead_tup, n_mod_since_analyze, n_ins_since_vacuum,
+                n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd,
+                last_autovacuum, last_autoanalyze,
+                vacuum_count, autovacuum_count, analyze_count, autoanalyze_count,
+                total_autovacuum_time, reltuples, relpages, relallvisible,
+                relfrozenxid, relminmxid, relation_size_bytes, total_size_bytes, reloptions
+            FROM relset
+            WHERE _min_part = 0 OR NOT _relispartition OR total_size_bytes >= _min_part
         ),
         chg AS (
             SELECT cur.* FROM cur
@@ -735,7 +823,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_observe.observe() IS
-  'Collect one snapshot: header (always) + per-relation samples only for relations whose observed state changed (sparse change-logging, S3).';
+  'Collect one snapshot: header (always) + per-relation samples for relations that pass collection_policy (S5) and whose observed state changed (sparse change-logging, S3).';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Reader reconciliation  (Phase 1.5 S3)
