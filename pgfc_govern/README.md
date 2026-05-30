@@ -54,6 +54,14 @@ Core steps: `classify()`, `estimate()`, `plan()`, `apply()`, `verify()`, plus th
 and `policy_history` records policy changes (kept indefinitely) — schedule `retain()`
 daily with pg_cron alongside the loops.
 
+Self-maintenance (S6): the audit/state tables carry **static** autovacuum reloptions,
+`storage_budget()` reports per-relation bytes + dead tuples across **both** schemas,
+and the one-row `self_health` view compares the whole-governor footprint to the
+`storage_config.budget_bytes` cap (`over_budget`). `degrade()` enforces the cap by
+shedding storage in a fixed order — raw → fine rollups → coarse rollups → diagnostics
+→ actions — stopping once under budget; policy is never pruned, and with no cap
+configured `degrade()` is a no-op.
+
 ### Deliberately deferred (so scope is explicit, not accidental)
 
 - **Threshold lever and the analyze objective.** `plan()` moves the vacuum

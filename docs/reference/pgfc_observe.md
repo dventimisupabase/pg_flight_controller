@@ -253,6 +253,18 @@ Header row per observe() run: timestamp + cluster/GUC + pg_class health + xmin h
 | `autovacuum_count` | `bigint` |
 | `collected_at` | `timestamp with time zone` |
 
+### pgfc_observe.self_health
+
+One-row self-maintenance summary for pgfc_observe (S6): total bytes, aggregate dead tuples, partition counts, oldest raw partition.
+
+| Column | Type |
+| --- | --- |
+| `total_bytes` | `numeric` |
+| `total_dead_tuples` | `numeric` |
+| `raw_partitions` | `bigint` |
+| `rollup_partitions` | `bigint` |
+| `oldest_raw_partition` | `timestamp with time zone` |
+
 ## Functions
 
 ### `pgfc_observe._ensure_part(p_parent text, p_key integer, p_span text) → void`
@@ -286,6 +298,10 @@ Aggregate one rollup tier into the next coarser one on UTC p_unit buckets (sampl
 ### `pgfc_observe._rollup_inventory() → TABLE(parent text, partition text, part_key integer, span text, range_start timestamp with time zone, range_end timestamp with time zone, approx_rows bigint, size_bytes bigint)`
 
 Child partitions of the rollup tables with int key, span, decoded range, est. rows, and size.
+
+### `pgfc_observe._telemetry_reloptions() → text`
+
+Static autovacuum reloptions string applied to every telemetry/rollup partition (S6).
 
 ### `pgfc_observe.current_relation_state(p_as_of bigint) → TABLE(snapshot_id bigint, collected_day integer, relid oid, schemaname name, relname name, n_live_tup bigint, n_dead_tup bigint, n_mod_since_analyze bigint, n_ins_since_vacuum bigint, n_tup_ins bigint, n_tup_upd bigint, n_tup_del bigint, n_tup_hot_upd bigint, last_autovacuum timestamp with time zone, last_autoanalyze timestamp with time zone, vacuum_count bigint, autovacuum_count bigint, analyze_count bigint, autoanalyze_count bigint, total_autovacuum_time double precision, reltuples real, relpages integer, relallvisible integer, relfrozenxid_age bigint, relminmxid_age bigint, relation_size_bytes bigint, total_size_bytes bigint, reloptions text[])`
 
@@ -322,3 +338,7 @@ Cascade raw samples into the 1m/1h/1d rollup tiers (S4). Idempotent (per-PK upse
 ### `pgfc_observe.rollup_retain(keep_1m interval, keep_1h interval, keep_1d interval) → bigint`
 
 Cascading rollup GC (S4): DROP rollup partitions past their per-tier window (1m 7d / 1h 90d / 1d 365d). Returns partitions dropped.
+
+### `pgfc_observe.storage_budget() → TABLE(relation text, bytes bigint, dead_tuples bigint)`
+
+Per-logical-relation on-disk bytes + dead tuples for the pgfc_observe schema (S6); child partitions folded into their parent.

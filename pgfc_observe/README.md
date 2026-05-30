@@ -61,6 +61,14 @@ temporary tables (`exclude_temp`), extension-owned relations
 child partitions (`min_partition_size_bytes`). Rollups and the `pgfc_govern` views
 inherit the filtered set automatically.
 
+Every partition is created with **static** autovacuum reloptions (`scale_factor = 0`
+plus a fixed threshold) so the governor maintains its own schema explicitly rather
+than governing itself. Report the footprint with `storage_budget()` (per-relation
+bytes + dead tuples, child partitions folded into their parent) and the one-row
+`self_health` view (totals + partition counts). Dead tuples should stay near zero —
+the tables rotate by `TRUNCATE`/`DROP`, never `DELETE`. (A whole-system, cross-schema
+budget plus a `degrade()` prune-order enforcer live in `pgfc_govern`.)
+
 ## Schema evolution
 
 Additive-only: new columns are nullable; existing columns are never dropped or

@@ -149,6 +149,15 @@ Append-only audit of policy changes (insert/update/delete); retained indefinitel
 | `saturation_streak` | `integer` |  |
 | `estimated_at` | `timestamp with time zone` |  |
 
+### pgfc_govern.storage_config
+
+Single-row storage config (S6): budget_bytes is the total-bytes cap over both schemas that degrade() enforces. NULL = no cap (degrade is a no-op).
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `singleton` | `boolean` |  |
+| `budget_bytes` | `bigint` | Total on-disk cap across pgfc_observe + pgfc_govern. NULL disables degrade(). |
+
 ### pgfc_govern.tick_log
 
 | Column | Type | Description |
@@ -209,6 +218,18 @@ Append-only audit of policy changes (insert/update/delete); retained indefinitel
 | `last_decision_at` | `timestamp with time zone` |
 | `current_scale_factor` | `text` |
 
+### pgfc_govern.self_health
+
+One-row whole-governor self-health (S6): total bytes + dead tuples across both schemas vs the configured budget; over_budget flags when degrade() should run.
+
+| Column | Type |
+| --- | --- |
+| `total_bytes` | `numeric` |
+| `total_dead_tuples` | `numeric` |
+| `budget_bytes` | `bigint` |
+| `bytes_under_budget` | `numeric` |
+| `over_budget` | `boolean` |
+
 ## Functions
 
 ### `pgfc_govern._findings(p_snapshot_id bigint) → TABLE(relid oid, inhibitor_class text, severity text, recommendation text, evidence jsonb)`
@@ -231,6 +252,10 @@ Assign each relation a workload class with a signal floor and N-cycle hysteresis
 
 One control cycle: plan, apply (only if not advisory_only), verify.
 
+### `pgfc_govern.degrade(p_budget_bytes bigint, keep_raw interval, keep_rollup_fine interval, keep_rollup_coarse interval, keep_diagnostics interval, keep_actions interval) → TABLE(step integer, level text, action text, bytes_after bigint)`
+
+Graceful-degrade prune order (S6): shed storage raw→fine→coarse rollups→diagnostics→actions until under budget; policy is never pruned. No-op when no budget is configured. Returns the ordered prune log.
+
 ### `pgfc_govern.estimate(p_snapshot_id bigint) → integer`
 
 Derive hidden state (rates, effectiveness, saturation) into relation_estimate.
@@ -248,6 +273,10 @@ Advisory: write decision_log per relation (vacuum objective) + reconcile diagnos
 Prune audit tables by time cutoff (decisions/actions 180d, ticks 180d, resolved diagnostics 365d); policy_history is never pruned. Returns per-table delete counts.
 
 ### `pgfc_govern.snap_sf(x double precision) → double precision`
+
+### `pgfc_govern.storage_budget() → TABLE(schema_name text, relation text, bytes bigint, dead_tuples bigint)`
+
+Whole-governor storage report (S6): per-relation bytes + dead tuples across pgfc_observe and pgfc_govern, tagged by schema.
 
 ### `pgfc_govern.verify(p_tick_id bigint) → integer`
 

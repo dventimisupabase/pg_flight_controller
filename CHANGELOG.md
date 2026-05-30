@@ -88,6 +88,22 @@ section in the same pull request as your change (this is a convention, not a CI 
   because they read what `observe()` wrote. No tiered cadence — sparse change-logging
   (S3) already handles cold tables.
 
+- **Storage Phase 1.5 — S6 (storage budget + self-health).** The governor now bounds
+  and reports its own footprint. Every telemetry/rollup partition is created with — and
+  pre-S6 partitions are backfilled to — **static autovacuum reloptions**
+  (`scale_factor = 0` + a fixed threshold, via a single `_telemetry_reloptions()`
+  source of truth), and the `pgfc_govern` audit/state tables get matching static
+  settings: the governor maintains its own schema explicitly rather than governing
+  itself. New `storage_budget()` functions report per-relation on-disk bytes and dead
+  tuples (`pgfc_observe`'s folds child partitions into their parent; `pgfc_govern`'s
+  spans **both** schemas), and one-row `self_health` views summarize the footprint —
+  `pgfc_govern.self_health` compares it to a configured cap and flags `over_budget`. A
+  new single-row `pgfc_govern.storage_config(budget_bytes)` (default `NULL` = no cap)
+  drives `pgfc_govern.degrade()`, which sheds storage in a **fixed graceful-degrade
+  order** — raw → fine rollups → coarse rollups → diagnostics → actions → policy
+  (**never** pruned) — stopping as soon as the footprint is back under budget. With no
+  cap configured `degrade()` is a no-op, so it never silently destroys telemetry.
+
 ### Changed
 
 - **`pgfc_observe.retain(interval)` is no longer row-by-row `DELETE`** — it `TRUNCATE`s
