@@ -41,3 +41,13 @@ jobs:
 
       - name: Run documentation doctests
         run: ./scripts/run-doctests.sh
+
+  links:
+    name: Links
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check internal markdown links resolve
+        run: python3 scripts/check-links.py .
