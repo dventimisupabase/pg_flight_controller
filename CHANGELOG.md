@@ -61,6 +61,21 @@ section in the same pull request as your change (this is a convention, not a CI 
   `plan()`, diagnostics) now reconcile through this function. Subsumes the reloptions
   data-minimization goal: the `reloptions` array is re-stored only when it changes.
 
+- **Storage Phase 1.5 — S4 (rollups).** Three per-relation aggregate tiers —
+  `rollup_1m`, `rollup_1h`, `rollup_1d` — let long-range trend analysis outlive the
+  fast-rotating raw samples. A new `rollup()` job cascades raw → 1m → 1h → 1d
+  (sample-count-weighted averages, end-of-bucket cumulative counters) and is
+  idempotent (per-PK upsert); it must run at least once per raw-retention window, the
+  real guarantee being the window, not nightly cron ordering. The tiers are
+  partition-rotated like raw (zero dead tuples) but the partition **span tracks the
+  tier**: the fine 1m tier is **daily** partitioned (7-day window), the coarse 1h/1d
+  tiers **monthly** (90-/365-day windows) — added `_epoch_month()`/`_month_start()`
+  keys, a generic `_ensure_part()`, and a `_rollup_inventory()`. `rollup_retain()`
+  drops out-of-window rollup partitions with **cascading per-tier windows** (1m 7 d,
+  1h 90 d, 1d 365 d). Rollups are sparse-in/sparse-out, so a new
+  `current_rollup(tier, as_of)` carry-forward reader keeps a quiet relation answerable
+  after its raw samples are gone.
+
 ### Changed
 
 - **`pgfc_observe.retain(interval)` is no longer row-by-row `DELETE`** — it `TRUNCATE`s

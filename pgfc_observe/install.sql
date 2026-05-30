@@ -1,4 +1,4 @@
--- pgfc_observe — Observe + Orient (Phase 0; partition storage 1.5 S2; sparse 1.5 S3)
+-- pgfc_observe — Observe + Orient (Phase 0; partition storage 1.5 S2; sparse 1.5 S3; rollups 1.5 S4)
 --
 -- Read-only telemetry for the pg_flight_controller autovacuum governor: periodic
 -- snapshots of autovacuum-relevant state. Writes only to its own schema.
@@ -41,6 +41,29 @@ RETURNS integer LANGUAGE sql STABLE AS $$
 $$;
 COMMENT ON FUNCTION pgfc_observe._epoch_day(timestamptz) IS
   'Whole UTC days since 1970-01-01 — the int4 daily RANGE partition key.';
+
+-- Epoch month = whole calendar months since 1970-01 UTC, as a single monotonic int4
+-- (year*12 + month-1, rebased to 1970). The coarse rollup tiers (1h, 1d) are partitioned
+-- by MONTH, not day: their retention windows (90 d / 365 d) would otherwise need 90–365
+-- daily partitions, whereas a daily span on the fine 1m tier keeps its 7-day window tight.
+-- One distinct value per UTC calendar month, so a monthly partition spans [month, month+1).
+-- STABLE for the same reason as _epoch_day (used only to compute stored values / cutoffs).
+CREATE OR REPLACE FUNCTION pgfc_observe._epoch_month(ts timestamptz)
+RETURNS integer LANGUAGE sql STABLE AS $$
+    SELECT (extract(year  FROM (ts AT TIME ZONE 'UTC'))::int - 1970) * 12
+         + (extract(month FROM (ts AT TIME ZONE 'UTC'))::int - 1)
+$$;
+COMMENT ON FUNCTION pgfc_observe._epoch_month(timestamptz) IS
+  'Whole UTC calendar months since 1970-01 — the int4 monthly RANGE partition key for coarse rollups.';
+
+-- Inverse of _epoch_month: the UTC instant at the start of epoch-month k. Used to decode a
+-- monthly partition''s int key back to its [start, end) range and to name the partition.
+CREATE OR REPLACE FUNCTION pgfc_observe._month_start(k integer)
+RETURNS timestamptz LANGUAGE sql STABLE AS $$
+    SELECT make_timestamptz(1970 + (k / 12), (k % 12) + 1, 1, 0, 0, 0, 'UTC')
+$$;
+COMMENT ON FUNCTION pgfc_observe._month_start(integer) IS
+  'UTC instant at the start of epoch-month k (inverse of _epoch_month).';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Destructive recreate  (Phase 1.5 S2 — one-time; see header)
@@ -218,6 +241,135 @@ COMMENT ON TABLE pgfc_observe.relation_last_state IS
   'UNLOGGED last-observed state per relation: the change-signature cache for sparse logging (S3). Rebuilt from the catalogs after a crash.';
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Rollup tables  (Phase 1.5 S4 — long-range history after raw rotates away)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Raw samples are retained only 24–72 h (partition rotation, S2). Long-range trend
+-- analysis reads these aggregate tiers instead, computed by rollup() (below) BEFORE the
+-- raw partitions are truncated and kept far longer. Three tiers — 1-minute, 1-hour,
+-- 1-day buckets — each a per-relation aggregate keyed (bucket_part, bucket_start, relid).
+--
+-- Like raw, retention is whole-partition rotation (zero dead tuples), but the partition
+-- SPAN differs by tier so it stays between the bucket and the retention window: the fine
+-- 1m tier (7 d) is partitioned DAILY; the coarse 1h/1d tiers (90 d / 365 d) MONTHLY.
+--
+-- Sparse-in, sparse-out: rollup() aggregates whatever raw rows exist in each bucket, so a
+-- relation that was quiet for a bucket simply has no row there — exactly the raw sparsity
+-- carried through. Readers carry forward the last known bucket (current_rollup(), below),
+-- so a quiet relation is still answerable long after its last bucket.
+--
+-- Averages are SAMPLE-COUNT-WEIGHTED so a coarse tier built from a finer one matches what
+-- it would have computed straight from raw. Cumulative counters (vacuum/analyze counts,
+-- n_tup_*) are stored as the END-OF-BUCKET max; per-bucket deltas/rates are derived at read
+-- (a counter delta across a gap or a first bucket is meaningless to bake in here).
+
+-- One row per relation per 1-minute bucket. Daily RANGE partitioned (7-day window).
+CREATE TABLE IF NOT EXISTS pgfc_observe.rollup_1m (
+    bucket_part           integer     NOT NULL,   -- _epoch_day(bucket_start): daily partition key
+    bucket_start          timestamptz NOT NULL,   -- start of the 1-minute bucket (UTC-aligned)
+    relid                 oid         NOT NULL,
+    schemaname            name        NOT NULL,
+    relname               name        NOT NULL,
+    sample_count          integer     NOT NULL,    -- raw samples folded into this bucket
+    avg_dead_tup          double precision,
+    max_dead_tup          bigint,
+    avg_live_tup          double precision,
+    max_live_tup          bigint,
+    avg_mod_since_analyze double precision,
+    max_mod_since_analyze bigint,
+    avg_reltuples         double precision,        -- for dead/mod fraction at read time
+    max_reltuples         bigint,
+    max_relfrozenxid_age  bigint,                  -- max xid age over the bucket
+    max_relminmxid_age    bigint,
+    max_n_tup_ins         bigint,                  -- cumulative churn counters (end-of-bucket)
+    max_n_tup_upd         bigint,
+    max_n_tup_del         bigint,
+    max_vacuum_count      bigint,                  -- cumulative (auto)vacuum/analyze counters
+    max_autovacuum_count  bigint,
+    max_analyze_count     bigint,
+    max_autoanalyze_count bigint,
+    avg_total_size_bytes  double precision,
+    max_total_size_bytes  bigint,
+    PRIMARY KEY (bucket_part, bucket_start, relid)
+) PARTITION BY RANGE (bucket_part);
+COMMENT ON TABLE pgfc_observe.rollup_1m IS
+  'Per-relation 1-minute aggregate of raw samples (S4). Daily RANGE partitioned; ~7-day retention. Averages are sample-count-weighted; counters are end-of-bucket cumulative.';
+
+-- One row per relation per 1-hour bucket. Monthly RANGE partitioned (~90-day window).
+CREATE TABLE IF NOT EXISTS pgfc_observe.rollup_1h (
+    bucket_part           integer     NOT NULL,   -- _epoch_month(bucket_start): monthly partition key
+    bucket_start          timestamptz NOT NULL,   -- start of the 1-hour bucket (UTC-aligned)
+    relid                 oid         NOT NULL,
+    schemaname            name        NOT NULL,
+    relname               name        NOT NULL,
+    sample_count          integer     NOT NULL,
+    avg_dead_tup          double precision,
+    max_dead_tup          bigint,
+    avg_live_tup          double precision,
+    max_live_tup          bigint,
+    avg_mod_since_analyze double precision,
+    max_mod_since_analyze bigint,
+    avg_reltuples         double precision,
+    max_reltuples         bigint,
+    max_relfrozenxid_age  bigint,
+    max_relminmxid_age    bigint,
+    max_n_tup_ins         bigint,
+    max_n_tup_upd         bigint,
+    max_n_tup_del         bigint,
+    max_vacuum_count      bigint,
+    max_autovacuum_count  bigint,
+    max_analyze_count     bigint,
+    max_autoanalyze_count bigint,
+    avg_total_size_bytes  double precision,
+    max_total_size_bytes  bigint,
+    PRIMARY KEY (bucket_part, bucket_start, relid)
+) PARTITION BY RANGE (bucket_part);
+COMMENT ON TABLE pgfc_observe.rollup_1h IS
+  'Per-relation 1-hour aggregate of the 1m tier (S4). Monthly RANGE partitioned; ~90-day retention.';
+
+-- One row per relation per 1-day bucket. Monthly RANGE partitioned (~365-day window).
+CREATE TABLE IF NOT EXISTS pgfc_observe.rollup_1d (
+    bucket_part           integer     NOT NULL,   -- _epoch_month(bucket_start): monthly partition key
+    bucket_start          timestamptz NOT NULL,   -- start of the 1-day bucket (UTC-aligned)
+    relid                 oid         NOT NULL,
+    schemaname            name        NOT NULL,
+    relname               name        NOT NULL,
+    sample_count          integer     NOT NULL,
+    avg_dead_tup          double precision,
+    max_dead_tup          bigint,
+    avg_live_tup          double precision,
+    max_live_tup          bigint,
+    avg_mod_since_analyze double precision,
+    max_mod_since_analyze bigint,
+    avg_reltuples         double precision,
+    max_reltuples         bigint,
+    max_relfrozenxid_age  bigint,
+    max_relminmxid_age    bigint,
+    max_n_tup_ins         bigint,
+    max_n_tup_upd         bigint,
+    max_n_tup_del         bigint,
+    max_vacuum_count      bigint,
+    max_autovacuum_count  bigint,
+    max_analyze_count     bigint,
+    max_autoanalyze_count bigint,
+    avg_total_size_bytes  double precision,
+    max_total_size_bytes  bigint,
+    PRIMARY KEY (bucket_part, bucket_start, relid)
+) PARTITION BY RANGE (bucket_part);
+COMMENT ON TABLE pgfc_observe.rollup_1d IS
+  'Per-relation 1-day aggregate of the 1h tier (S4). Monthly RANGE partitioned; ~365-day retention.';
+
+-- BRIN on the partition key (bloat-free range scans on the parent; see the raw tables for
+-- the rationale) and a btree on (relid, bucket_start DESC) backing per-relation trend
+-- queries and the carry-forward DISTINCT ON in current_rollup(). On the partitioned
+-- parents, so every partition inherits both.
+CREATE INDEX IF NOT EXISTS rollup_1m_bucket_part_brin ON pgfc_observe.rollup_1m USING brin (bucket_part);
+CREATE INDEX IF NOT EXISTS rollup_1h_bucket_part_brin ON pgfc_observe.rollup_1h USING brin (bucket_part);
+CREATE INDEX IF NOT EXISTS rollup_1d_bucket_part_brin ON pgfc_observe.rollup_1d USING brin (bucket_part);
+CREATE INDEX IF NOT EXISTS rollup_1m_relid_idx ON pgfc_observe.rollup_1m (relid, bucket_start DESC);
+CREATE INDEX IF NOT EXISTS rollup_1h_relid_idx ON pgfc_observe.rollup_1h (relid, bucket_start DESC);
+CREATE INDEX IF NOT EXISTS rollup_1d_relid_idx ON pgfc_observe.rollup_1d (relid, bucket_start DESC);
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Helpers
 -- ─────────────────────────────────────────────────────────────────────────────
 
@@ -346,6 +498,65 @@ LANGUAGE sql STABLE AS $fn$
 $fn$;
 COMMENT ON FUNCTION pgfc_observe._partition_inventory() IS
   'Child partitions of the telemetry tables with day, decoded range, est. rows, and size.';
+
+-- Generic single-partition ensure used by the rollup job (S4): create the partition of
+-- p_parent covering int key p_key if missing. p_span ('day'|'month') only selects the
+-- human-readable name suffix — the RANGE bound is always [p_key, p_key+1) in that span's
+-- unit. Idempotent (IF NOT EXISTS) and race-safe (duplicate_table caught), matching
+-- _ensure_partition. The raw tables keep their own _ensure_partition (called hot by
+-- observe()); this serves the rollup parents, whose keys are days (1m) or months (1h/1d).
+CREATE OR REPLACE FUNCTION pgfc_observe._ensure_part(
+    p_parent text, p_key integer, p_span text)
+RETURNS void LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_suffix text := CASE p_span
+        WHEN 'day'   THEN to_char(to_timestamp(p_key * 86400) AT TIME ZONE 'UTC', 'YYYYMMDD')
+        WHEN 'month' THEN to_char(pgfc_observe._month_start(p_key) AT TIME ZONE 'UTC', 'YYYYMM')
+    END;
+BEGIN
+    EXECUTE format(
+        'CREATE TABLE IF NOT EXISTS pgfc_observe.%I PARTITION OF pgfc_observe.%I '
+        'FOR VALUES FROM (%s) TO (%s)',
+        p_parent || '_p' || v_suffix, p_parent, p_key, p_key + 1);
+EXCEPTION WHEN duplicate_table THEN NULL;   -- concurrent run created it first
+END
+$fn$;
+COMMENT ON FUNCTION pgfc_observe._ensure_part(text, integer, text) IS
+  'Create the [p_key, p_key+1) RANGE partition of p_parent if missing (p_span day|month names it). Idempotent/race-safe; used by rollup() (S4).';
+
+-- One row per existing child partition of the three rollup tables, with its int key, span,
+-- decoded UTC range, est. rows, and size. Backs rollup_retain() and operator inspection.
+-- The 1m tier is day-spanned, the 1h/1d tiers month-spanned, so the range decode branches.
+CREATE OR REPLACE FUNCTION pgfc_observe._rollup_inventory()
+RETURNS TABLE (parent text, partition text, part_key integer, span text,
+               range_start timestamptz, range_end timestamptz,
+               approx_rows bigint, size_bytes bigint)
+LANGUAGE sql STABLE AS $fn$
+    SELECT parent, partition, part_key, span,
+           CASE span WHEN 'day'   THEN to_timestamp(part_key::bigint * 86400)
+                     WHEN 'month' THEN pgfc_observe._month_start(part_key)        END,
+           CASE span WHEN 'day'   THEN to_timestamp((part_key::bigint + 1) * 86400)
+                     WHEN 'month' THEN pgfc_observe._month_start(part_key + 1)    END,
+           approx_rows, size_bytes
+    FROM (
+        SELECT p.relname::text AS parent,
+               c.relname::text AS partition,
+               (regexp_match(pg_get_expr(c.relpartbound, c.oid),
+                             'FROM \((\d+)\)'))[1]::integer AS part_key,
+               CASE p.relname WHEN 'rollup_1m' THEN 'day' ELSE 'month' END AS span,
+               GREATEST(c.reltuples, 0)::bigint AS approx_rows,
+               pg_total_relation_size(c.oid)    AS size_bytes
+        FROM pg_inherits i
+        JOIN pg_class c     ON c.oid = i.inhrelid
+        JOIN pg_class p     ON p.oid = i.inhparent
+        JOIN pg_namespace n ON n.oid = p.relnamespace
+        WHERE n.nspname = 'pgfc_observe'
+          AND p.relname IN ('rollup_1m', 'rollup_1h', 'rollup_1d')
+    ) s
+    ORDER BY parent, part_key;
+$fn$;
+COMMENT ON FUNCTION pgfc_observe._rollup_inventory() IS
+  'Child partitions of the rollup tables with int key, span, decoded range, est. rows, and size.';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- observe(): collect one snapshot (header + per-relation samples)
@@ -579,6 +790,254 @@ COMMENT ON FUNCTION pgfc_observe.current_relation_state(bigint) IS
   'Dense current state per relation as-of a snapshot, reconstructed from sparse storage with live-computed freeze ages (S3).';
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Rollups  (Phase 1.5 S4)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Roll raw samples up into the 1m/1h/1d aggregate tiers. Cascading: 1m is built from raw
+-- relation_samples, 1h from 1m, 1d from 1h — each coarse average sample-count-weighted so
+-- it equals what it would have computed straight from raw. Idempotent: every tier upserts
+-- on its PK (recomputing a bucket overwrites it), so re-running is safe and late raw within
+-- the window is absorbed.
+--
+-- MUST run before raw truncation — but the real guarantee is the raw RETENTION WINDOW, not
+-- cron ordering: as long as rollup() runs at least once per raw-retention window (default
+-- raw keep is 3 days; schedule rollup() daily), no raw bucket is lost. p_lookback bounds
+-- the work to recent buckets and defaults to that window; the source cutoff is truncated to
+-- each tier's unit so a partial coarse bucket is always recomputed in full.
+CREATE OR REPLACE FUNCTION pgfc_observe.rollup(p_lookback interval DEFAULT '3 days')
+RETURNS bigint   -- total rows upserted across the three tiers
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_total bigint := 0;
+    v_n     bigint;
+    d       integer;
+    m       integer;
+BEGIN
+    -- Ensure the partitions covering the lookback window exist on every tier.
+    FOR d IN SELECT generate_series(pgfc_observe._epoch_day(now() - p_lookback),
+                                    pgfc_observe._epoch_day(now())) LOOP
+        PERFORM pgfc_observe._ensure_part('rollup_1m', d, 'day');
+    END LOOP;
+    FOR m IN SELECT generate_series(pgfc_observe._epoch_month(now() - p_lookback),
+                                    pgfc_observe._epoch_month(now())) LOOP
+        PERFORM pgfc_observe._ensure_part('rollup_1h', m, 'month');
+        PERFORM pgfc_observe._ensure_part('rollup_1d', m, 'month');
+    END LOOP;
+
+    -- Tier 1m ← raw relation_samples (UTC-aligned 1-minute buckets). Freeze ages are
+    -- computed live from the raw xids here (rollup runs soon after collection), matching
+    -- current_relation_state(); the legacy *_age columns are the pre-S3 fallback.
+    INSERT INTO pgfc_observe.rollup_1m AS r (
+        bucket_part, bucket_start, relid, schemaname, relname, sample_count,
+        avg_dead_tup, max_dead_tup, avg_live_tup, max_live_tup,
+        avg_mod_since_analyze, max_mod_since_analyze, avg_reltuples, max_reltuples,
+        max_relfrozenxid_age, max_relminmxid_age,
+        max_n_tup_ins, max_n_tup_upd, max_n_tup_del,
+        max_vacuum_count, max_autovacuum_count, max_analyze_count, max_autoanalyze_count,
+        avg_total_size_bytes, max_total_size_bytes)
+    SELECT
+        pgfc_observe._epoch_day(b.bucket_start), b.bucket_start, b.relid, b.schemaname, b.relname,
+        b.sample_count,
+        b.avg_dead_tup, b.max_dead_tup, b.avg_live_tup, b.max_live_tup,
+        b.avg_mod_since_analyze, b.max_mod_since_analyze, b.avg_reltuples, b.max_reltuples,
+        b.max_relfrozenxid_age, b.max_relminmxid_age,
+        b.max_n_tup_ins, b.max_n_tup_upd, b.max_n_tup_del,
+        b.max_vacuum_count, b.max_autovacuum_count, b.max_analyze_count, b.max_autoanalyze_count,
+        b.avg_total_size_bytes, b.max_total_size_bytes
+    FROM (
+        SELECT rs.relid,
+               date_trunc('minute', sn.collected_at, 'UTC') AS bucket_start,
+               max(rs.schemaname) AS schemaname, max(rs.relname) AS relname,
+               count(*)::integer  AS sample_count,
+               avg(rs.n_dead_tup)::float8           AS avg_dead_tup,
+               max(rs.n_dead_tup)                   AS max_dead_tup,
+               avg(rs.n_live_tup)::float8           AS avg_live_tup,
+               max(rs.n_live_tup)                   AS max_live_tup,
+               avg(rs.n_mod_since_analyze)::float8  AS avg_mod_since_analyze,
+               max(rs.n_mod_since_analyze)          AS max_mod_since_analyze,
+               avg(GREATEST(rs.reltuples, 0))::float8         AS avg_reltuples,
+               max(GREATEST(rs.reltuples, 0))::bigint         AS max_reltuples,
+               max(COALESCE(age(NULLIF(rs.relfrozenxid, '0'::xid))::bigint, rs.relfrozenxid_age))   AS max_relfrozenxid_age,
+               max(COALESCE(mxid_age(NULLIF(rs.relminmxid, '0'::xid))::bigint, rs.relminmxid_age))  AS max_relminmxid_age,
+               max(rs.n_tup_ins) AS max_n_tup_ins,
+               max(rs.n_tup_upd) AS max_n_tup_upd,
+               max(rs.n_tup_del) AS max_n_tup_del,
+               max(rs.vacuum_count)     AS max_vacuum_count,
+               max(rs.autovacuum_count) AS max_autovacuum_count,
+               max(rs.analyze_count)    AS max_analyze_count,
+               max(rs.autoanalyze_count) AS max_autoanalyze_count,
+               avg(rs.total_size_bytes)::float8 AS avg_total_size_bytes,
+               max(rs.total_size_bytes)         AS max_total_size_bytes
+        FROM pgfc_observe.relation_samples rs
+        JOIN pgfc_observe.snapshots sn USING (snapshot_id)
+        WHERE sn.collected_at >= now() - p_lookback
+        GROUP BY rs.relid, date_trunc('minute', sn.collected_at, 'UTC')
+    ) b
+    ON CONFLICT (bucket_part, bucket_start, relid) DO UPDATE SET
+        schemaname = EXCLUDED.schemaname, relname = EXCLUDED.relname,
+        sample_count = EXCLUDED.sample_count,
+        avg_dead_tup = EXCLUDED.avg_dead_tup, max_dead_tup = EXCLUDED.max_dead_tup,
+        avg_live_tup = EXCLUDED.avg_live_tup, max_live_tup = EXCLUDED.max_live_tup,
+        avg_mod_since_analyze = EXCLUDED.avg_mod_since_analyze,
+        max_mod_since_analyze = EXCLUDED.max_mod_since_analyze,
+        avg_reltuples = EXCLUDED.avg_reltuples, max_reltuples = EXCLUDED.max_reltuples,
+        max_relfrozenxid_age = EXCLUDED.max_relfrozenxid_age,
+        max_relminmxid_age = EXCLUDED.max_relminmxid_age,
+        max_n_tup_ins = EXCLUDED.max_n_tup_ins, max_n_tup_upd = EXCLUDED.max_n_tup_upd,
+        max_n_tup_del = EXCLUDED.max_n_tup_del,
+        max_vacuum_count = EXCLUDED.max_vacuum_count,
+        max_autovacuum_count = EXCLUDED.max_autovacuum_count,
+        max_analyze_count = EXCLUDED.max_analyze_count,
+        max_autoanalyze_count = EXCLUDED.max_autoanalyze_count,
+        avg_total_size_bytes = EXCLUDED.avg_total_size_bytes,
+        max_total_size_bytes = EXCLUDED.max_total_size_bytes;
+    GET DIAGNOSTICS v_n = ROW_COUNT;  v_total := v_total + v_n;
+
+    -- Tier 1h ← 1m, Tier 1d ← 1h. Same shape (monthly-partitioned, sample-count-weighted);
+    -- only the source table and bucket unit differ, so they share one helper, which returns
+    -- its own upsert count.
+    SELECT pgfc_observe._rollup_coarsen('rollup_1h', 'rollup_1m', 'hour', p_lookback) INTO v_n;
+    v_total := v_total + v_n;
+    SELECT pgfc_observe._rollup_coarsen('rollup_1d', 'rollup_1h', 'day', p_lookback) INTO v_n;
+    v_total := v_total + v_n;
+
+    RETURN v_total;
+END
+$fn$;
+COMMENT ON FUNCTION pgfc_observe.rollup(interval) IS
+  'Cascade raw samples into the 1m/1h/1d rollup tiers (S4). Idempotent (per-PK upsert); run at least once per raw-retention window. Returns rows upserted.';
+
+-- Coarsen one rollup tier into the next (1m→1h, 1h→1d). Aggregates p_src into p_dst on
+-- UTC-aligned p_unit buckets, sample-count-weighting the averages and max-ing the rest, and
+-- upserts on the destination PK. Returns the number of rows upserted (so rollup() can sum
+-- it via ROW_COUNT). Kept as a helper because the two coarsen steps are identical bar the
+-- source table, bucket unit, and partition-key function.
+CREATE OR REPLACE FUNCTION pgfc_observe._rollup_coarsen(
+    p_dst text, p_src text, p_unit text, p_lookback interval)
+RETURNS bigint LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_n bigint;
+BEGIN
+    EXECUTE format($q$
+        INSERT INTO pgfc_observe.%I AS r (
+            bucket_part, bucket_start, relid, schemaname, relname, sample_count,
+            avg_dead_tup, max_dead_tup, avg_live_tup, max_live_tup,
+            avg_mod_since_analyze, max_mod_since_analyze, avg_reltuples, max_reltuples,
+            max_relfrozenxid_age, max_relminmxid_age,
+            max_n_tup_ins, max_n_tup_upd, max_n_tup_del,
+            max_vacuum_count, max_autovacuum_count, max_analyze_count, max_autoanalyze_count,
+            avg_total_size_bytes, max_total_size_bytes)
+        SELECT
+            pgfc_observe._epoch_month(b.bucket_start), b.bucket_start, b.relid, b.schemaname, b.relname,
+            b.sample_count,
+            b.avg_dead_tup, b.max_dead_tup, b.avg_live_tup, b.max_live_tup,
+            b.avg_mod_since_analyze, b.max_mod_since_analyze, b.avg_reltuples, b.max_reltuples,
+            b.max_relfrozenxid_age, b.max_relminmxid_age,
+            b.max_n_tup_ins, b.max_n_tup_upd, b.max_n_tup_del,
+            b.max_vacuum_count, b.max_autovacuum_count, b.max_analyze_count, b.max_autoanalyze_count,
+            b.avg_total_size_bytes, b.max_total_size_bytes
+        FROM (
+            SELECT s.relid,
+                   date_trunc(%L, s.bucket_start, 'UTC') AS bucket_start,
+                   max(s.schemaname) AS schemaname, max(s.relname) AS relname,
+                   sum(s.sample_count)::integer AS sample_count,
+                   sum(s.avg_dead_tup * s.sample_count) / NULLIF(sum(s.sample_count), 0)          AS avg_dead_tup,
+                   max(s.max_dead_tup) AS max_dead_tup,
+                   sum(s.avg_live_tup * s.sample_count) / NULLIF(sum(s.sample_count), 0)          AS avg_live_tup,
+                   max(s.max_live_tup) AS max_live_tup,
+                   sum(s.avg_mod_since_analyze * s.sample_count) / NULLIF(sum(s.sample_count), 0) AS avg_mod_since_analyze,
+                   max(s.max_mod_since_analyze) AS max_mod_since_analyze,
+                   sum(s.avg_reltuples * s.sample_count) / NULLIF(sum(s.sample_count), 0)         AS avg_reltuples,
+                   max(s.max_reltuples) AS max_reltuples,
+                   max(s.max_relfrozenxid_age) AS max_relfrozenxid_age,
+                   max(s.max_relminmxid_age)   AS max_relminmxid_age,
+                   max(s.max_n_tup_ins) AS max_n_tup_ins,
+                   max(s.max_n_tup_upd) AS max_n_tup_upd,
+                   max(s.max_n_tup_del) AS max_n_tup_del,
+                   max(s.max_vacuum_count)     AS max_vacuum_count,
+                   max(s.max_autovacuum_count) AS max_autovacuum_count,
+                   max(s.max_analyze_count)    AS max_analyze_count,
+                   max(s.max_autoanalyze_count) AS max_autoanalyze_count,
+                   sum(s.avg_total_size_bytes * s.sample_count) / NULLIF(sum(s.sample_count), 0) AS avg_total_size_bytes,
+                   max(s.max_total_size_bytes) AS max_total_size_bytes
+            FROM pgfc_observe.%I s
+            WHERE s.bucket_start >= date_trunc(%L, now() - $1, 'UTC')
+            GROUP BY s.relid, date_trunc(%L, s.bucket_start, 'UTC')
+        ) b
+        ON CONFLICT (bucket_part, bucket_start, relid) DO UPDATE SET
+            schemaname = EXCLUDED.schemaname, relname = EXCLUDED.relname,
+            sample_count = EXCLUDED.sample_count,
+            avg_dead_tup = EXCLUDED.avg_dead_tup, max_dead_tup = EXCLUDED.max_dead_tup,
+            avg_live_tup = EXCLUDED.avg_live_tup, max_live_tup = EXCLUDED.max_live_tup,
+            avg_mod_since_analyze = EXCLUDED.avg_mod_since_analyze,
+            max_mod_since_analyze = EXCLUDED.max_mod_since_analyze,
+            avg_reltuples = EXCLUDED.avg_reltuples, max_reltuples = EXCLUDED.max_reltuples,
+            max_relfrozenxid_age = EXCLUDED.max_relfrozenxid_age,
+            max_relminmxid_age = EXCLUDED.max_relminmxid_age,
+            max_n_tup_ins = EXCLUDED.max_n_tup_ins, max_n_tup_upd = EXCLUDED.max_n_tup_upd,
+            max_n_tup_del = EXCLUDED.max_n_tup_del,
+            max_vacuum_count = EXCLUDED.max_vacuum_count,
+            max_autovacuum_count = EXCLUDED.max_autovacuum_count,
+            max_analyze_count = EXCLUDED.max_analyze_count,
+            max_autoanalyze_count = EXCLUDED.max_autoanalyze_count,
+            avg_total_size_bytes = EXCLUDED.avg_total_size_bytes,
+            max_total_size_bytes = EXCLUDED.max_total_size_bytes
+    $q$, p_dst, p_unit, p_src, p_unit, p_unit)
+    USING p_lookback;
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    RETURN v_n;
+END
+$fn$;
+COMMENT ON FUNCTION pgfc_observe._rollup_coarsen(text, text, text, interval) IS
+  'Aggregate one rollup tier into the next coarser one on UTC p_unit buckets (sample-count-weighted avgs); upsert into p_dst. Helper for rollup() (S4).';
+
+-- Carry-forward reader: the latest known bucket per relation as-of p_as_of in tier p_tier
+-- ('1m'|'1h'|'1d'). Mirrors current_relation_state() over the rollup tiers — sparse
+-- storage means a quiet relation has no bucket for a given period, so DISTINCT ON (relid)
+-- the most recent bucket at or before p_as_of. This is what makes a long-range query
+-- answerable for a relation whose raw samples have long since rotated away.
+CREATE OR REPLACE FUNCTION pgfc_observe.current_rollup(
+    p_tier text DEFAULT '1m', p_as_of timestamptz DEFAULT now())
+RETURNS TABLE (
+    bucket_start timestamptz, relid oid, schemaname name, relname name, sample_count integer,
+    avg_dead_tup double precision, max_dead_tup bigint,
+    avg_live_tup double precision, max_live_tup bigint,
+    avg_mod_since_analyze double precision, max_mod_since_analyze bigint,
+    avg_reltuples double precision, max_reltuples bigint,
+    max_relfrozenxid_age bigint, max_relminmxid_age bigint,
+    max_n_tup_ins bigint, max_n_tup_upd bigint, max_n_tup_del bigint,
+    max_vacuum_count bigint, max_autovacuum_count bigint,
+    max_analyze_count bigint, max_autoanalyze_count bigint,
+    avg_total_size_bytes double precision, max_total_size_bytes bigint)
+LANGUAGE plpgsql STABLE AS $fn$
+DECLARE
+    v_tbl text := CASE p_tier WHEN '1m' THEN 'rollup_1m'
+                              WHEN '1h' THEN 'rollup_1h'
+                              WHEN '1d' THEN 'rollup_1d' END;
+BEGIN
+    IF v_tbl IS NULL THEN
+        RAISE EXCEPTION 'unknown rollup tier: %', p_tier
+            USING HINT = 'use ''1m'', ''1h'', or ''1d''';
+    END IF;
+    RETURN QUERY EXECUTE format($q$
+        SELECT DISTINCT ON (relid)
+            bucket_start, relid, schemaname, relname, sample_count,
+            avg_dead_tup, max_dead_tup, avg_live_tup, max_live_tup,
+            avg_mod_since_analyze, max_mod_since_analyze, avg_reltuples, max_reltuples,
+            max_relfrozenxid_age, max_relminmxid_age,
+            max_n_tup_ins, max_n_tup_upd, max_n_tup_del,
+            max_vacuum_count, max_autovacuum_count, max_analyze_count, max_autoanalyze_count,
+            avg_total_size_bytes, max_total_size_bytes
+        FROM pgfc_observe.%I
+        WHERE bucket_start <= $1
+        ORDER BY relid, bucket_start DESC
+    $q$, v_tbl) USING p_as_of;
+END
+$fn$;
+COMMENT ON FUNCTION pgfc_observe.current_rollup(text, timestamptz) IS
+  'Carry-forward latest rollup bucket per relation as-of p_as_of in tier 1m|1h|1d (S4): answers long-range queries after raw rotates away.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Views (latest sample per relation; human-readable debt)
 -- ─────────────────────────────────────────────────────────────────────────────
 
@@ -697,11 +1156,50 @@ $fn$;
 COMMENT ON FUNCTION pgfc_observe.drop_empty_partitions(interval) IS
   'Tier-2 GC: DROP empty telemetry partitions older than keep (default 30 days). Returns partitions dropped.';
 
+-- Rollup retention (S4): cascading per-tier windows — the finer the tier, the shorter it
+-- lives (1m 7 d, 1h 90 d, 1d 365 d; all overridable). Whole-partition DROP, never row-by-row
+-- DELETE, so it stays zero-bloat like the raw tiers. Rollup partition counts are small
+-- (≤7 daily for 1m; a handful of monthly for 1h/1d), so a single direct DROP of a partition
+-- whose entire range is out of window is simpler than the raw tables' two-tier
+-- truncate-then-drop. A partition is droppable only when its range_end is at/under the
+-- cutoff, so a still-in-window partition is never dropped.
+CREATE OR REPLACE FUNCTION pgfc_observe.rollup_retain(
+    keep_1m interval DEFAULT '7 days',
+    keep_1h interval DEFAULT '90 days',
+    keep_1d interval DEFAULT '365 days')
+RETURNS bigint   -- number of rollup partitions dropped
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_count bigint := 0;
+    r       record;
+    v_keep  interval;
+BEGIN
+    FOR r IN SELECT parent, partition, range_end FROM pgfc_observe._rollup_inventory() LOOP
+        v_keep := CASE r.parent WHEN 'rollup_1m' THEN keep_1m
+                                WHEN 'rollup_1h' THEN keep_1h
+                                WHEN 'rollup_1d' THEN keep_1d END;
+        IF r.range_end <= now() - v_keep THEN
+            EXECUTE format('DROP TABLE pgfc_observe.%I', r.partition);
+            v_count := v_count + 1;
+        END IF;
+    END LOOP;
+    RETURN v_count;
+END
+$fn$;
+COMMENT ON FUNCTION pgfc_observe.rollup_retain(interval, interval, interval) IS
+  'Cascading rollup GC (S4): DROP rollup partitions past their per-tier window (1m 7d / 1h 90d / 1d 365d). Returns partitions dropped.';
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Bootstrap: ensure the current day's partition exists so a fresh install accepts
 -- inserts immediately (observe() re-ensures on every run). Idempotent.
 -- ─────────────────────────────────────────────────────────────────────────────
 SELECT pgfc_observe._ensure_partition();
+
+-- Bootstrap the current rollup partitions too (S4), so a fresh install can rollup()
+-- immediately; rollup() re-ensures the lookback window on every run. Idempotent.
+SELECT pgfc_observe._ensure_part('rollup_1m', pgfc_observe._epoch_day(now()),   'day');
+SELECT pgfc_observe._ensure_part('rollup_1h', pgfc_observe._epoch_month(now()), 'month');
+SELECT pgfc_observe._ensure_part('rollup_1d', pgfc_observe._epoch_month(now()), 'month');
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Additive upgrades  (see header)
