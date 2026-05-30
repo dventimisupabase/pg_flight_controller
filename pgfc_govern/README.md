@@ -26,6 +26,24 @@ plan → verify` and writes a complete `decision_log` / `diagnostics` trail, but
 
 Remove with `\i uninstall.sql` (`DROP SCHEMA ... CASCADE`); leaves pgfc_observe intact.
 
+## Verify it works (advisory)
+
+Run one fast loop and one control loop, then read what the governor *would* do —
+with the default policy nothing is ever applied:
+
+<!-- doctest -->
+
+```sql
+SELECT pgfc_govern.observe_tick();    -- observe + classify + estimate
+SELECT pgfc_govern.control_tick();    -- plan + verify (advisory: apply() never fires)
+SELECT relname, kind, decision, proposed_value
+FROM pgfc_govern.governor_status
+ORDER BY relname
+LIMIT 5;
+```
+
+(A doctest — CI runs it against a fresh install on every PR.)
+
 ## What's here (Phase 1)
 
 Functions: `observe_tick()` (observe + `classify` + `estimate`) and `control_tick()`

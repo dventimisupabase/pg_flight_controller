@@ -17,6 +17,23 @@ This is **Phase 0** of the design in [`out/technical-design.md`](../out/technica
 
 Remove with `\i uninstall.sql` (`DROP SCHEMA ... CASCADE`).
 
+## Verify it works
+
+Collect one snapshot and look at the per-relation maintenance debt:
+
+<!-- doctest -->
+
+```sql
+SELECT pgfc_observe.observe();                 -- returns the new snapshot_id
+SELECT relname, dead_tuple_fraction, vacuum_debt_ratio, freeze_debt
+FROM pgfc_observe.maintenance_debt
+ORDER BY vacuum_debt_ratio DESC NULLS LAST
+LIMIT 5;
+```
+
+(The example above is a doctest — CI runs it against a fresh install on every PR, so
+it can't silently fall out of date.)
+
 ## Schema evolution
 
 Additive-only: new columns are nullable; existing columns are never dropped or
