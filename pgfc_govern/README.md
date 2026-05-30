@@ -26,6 +26,27 @@ plan → verify` and writes a complete `decision_log` / `diagnostics` trail, but
 
 Remove with `\i uninstall.sql` (`DROP SCHEMA ... CASCADE`); leaves pgfc_observe intact.
 
+## What's here (Phase 1)
+
+Functions: `observe_tick()` (observe + `classify` + `estimate`) and `control_tick()`
+(`plan` + `apply`-if-not-advisory + `verify`), driven by pg_cron in production.
+Core steps: `classify()`, `estimate()`, `plan()`, `apply()`, `verify()`, plus the
+`removability`-aware diagnosis. Views: `governor_status`, `catalog_health`,
+`active_diagnostics`.
+
+### Deliberately deferred (so scope is explicit, not accidental)
+
+- **Threshold lever and the analyze objective.** `plan()` moves the vacuum
+  scale-factor lever only; the small-table threshold lever and the analyze-objective
+  decision are follow-ups.
+- **Actuation-economy gates** (per-relation / global / daily rate limits,
+  sustained-deviation) — Phase 2, when `apply()` is enabled in earnest.
+- **`verify()`** is a no-op in Phase 1 (nothing is applied to attribute); Phase 2
+  expands it.
+- **`apply()`** is implemented (single-actuator, with live no-op, ownership,
+  baseline capture, 100 ms non-blocking lock, failure recording) but only ever runs
+  when `advisory_only = false`.
+
 ## Tests
 
 From the project root (installs both extensions, runs both suites):
