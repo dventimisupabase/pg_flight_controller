@@ -34,11 +34,28 @@ LIMIT 5;
 (The example above is a doctest — CI runs it against a fresh install on every PR, so
 it can't silently fall out of date.)
 
+## Storage
+
+`snapshots` and `relation_samples` are **daily `RANGE` partitioned** on an `int4`
+epoch-day key (`collected_day`). `observe()` creates each day's partition on demand;
+retention is whole-partition rotation, so it produces zero dead tuples:
+
+- `retain()` (nightly) `TRUNCATE`s partitions older than its window (default 3 days).
+- `drop_empty_partitions()` (monthly) `DROP`s the empty shells (default 30 days).
+
+Inspect partitions with `SELECT * FROM pgfc_observe._partition_inventory()`.
+
 ## Schema evolution
 
 Additive-only: new columns are nullable; existing columns are never dropped or
 renamed. Historical rows with `NULL` in a newer column mean "not collected then."
 Re-running `install.sql` upgrades in place.
+
+> **One-time exception (S2).** Adding partitioning could not be done in place, so
+> re-running `install.sql` over a pre-S2 install **destructively recreates** the two
+> telemetry tables (telemetry is disposable). This `DROP ... CASCADE` also drops
+> dependent cross-schema views such as `pgfc_govern.catalog_health` — re-run
+> `pgfc_govern/install.sql` afterward to restore them.
 
 ## Tests
 
