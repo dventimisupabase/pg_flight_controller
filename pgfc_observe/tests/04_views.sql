@@ -1,7 +1,7 @@
 -- Views exist and the debt math matches hand-computed values, including the
 -- effective-threshold = reloption ?? global-default rule.
 BEGIN;
-SELECT plan(11);
+SELECT plan(13);
 
 SELECT has_view('pgfc_observe', 'relation_health', 'relation_health view exists');
 SELECT has_view('pgfc_observe', 'maintenance_debt', 'maintenance_debt view exists');
@@ -53,6 +53,16 @@ SELECT is(round((SELECT vacuum_debt_ratio FROM pgfc_observe.maintenance_debt WHE
 -- relation_health surfaces the latest sample
 SELECT is((SELECT n_dead_tup FROM pgfc_observe.relation_health WHERE relid = 99999),
           30::bigint, 'relation_health shows the latest sample');
+
+-- Never-analyzed table: reltuples = -1 must not yield a negative fraction.
+INSERT INTO pgfc_observe.relation_samples
+  (snapshot_id, relid, schemaname, relname, n_dead_tup, n_mod_since_analyze, reltuples)
+VALUES ((SELECT max(snapshot_id) FROM pgfc_observe.snapshots),
+        99997, 'public', 't_never_analyzed', 5, 5, -1);
+SELECT is((SELECT dead_tuple_fraction FROM pgfc_observe.maintenance_debt WHERE relid = 99997),
+          NULL, 'reltuples = -1 yields NULL dead_tuple_fraction, not a negative');
+SELECT is((SELECT vacuum_threshold FROM pgfc_observe.maintenance_debt WHERE relid = 99997),
+          50::float8, 'reltuples = -1 clamps to 0: vacuum_threshold = base (50)');
 
 SELECT * FROM finish();
 ROLLBACK;

@@ -3,9 +3,17 @@
 -- Read-only telemetry for the pg_flight_controller autovacuum governor: periodic
 -- snapshots of autovacuum-relevant state. Writes only to its own schema.
 --
--- Re-runnable: this file is the upgrade path. Everything uses
--- CREATE SCHEMA IF NOT EXISTS / CREATE OR REPLACE / CREATE TABLE IF NOT EXISTS,
--- and schema changes are additive-only (new nullable columns; never drop/rename).
+-- Re-running this file is safe and idempotent for the CURRENT schema
+-- (CREATE ... IF NOT EXISTS / CREATE OR REPLACE throughout; the harness applies it
+-- twice to prove this).
+--
+-- Schema evolution is additive-only (new NULLABLE columns; never drop/rename).
+-- IMPORTANT: `CREATE TABLE IF NOT EXISTS` does NOT add a column to a table that
+-- already exists, so it alone does not upgrade an older install. To add a column:
+--   1. add it (nullable) to the CREATE TABLE below — for fresh installs; and
+--   2. add a matching `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` in the
+--      "Additive upgrades" section near the end — for existing installs on re-run.
+-- v0.0.1 is the initial shape, so that section is currently empty.
 
 CREATE SCHEMA IF NOT EXISTS pgfc_observe;
 COMMENT ON SCHEMA pgfc_observe IS
@@ -267,23 +275,26 @@ WITH latest AS (
     JOIN pgfc_observe.snapshots sn USING (snapshot_id)
     ORDER BY rs.relid, sn.snapshot_id DESC
 ), eff AS (
+    -- reltuples is -1 for a never-analyzed table (PG14+); clamp to 0 so it reads as
+    -- "unknown" (NULL fractions, threshold = base) rather than producing negatives.
     SELECT *,
+      GREATEST(reltuples, 0) AS reltuples_est,
       COALESCE(pgfc_observe.effective_reloption(reloptions,'autovacuum_vacuum_threshold')::bigint,
                def_vac_threshold)
       + COALESCE(pgfc_observe.effective_reloption(reloptions,'autovacuum_vacuum_scale_factor')::float8,
-                 def_vac_scale_factor) * reltuples                            AS vacuum_threshold,
+                 def_vac_scale_factor) * GREATEST(reltuples, 0)              AS vacuum_threshold,
       COALESCE(pgfc_observe.effective_reloption(reloptions,'autovacuum_analyze_threshold')::bigint,
                def_ana_threshold)
       + COALESCE(pgfc_observe.effective_reloption(reloptions,'autovacuum_analyze_scale_factor')::float8,
-                 def_ana_scale_factor) * reltuples                           AS analyze_threshold
+                 def_ana_scale_factor) * GREATEST(reltuples, 0)             AS analyze_threshold
     FROM latest
 )
 SELECT relid, schemaname, relname,
        n_dead_tup, n_mod_since_analyze, reltuples,
        vacuum_threshold, analyze_threshold,
        -- target-space quantities: fraction of the table that is dead / stale
-       (n_dead_tup::float8          / NULLIF(reltuples, 0))        AS dead_tuple_fraction,
-       (n_mod_since_analyze::float8 / NULLIF(reltuples, 0))        AS mod_fraction,
+       (n_dead_tup::float8          / NULLIF(reltuples_est, 0))    AS dead_tuple_fraction,
+       (n_mod_since_analyze::float8 / NULLIF(reltuples_est, 0))    AS mod_fraction,
        -- overdue indicators only (>1 => past trigger, waiting): not control setpoints
        (n_dead_tup::float8          / NULLIF(vacuum_threshold, 0)) AS vacuum_debt_ratio,
        (n_mod_since_analyze::float8 / NULLIF(analyze_threshold, 0)) AS analyze_debt_ratio,
@@ -311,3 +322,12 @@ LANGUAGE sql AS $$
 $$;
 COMMENT ON FUNCTION pgfc_observe.retain(interval) IS
   'Delete snapshots older than keep (default 14 days); relation_samples cascade.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Additive upgrades  (see header)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- When a future version adds a column, add an idempotent ALTER here so existing
+-- installs gain it on re-run, e.g.:
+--   ALTER TABLE pgfc_observe.relation_samples
+--       ADD COLUMN IF NOT EXISTS n_tup_newpage_upd bigint;   -- PG16+, v0.0.2
+-- v0.0.1 is the initial shape; nothing to reconcile yet.

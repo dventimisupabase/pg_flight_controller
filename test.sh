@@ -46,7 +46,9 @@ for v in "${VERSIONS[@]}"; do
 
   rc=0
   # pgTAP must be available for the tests; install.sql is the extension under test.
+  # Apply install.sql TWICE (ON_ERROR_STOP) to prove re-run is idempotent/safe.
   "${COMPOSE[@]}" exec -T db "${PSQL[@]}" -c "CREATE EXTENSION IF NOT EXISTS pgtap;" \
+    && "${COMPOSE[@]}" exec -T db "${PSQL[@]}" -f /sql/install.sql \
     && "${COMPOSE[@]}" exec -T db "${PSQL[@]}" -f /sql/install.sql \
     && "${COMPOSE[@]}" exec -T db bash -c \
          "pg_prove -U postgres -d pgfc_test --pset pager=off /sql/tests/*.sql" \
