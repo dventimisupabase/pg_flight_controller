@@ -1008,19 +1008,20 @@ progress, not commands** (Appendix C). When debt stays high, the governor classi
 ```text
                        autovacuum_count        cleanup effectiveness     →  cause
                        incrementing?           (§7.4, EWMA, sustained)
-config-insufficient    NO                      —                         →  normal control:
-                                                                            lower threshold
-                                                                            (actuator HAS authority)
+config (not firing)    NO                      —                         →  suppressed:not_firing
+                                                                            (hold + diagnose;
+                                                                            actuator has NO authority)
 io_limited             YES                     OK (vacuums DO drop dead   →  escalate:io_limited
                                                tuples; refills faster)
 inhibited              YES                     ≈ 0 (vacuums run, dead     →  diagnose: inhibitor
                                                tuples do NOT drop)
 ```
 
-So: **`autovacuum_count` delta separates config from saturation; effectiveness
-separates `io_limited` from inhibited; the xmin horizon (§5.3a) attributes *which*
-inhibitor.** All require ≥ K observed vacuum cycles, so no cause is declared on a
-table the governor has not yet watched through a cycle.
+So: **`autovacuum_count` delta separates `config` (not firing) from the
+running-but-stuck causes; effectiveness separates `io_limited` from `inhibited`; the
+xmin horizon (§5.3a) attributes *which* inhibitor.** All require ≥ K observed vacuum
+cycles, so no cause is declared on a table the governor has not yet watched through a
+cycle.
 
 **A pinned, non-advancing horizon is a *necessary* condition for `inhibited` — low
 effectiveness alone is not enough.** This is the dangerous cell: a fast-churning
@@ -1032,9 +1033,16 @@ effectiveness **with a healthy horizon is treated as measurement noise**, never 
 inhibitor; it falls through to `io_limited` only if debt is genuinely and persistently
 high. `inhibited` requires the horizon evidence.
 
-- **config-insufficient** is not saturation at all — autovacuum simply is not firing
-  often enough; the actuator has authority, so this is ordinary control (lower the
-  threshold/scale per §11.1–11.2).
+- **`config` (not firing)** — debt is high but autovacuum has not run. Because
+  `debt_high` means `n_dead_tup` is *already over* the trigger, the table is already
+  eligible — lowering the threshold/scale cannot make it fire. The actuator has **no
+  authority** here, so the response is **hold + diagnose** (`suppressed:not_firing`):
+  surface that autovacuum is not keeping up (disabled? worker-starved? just crossed
+  and imminent?) instead of issuing a futile change. The genuinely *under-triggered,
+  fixable* case — where the current setting is laxer than the class target — is
+  **not** `debt_high`; it is the ordinary `saturation_cause IS NULL` regime, where
+  feedforward lowers `sf` toward `f*` (§11.1–11.2). That normal control is not a
+  saturation cause and does not pass through here.
 
 - **`io_limited`** — vacuum fires and *does* reclaim, but churn outruns it. Lowering
   `sf` further is futile (the trigger is already always tripped). Emit
@@ -1706,7 +1714,7 @@ pgTAP, run via `./test.sh` on PG 15/16/17/18 (matches `CLAUDE.md`).
 
 - **Saturation classification (`pgfc_govern/tests/`, Appendix C):** the three-way
   discriminator (§11.3) — (a) debt high with `autovacuum_count` *not* incrementing →
-  `config` (normal control, lowers threshold); (b) incrementing with
+  `config` (hold + diagnose, never lowers threshold); (b) incrementing with
   `cleanup_per_run > 0` but debt refilling → `io_limited`; (c) incrementing with
   effectiveness ≈ 0 and a pinned `oldest_xmin` → `inhibited`. Effectiveness is judged over K cycles, never
   one; no cause is declared before K observed cycles.
