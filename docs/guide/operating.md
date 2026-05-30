@@ -152,6 +152,29 @@ use `pgfc_observe.current_relation_state()` (or the `relation_health` /
 `maintenance_debt` views built on it), which reconstructs the dense view from sparse
 storage and recomputes freeze ages live.
 
+In databases with thousands of relations you can bound *which* relations `observe()`
+samples through the single-row `pgfc_observe.collection_policy` table. System schemas
+(`pg_catalog`, `information_schema`, and the governor's own schemas) are always
+excluded; the policy adds four further filters:
+
+- `exclude_temp` (default `true`) — skip temporary tables.
+- `include_extension_owned` (default `false`) — skip relations owned by an extension.
+- `excluded_schemas` (default `{}`) — extra schemas to skip, *additive* to the system
+  list (it can never re-include `pg_catalog`).
+- `min_partition_size_bytes` (default `0`, disabled) — skip child partitions smaller
+  than this, so a partition-heavy schema does not flood collection.
+
+Change them in place, e.g.:
+
+```sql
+UPDATE pgfc_observe.collection_policy
+   SET excluded_schemas = ARRAY['staging','scratch']::name[],
+       min_partition_size_bytes = 10 * 1024 * 1024;   -- 10 MB
+```
+
+The filters apply at collection, so rollups and the `pgfc_govern` views inherit the
+filtered set automatically.
+
 ## Enabling active control
 
 > **Phase status.** Active control is **experimental** in this release. `apply()`

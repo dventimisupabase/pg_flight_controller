@@ -54,6 +54,13 @@ dense view from sparse storage and recomputes the (globally-ticking) freeze ages
 from the stored raw `relfrozenxid` / `relminmxid`. `relation_last_state` is a
 rebuildable cache, so it is empty after a crash until the next `observe()` refills it.
 
+For large schemas, the single-row `collection_policy` table bounds *which* relations
+`observe()` samples: it always skips the system schemas and adds optional filters for
+temporary tables (`exclude_temp`), extension-owned relations
+(`include_extension_owned`), extra schemas (`excluded_schemas`), and sub-threshold
+child partitions (`min_partition_size_bytes`). Rollups and the `pgfc_govern` views
+inherit the filtered set automatically.
+
 ## Schema evolution
 
 Additive-only: new columns are nullable; existing columns are never dropped or

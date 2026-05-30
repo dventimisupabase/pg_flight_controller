@@ -76,6 +76,18 @@ section in the same pull request as your change (this is a convention, not a CI 
   `current_rollup(tier, as_of)` carry-forward reader keeps a quiet relation answerable
   after its raw samples are gone.
 
+- **Storage Phase 1.5 — S5 (cardinality filters).** A new single-row
+  `pgfc_observe.collection_policy` table bounds *which* relations `observe()` samples,
+  so the governor stays cheap in databases with thousands of relations. Four filters
+  are applied set-based inside the collection query (never per-row): temporary tables
+  (`exclude_temp`, default on), extension-owned relations
+  (`include_extension_owned`, default off), additional schemas (`excluded_schemas`,
+  additive to the always-excluded system schemas — config can never re-include
+  `pg_catalog`), and child partitions below a size floor (`min_partition_size_bytes`,
+  `0` disables). Rollups and `pgfc_govern`'s readers inherit the filtered set for free
+  because they read what `observe()` wrote. No tiered cadence — sparse change-logging
+  (S3) already handles cold tables.
+
 ### Changed
 
 - **`pgfc_observe.retain(interval)` is no longer row-by-row `DELETE`** — it `TRUNCATE`s
