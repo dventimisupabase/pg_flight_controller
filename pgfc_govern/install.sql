@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.policy (
     io_budget_fraction double precision,                        -- reserved (Phase 3)
     freeze_posture     text NOT NULL DEFAULT 'standard'
                        CHECK (freeze_posture IN ('standard','conservative')),
-    -- actuator-economy / catalog-mutation knobs (Appendices A & B)
+    -- actuator-economy / catalog-mutation knobs
     min_interval       interval NOT NULL DEFAULT '1 hour',      -- per-relation rate limit
     global_max_changes_per_cycle integer NOT NULL DEFAULT 50,   -- cluster cap / cycle
     daily_mutation_budget integer NOT NULL DEFAULT 500,         -- cluster cap / day
@@ -68,7 +68,7 @@ INSERT INTO pgfc_govern.policy (policy_name, description)
 VALUES ('default', 'Default advisory policy (plans, never applies)')
 ON CONFLICT (policy_name) DO NOTHING;
 
--- Policy history: human-owned desired-state changes over time (Appendix D, class 5).
+-- Policy history: human-owned desired-state changes over time.
 -- Retained indefinitely (pruned last, explicitly) so past governor behavior can be
 -- explained. The trigger below is created AFTER the seed INSERT, so the auto-seeded
 -- 'default' policy is intentionally not logged — only real human changes are.
@@ -134,7 +134,7 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.relation_estimate (
     cleanup_per_run     bigint,
     maintenance_lag     interval,
     burstiness          double precision,
-    -- effectiveness & saturation (Appendix C)
+    -- effectiveness & saturation
     effectiveness       double precision,
     freeze_progressing  boolean,
     saturation_cause    text,             -- NULL | 'config' | 'io_limited' | 'inhibited'
@@ -209,7 +209,7 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.tick_log (
     error          text
 );
 
--- Diagnostic findings: saturation root-cause + actionable recommendation (Appendix C).
+-- Diagnostic findings: saturation root-cause + actionable recommendation.
 CREATE TABLE IF NOT EXISTS pgfc_govern.diagnostics (
     diagnostic_id   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     relid           oid,             -- NULL = cluster-level finding
@@ -612,7 +612,7 @@ BEGIN
                            'freeze_debt', freeze_debt,
                            'horizon_owner', oldest_xmin_owner),
         jsonb_build_object('f_template', f_template, 'eff_f', eff_f, 'sf_target', sf_target),
-        -- precedence: freeze floor dominates saturation suppression (§11.5/§13)
+        -- precedence: freeze floor dominates saturation suppression
         CASE
             WHEN freeze_stress AND horizon_pinned
                  THEN 'escalate:inhibited:' || COALESCE(oldest_xmin_owner,'unknown')
@@ -920,13 +920,13 @@ WHERE resolved_at IS NULL
 ORDER BY (severity = 'critical') DESC, detected_at DESC;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Retention  (Appendix D; design "Observation storage and self-maintenance", S1)
+-- Retention  (Phase 1.5 S1)
 -- ─────────────────────────────────────────────────────────────────────────────
 
 -- Prune the append-only audit tables by time cutoff. These tables are low-volume
 -- (≤ ~1 action/relation/hour, one tick/cycle), so a simple DELETE cutoff is adequate
 -- here; the high-volume observe tables use partition rotation instead (later S2+).
--- policy_history is NOT pruned — it is retained indefinitely (Appendix D, pruned last).
+-- policy_history is NOT pruned — it is retained indefinitely (pruned last).
 --
 -- Ordering respects the action_history -> decision_log FK: actions prune first, and a
 -- decision is kept while any retained action still references it (so a retained action

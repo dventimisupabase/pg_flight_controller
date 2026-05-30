@@ -325,7 +325,7 @@ Collect one snapshot: header (always) + per-relation samples for relations that 
 
 ### `pgfc_observe.removability_horizons() → TABLE(oldest_xmin_age bigint, oldest_xmin_owner text, oldest_xmin_owner_detail text, oldest_catalog_xmin_age bigint, oldest_catalog_xmin_owner text)`
 
-Oldest xmin data/catalog removability horizons with attributed owner class (Appendix C).
+Oldest xmin data/catalog removability horizons with attributed owner class.
 
 ### `pgfc_observe.retain(keep interval) → bigint`
 

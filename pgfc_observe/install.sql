@@ -443,7 +443,7 @@ COMMENT ON FUNCTION pgfc_observe.effective_reloption(text[], text) IS
 -- The single observable that explains why vacuum may reclaim nothing: the oldest
 -- xmin data horizon and the oldest catalog horizon, each with the age and owning
 -- class of the oldest source. Inhibitor classes are different owners of these two
--- horizons (Appendix C). Cheap, STABLE; owner is 'none' when nothing is pinning.
+-- horizons. Cheap, STABLE; owner is 'none' when nothing is pinning.
 -- The calling backend and non-client (e.g. autovacuum) backends are excluded so
 -- the governor never attributes a pin to itself or to the cleaner.
 CREATE OR REPLACE FUNCTION pgfc_observe.removability_horizons()
@@ -485,7 +485,7 @@ SELECT (SELECT a FROM oldest),
        COALESCE((SELECT slot_name FROM cat), 'none');
 $fn$;
 COMMENT ON FUNCTION pgfc_observe.removability_horizons() IS
-  'Oldest xmin data/catalog removability horizons with attributed owner class (Appendix C).';
+  'Oldest xmin data/catalog removability horizons with attributed owner class.';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Partition management  (Phase 1.5 S2)

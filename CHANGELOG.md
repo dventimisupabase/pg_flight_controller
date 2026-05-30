@@ -17,12 +17,12 @@ section in the same pull request as your change (this is a convention, not a CI 
   `control_tick()` orchestrators, and the `governor_status`, `catalog_health`, and
   `active_diagnostics` views. Advisory by default (`advisory_only = true`): it plans
   and diagnoses but changes nothing.
-- **Documentation** — top-level `README.md`, the `docs/` guide set (getting started,
-  concepts, operating), generated schema reference under `docs/reference/`, and the
-  `out/technical-design.md` architecture narrative — including the decided
-  **observation storage and self-maintenance** model (partition-rotation retention,
-  sparse change-logging, rollups, governor self-maintenance) and the **Phase 1.5**
-  storage increments (S1–S6), built before active control.
+- **Documentation** — top-level `README.md` and the `docs/` guide set (getting
+  started, concepts, operating) plus the generated schema reference under
+  `docs/reference/`. The concepts guide covers the **observation storage and
+  self-maintenance** model (partition-rotation retention, sparse change-logging,
+  rollups, governor self-maintenance) and the **Phase 1.5** storage increments
+  (S1–S6), built before active control.
 - **Test & docs tooling** — `test.sh` pgTAP suites across PostgreSQL 15–18; CI for
   the test matrix, markdown/shell lint, generated-reference staleness, documentation
   doctests, internal link integrity, and an advisory AI doc-drift reviewer. `main` is
@@ -105,6 +105,14 @@ section in the same pull request as your change (this is a convention, not a CI 
   cap configured `degrade()` is a no-op, so it never silently destroys telemetry.
 
 ### Changed
+
+- **`docs/` is now the self-contained, as-built spec.** The hand-written guides no
+  longer link into `out/technical-design.md` for substance — `concepts.md` explains
+  the workload classes, control law, gates, removability horizons, and safety
+  guarantees directly. All backward references from the project into `in/`/`out/`
+  (docs, READMEs, SQL/test comments, CHANGELOG) were removed; `in/`–`out/` are frozen
+  design intent the implementation may diverge from. The doc-drift CI reviewer was
+  repointed to treat the code as ground truth and `docs/` as the spec under review.
 
 - **`pgfc_observe.retain(interval)` is no longer row-by-row `DELETE`** — it `TRUNCATE`s
   whole daily partitions, and its default window changed from 14 days to 3 days

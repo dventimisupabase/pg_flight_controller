@@ -20,7 +20,7 @@ SELECT fk_ok('pgfc_govern', 'action_history', 'decision_id',
              'pgfc_govern', 'decision_log', 'decision_id',
              'action_history.decision_id references decision_log');
 
--- Appendix-driven columns present
+-- key derived-state columns present
 SELECT has_column('pgfc_govern', 'relation_estimate', 'saturation_cause',
                   'relation_estimate has saturation_cause (App C)');
 SELECT has_column('pgfc_govern', 'policy', 'daily_mutation_budget',

@@ -65,9 +65,9 @@ SELECT cron.schedule('pgfc_control', '*/5 * * * *', $$SELECT pgfc_govern.control
 - **Reference** (generated from the schema):
   [`pgfc_observe`](docs/reference/pgfc_observe.md) ·
   [`pgfc_govern`](docs/reference/pgfc_govern.md).
-- **[Technical design](out/technical-design.md)** — architecture and rationale.
 
-The full documentation hub is [`docs/`](docs/index.md).
+The full documentation hub is [`docs/`](docs/index.md); [Concepts](docs/guide/concepts.md)
+covers the architecture and rationale.
 
 ## Development
 
