@@ -11,7 +11,7 @@ and a phased build plan.
 
 <a id="design-frame"></a>
 
-## 1. Design Frame
+## Design Frame
 
 The single idea the rest of this document hangs on:
 
@@ -30,7 +30,7 @@ section:
 - **There is actuation dead-time.** After we move a threshold, nothing observable
   happens until autovacuum next *evaluates* the table and then *runs*. That can be
   many ticks later. The control law must tolerate this delay or it will oscillate
-  ([§11](#control-law)).
+  ([control law](#control-law)).
 
 - **The thing we regulate is the dead-tuple *fraction at trigger* — not the raw
   count, and deliberately not a "debt ratio."** Autovacuum fires when
@@ -43,11 +43,11 @@ section:
   gain**: when autovacuum keeps up, `dead_tuples` is a sawtooth running 0→threshold,
   so the ratio time-averages to ≈0.5 *regardless of the scale factor*. We therefore
   use the debt ratio only as an instantaneous **overdue indicator** (>1 = past
-  trigger, waiting), never as a control setpoint. See [§7.2](#controlled-variables-and-indicators) and [§11](#control-law).
+  trigger, waiting), never as a control setpoint. See [controlled variables](#controlled-variables-and-indicators) and [control law](#control-law).
 
 - **Safety is a property of the inner loop we must never break.** We can make
   autovacuum more aggressive, but we must never configure a table such that
-  anti-wraparound protection is delayed ([§12](#actuators-apply), 13).
+  anti-wraparound protection is delayed ([actuators apply](#actuators-apply), 13).
 
 - **Actuator movement has cost, so it is a second controlled variable.** Each
   actuator move is an `ALTER TABLE` with *three* costs: a **lock cost** (DDL takes a
@@ -60,10 +60,10 @@ section:
   *frequency of its own actuator activity*. The optimal controller is not the one
   that hits the target fastest; it is the one that reaches convergence with the
   **minimum necessary catalog mutation**. This synergizes with the feedforward design
-  ([§7.2](#controlled-variables-and-indicators), [§11](#control-law)): we compute a target, **quantize it to a coarse grid**, and hold it. It
-  governs cadence ([§14](#control-loop-functions), [§18](#scheduling)), batching and locking ([§12](#actuators-apply)), quantization ([§11](#control-law)), rate
-  limits and a catalog-mutation budget ([§16](#safety-system)), catalog self-monitoring ([§5](#observable-state), [§15](#views)), and
-  saturation/inhibitor diagnosis ([§11.3](#saturation-diagnosis)).
+  ([controlled variables](#controlled-variables-and-indicators), [control law](#control-law)): we compute a target, **quantize it to a coarse grid**, and hold it. It
+  governs cadence ([control loop functions](#control-loop-functions), [scheduling](#scheduling)), batching and locking ([actuators apply](#actuators-apply)), quantization ([control law](#control-law)), rate
+  limits and a catalog-mutation budget ([safety system](#safety-system)), catalog self-monitoring ([observable state](#observable-state), [views](#views)), and
+  saturation/inhibitor diagnosis ([saturation diagnosis](#saturation-diagnosis)).
 
 - **The governor controls maintenance *progress*, not autovacuum (Appendix C).**
   "Vacuum ran" does not imply "cleanup happened" — vacuum can only remove tuples
@@ -73,7 +73,7 @@ section:
   **measures outcomes, not commands**: when more actuator input stops producing
   maintenance progress (actuator saturation), it does not escalate further — it
   switches from control mode to **diagnosis mode**, attributes the inhibitor, and
-  surfaces it ([§11.3](#saturation-diagnosis)). More input ≠ more progress.
+  surfaces it ([saturation diagnosis](#saturation-diagnosis)). More input ≠ more progress.
 
 The operating doctrine, drawn from Appendices A–C: **Observe frequently. Estimate
 continuously. Decide carefully. Mutate catalogs rarely. Diagnose before escalating.
@@ -103,7 +103,7 @@ actuators move.
 
 <a id="architecture-decision"></a>
 
-## 2. Architecture Decision: One Extension or Two?
+## Architecture Decision: One Extension or Two?
 
 `CLAUDE.md` pre-declares a two-extension split. The brief was to *revisit* that
 decision rather than inherit it, so this section weighs it honestly and then
@@ -111,7 +111,7 @@ commits.
 
 <a id="the-two-candidate-boundaries"></a>
 
-### 2.1 The two candidate boundaries
+### The two candidate boundaries
 
 - **A — Single extension** (`pg_flight_controller`): one schema, one install, one
   version. `observe → classify → estimate → plan → apply → verify` all live
@@ -123,7 +123,7 @@ commits.
 
 <a id="arguments-examined"></a>
 
-### 2.2 Arguments examined
+### Arguments examined
 
 | Concern | Single (A) | Two (B) |
 |---|---|---|
@@ -140,11 +140,11 @@ Two arguments that **do not survive scrutiny**, and which we explicitly drop:
 
 - *"Two extensions are inherently safer."* Schema separation alone is not a
   security boundary; both run in the same cluster. The real safety lever is
-  Phase sequencing and the advisory-only mode ([§18](#scheduling)), not the package count.
+  Phase sequencing and the advisory-only mode ([scheduling](#scheduling)), not the package count.
 
 <a id="decision"></a>
 
-### 2.3 Decision
+### Decision
 
 **Adopt B (two extensions), for one argument that survives: trust/blast-radius
 separation between read-only telemetry and setting mutation.** An operator can
@@ -154,7 +154,7 @@ wanted. The OODA mapping (Observe/Orient vs Decide/Act) is a pleasant alignment 
 not the deciding factor.
 
 The cost — a cross-schema contract — is bounded by making it **read-only and
-additive-only** ([§4](#cross-schema-contract)). `pgfc_govern` declares `requires = 'pgfc_observe'`.
+additive-only** ([cross schema contract](#cross-schema-contract)). `pgfc_govern` declares `requires = 'pgfc_observe'`.
 
 If during Phase 0 the observe schema proves not independently useful in practice,
 collapsing to A is a mechanical merge; the reverse is not. Starting split keeps the
@@ -164,7 +164,7 @@ cheaper option open.
 
 <a id="system-overview"></a>
 
-## 3. System Overview
+## System Overview
 
 ```text
                 pgfc_observe (Observe + Orient)
@@ -191,14 +191,14 @@ cheaper option open.
                       pg_cron: observe ~1 min · control ~5 min
 ```
 
-Two entry points, two cadences ([§14](#control-loop-functions), [§18](#scheduling)): `observe_tick()` runs fast and never
+Two entry points, two cadences ([control loop functions](#control-loop-functions), [scheduling](#scheduling)): `observe_tick()` runs fast and never
 acts; `control_tick()` runs slower and acts rarely. Observe frequently, act rarely.
 
 ---
 
 <a id="cross-schema-contract"></a>
 
-## 4. Cross-Schema Contract
+## Cross-Schema Contract
 
 `pgfc_govern` reads `pgfc_observe` and never writes it. The contract is:
 
@@ -219,14 +219,14 @@ split cheap.
 
 <a id="observable-state"></a>
 
-## 5. Observable State (the inputs)
+## Observable State (the inputs)
 
 All observables come from system catalogs and cumulative stats views. Availability
 notes matter because we test on PG 15–18 and the schema is additive.
 
 <a id="per-relation-from-pg_stat_all_tables"></a>
 
-### 5.1 Per-relation, from `pg_stat_all_tables`
+### Per-relation, from `pg_stat_all_tables`
 
 | Column | Meaning | Notes |
 |---|---|---|
@@ -243,7 +243,7 @@ notes matter because we test on PG 15–18 and the schema is additive.
 
 <a id="per-relation-from-pg_class"></a>
 
-### 5.2 Per-relation, from `pg_class`
+### Per-relation, from `pg_class`
 
 | Source | Meaning |
 |---|---|
@@ -251,12 +251,12 @@ notes matter because we test on PG 15–18 and the schema is additive.
 | `relallvisible` | visibility-map coverage |
 | `age(relfrozenxid)` | XID age → freeze debt |
 | `mxid_age(relminmxid)` | MultiXact age → freeze debt |
-| `reloptions` | **current explicit storage params** — the rollback baseline ([§14](#control-loop-functions)) |
+| `reloptions` | **current explicit storage params** — the rollback baseline ([control loop functions](#control-loop-functions)) |
 | `pg_relation_size`, `pg_total_relation_size` | bytes |
 
 <a id="cluster-guc-context"></a>
 
-### 5.3 Cluster / GUC context (per snapshot)
+### Cluster / GUC context (per snapshot)
 
 - Effective global defaults for every actuator GUC (`current_setting(...)`), needed
   to compute thresholds for tables with no explicit reloption.
@@ -269,11 +269,11 @@ notes matter because we test on PG 15–18 and the schema is additive.
   watch the catalog it writes to. Sampled at the snapshot header, *not* into
   `relation_samples` (we never un-exclude `pg_catalog`; that would flood the table).
   The governor's *own* mutation rate is derived separately from `action_history`
-  ([§15](#views)), no extra storage.
+  ([views](#views)), no extra storage.
 
 <a id="removability-horizons"></a>
 
-### 5.3a Removability horizons (Appendix C — why cleanup may be impossible)
+### Removability horizons (Appendix C — why cleanup may be impossible)
 
 Vacuum can only remove a dead tuple older than the cluster's xmin horizon. An
 external **inhibitor** can pin that horizon, so vacuum runs and reclaims nothing. The
@@ -293,11 +293,11 @@ We observe both, with the **age and the owning class** of whichever source is ol
 These are cluster-level signals (snapshot header), the structural twins of the
 catalog-health columns. Inhibitor **Class 6** (lock/interruption) is a *different*
 mechanism — partial progress, not horizon pinning — and is already covered by
-`lock_wait_outcome` / `vacuum_busy` ([§12.2](#apply)); it is not part of the horizon model.
+`lock_wait_outcome` / `vacuum_busy` ([apply](#apply)); it is not part of the horizon model.
 
 <a id="optional-best-effort"></a>
 
-### 5.4 Optional / best-effort
+### Optional / best-effort
 
 - `pg_stat_progress_vacuum` for in-flight vacuums. **Column layout changed in
   PG17** (`num_dead_tuples`/`max_dead_tuples` → byte-based counters). Observe it
@@ -307,7 +307,7 @@ mechanism — partial progress, not horizon pinning — and is already covered b
 
 <a id="pgfc_observe-schema"></a>
 
-## 6. `pgfc_observe` Schema (DDL)
+## `pgfc_observe` Schema (DDL)
 
 ```sql
 CREATE SCHEMA IF NOT EXISTS pgfc_observe;
@@ -336,7 +336,7 @@ CREATE TABLE IF NOT EXISTS pgfc_observe.snapshots (
     pg_class_n_dead_tup      bigint,         -- from pg_stat_all_tables for pg_class
     pg_class_n_live_tup      bigint,
     pg_class_last_autovacuum timestamptz,
-    -- removability horizons (Appendix C): why cleanup may be impossible ([§5.3a](#removability-horizons)).
+    -- removability horizons (Appendix C): why cleanup may be impossible ([removability horizons](#removability-horizons)).
     oldest_xmin_age          bigint,         -- age() of the oldest DATA horizon
     oldest_xmin_owner        text,           -- class: long_running_txn | replication_slot
                                              --   | standby_feedback | prepared_xact | none
@@ -394,7 +394,7 @@ CREATE INDEX IF NOT EXISTS relation_samples_relid_idx
 
 <a id="observe"></a>
 
-### 6.1 `observe()`
+### `observe()`
 
 ```sql
 CREATE OR REPLACE FUNCTION pgfc_observe.observe()
@@ -429,7 +429,7 @@ BEGIN
         h.oldest_xmin_age, h.oldest_xmin_owner, h.oldest_xmin_owner_detail,
         h.oldest_catalog_xmin_age, h.oldest_catalog_xmin_owner
     FROM pg_stat_all_tables c
-    CROSS JOIN pgfc_observe.removability_horizons() h   -- [§6.1a](#removability_horizons)
+    CROSS JOIN pgfc_observe.removability_horizons() h   -- [removability_horizons](#removability_horizons)
     WHERE c.relid = 'pg_catalog.pg_class'::regclass
     RETURNING snapshot_id INTO v_snapshot_id;
 
@@ -468,12 +468,12 @@ than dynamic SQL where reasonable.
 
 <a id="removability_horizons"></a>
 
-### 6.1a `removability_horizons()` — the inhibitor observable (Appendix C)
+### `removability_horizons()` — the inhibitor observable (Appendix C)
 
-Computes the two horizons of [§5.3a](#removability-horizons) as one record: the oldest data-xmin and the
+Computes the two horizons of [removability horizons](#removability-horizons) as one record: the oldest data-xmin and the
 oldest catalog-xmin, each with the *age* and the *owning class* of the oldest source.
 This is the single observable that explains why vacuum may reclaim nothing — and the
-attributor the diagnostic logic ([§11.3](#saturation-diagnosis)) keys on.
+attributor the diagnostic logic ([saturation diagnosis](#saturation-diagnosis)) keys on.
 
 ```sql
 CREATE OR REPLACE FUNCTION pgfc_observe.removability_horizons()
@@ -510,7 +510,7 @@ scaffold time across PG 15–18.
 
 <a id="observe-views"></a>
 
-### 6.2 Observe views
+### Observe views
 
 ```sql
 -- Latest sample per relation, with thresholds and debt computed for humans.
@@ -569,18 +569,18 @@ FROM eff;
 ```
 
 The `effective_reloption()` helper is the single source of truth for "explicit
-per-table value or global default," reused by the estimator ([§9](#pgfc_govern-schema)). It must
-compile and return correct values against a live PG 15–18 instance before [§6](#pgfc_observe-schema) is
+per-table value or global default," reused by the estimator ([pgfc_govern schema](#pgfc_govern-schema)). It must
+compile and return correct values against a live PG 15–18 instance before [pgfc_observe schema](#pgfc_observe-schema) is
 considered built — verify on first scaffold.
 
 ---
 
 <a id="derived-state-variables"></a>
 
-## 7. Derived State Variables (concrete formulas)
+## Derived State Variables (concrete formulas)
 
 This is where "ready to build" is earned: every derived quantity is a formula over
-observed columns, not a noun. All are computed by `estimate()` ([§9](#pgfc_govern-schema)) and
+observed columns, not a noun. All are computed by `estimate()` ([pgfc_govern schema](#pgfc_govern-schema)) and
 stored in `pgfc_govern.relation_estimate`.
 
 Notation: subscripts `t` = current snapshot, `t-1` = previous; `Δs` = seconds
@@ -590,7 +590,7 @@ default 1 hour).
 
 <a id="effective-thresholds"></a>
 
-### 7.1 Effective thresholds (not stored; intermediate)
+### Effective thresholds (not stored; intermediate)
 
 ```text
 vac_threshold  = effective(autovacuum_vacuum_threshold)
@@ -604,9 +604,9 @@ default.
 
 <a id="controlled-variables-and-indicators"></a>
 
-### 7.2 Controlled variables and indicators
+### Controlled variables and indicators
 
-**The target is a dead-tuple fraction** (see [§1](#design-frame) for why a debt ratio is the wrong
+**The target is a dead-tuple fraction** (see [design frame](#design-frame) for why a debt ratio is the wrong
 setpoint):
 
 ```text
@@ -618,7 +618,7 @@ Because autovacuum fires at `n_dead_tup > base + sf·reltuples`, the dead fracti
 trigger is `≈ base/reltuples + sf`, i.e. `≈ sf` for a large table. The scale factor
 therefore has **near-unity gain** on the dead fraction — and that is precisely why
 the keeping-up regime is controlled by *feedforward*, not measure-and-converge: we
-know what a given `sf` produces, so the control law computes and sets it ([§11](#control-law)). The
+know what a given `sf` produces, so the control law computes and sets it ([control law](#control-law)). The
 analyze loop treats `mod_fraction` vs `autovacuum_analyze_scale_factor` identically.
 
 **Diagnostic estimator (logged, *not* a control input).** We still record the
@@ -636,7 +636,7 @@ ticks — `n_dead_tup` sampled low before and after, `autovacuum_count` incremen
 peak never seen — and the bias is worst exactly for fast tables (`queue`, target
 0.02–0.05) that vacuum near the tick interval. Using it as a setpoint would make the
 most cleaning-sensitive tables drift dirtier. So it stays a diagnostic; feedback
-comes from the overdue indicators below ([§11.3](#saturation-diagnosis)).
+comes from the overdue indicators below ([saturation diagnosis](#saturation-diagnosis)).
 
 **Indicators (observed, logged, but not control setpoints):**
 
@@ -648,13 +648,13 @@ mxid_freeze_debt    = relminmxid_age      / def_mxid_freeze_max_age
 ```
 
 `vacuum_debt_ratio > 1` means the table is *past* its trigger and waiting on a
-worker — a useful lag/overdue signal, but flat in steady state ([§1](#design-frame)), so it never
+worker — a useful lag/overdue signal, but flat in steady state ([design frame](#design-frame)), so it never
 drives a correction. `freeze_debt` is observed and acted on for safety even though
-freeze *parameters* are out of MVP scope ([§13](#freeze-safety-in-the-mvp)).
+freeze *parameters* are out of MVP scope ([freeze safety in the mvp](#freeze-safety-in-the-mvp)).
 
 <a id="rates-and-dynamics"></a>
 
-### 7.3 Rates and dynamics
+### Rates and dynamics
 
 ```text
 churn_rate      = EWMA_α( (Δn_tup_ins + Δn_tup_upd + Δn_tup_del) / Δs )   tuples/sec
@@ -666,13 +666,13 @@ av_since_apply  = autovacuum_count_t - autovacuum_count_at_last_apply
 ```
 
 `av_since_apply` counts completed vacuum cycles since our last change. It is **not** a
-correction gate (the keeping-up move is feedforward, [§11.1](#the-keeping-up-move-is-feedforward-then-quantized)); it is consumed by
+correction gate (the keeping-up move is feedforward, [feedforward](#the-keeping-up-move-is-feedforward-then-quantized)); it is consumed by
 `verify()` to attribute outcomes and by the saturation-diagnosis K-cycle requirement
-([§11.3](#saturation-diagnosis)), which must not declare a saturation cause before watching at least one cycle.
+([saturation diagnosis](#saturation-diagnosis)), which must not declare a saturation cause before watching at least one cycle.
 
 <a id="cleanup-efficiency-effectiveness-and-lag"></a>
 
-### 7.4 Cleanup efficiency, effectiveness, and lag
+### Cleanup efficiency, effectiveness, and lag
 
 ```text
 -- dead tuples cleared per autovacuum run, observed across a run boundary
@@ -697,17 +697,17 @@ effectiveness   = EWMA_α(effective_cycle)                -- smoothed over K cyc
 ```
 
 Effectiveness is **smoothed, never judged off one cycle** — it inherits the exact
-sampling-bias trap of `f_peak` ([§7.2](#controlled-variables-and-indicators)): a fast-churning `queue` table re-dirties in
+sampling-bias trap of `f_peak` ([controlled variables](#controlled-variables-and-indicators)): a fast-churning `queue` table re-dirties in
 the gap between 1-min observations, so a single before/after delta can read as low
 effectiveness even when the vacuum worked. So we require *sustained* low
-effectiveness before suspecting saturation, and treat the **xmin horizon ([§5.3a](#removability-horizons)) as
+effectiveness before suspecting saturation, and treat the **xmin horizon ([removability horizons](#removability-horizons)) as
 the dispositive attributor** — a horizon pinned old and not advancing is near
 conclusive on its own; effectiveness just says "go look." Analogous freeze signal:
 `freeze_progressing = (relfrozenxid_age dropped after a vacuum)`.
 
 <a id="burstiness"></a>
 
-### 7.5 Burstiness
+### Burstiness
 
 ```text
 burstiness = stddev(inter_autovacuum_intervals) / mean(inter_autovacuum_intervals)
@@ -722,14 +722,14 @@ phases.
 
 <a id="relation-classification"></a>
 
-## 8. Relation Classification
+## Relation Classification
 
 Tables are classified into `append_only`, `oltp`, `queue`, `delete_heavy`,
-`archive`, `mixed`. Classification chooses the *desired-state template* ([§10](#policy-desired-state-model)), so it must be stable — flapping classification would flap setpoints.
+`archive`, `mixed`. Classification chooses the *desired-state template* ([policy desired state model](#policy-desired-state-model)), so it must be stable — flapping classification would flap setpoints.
 
 <a id="signals"></a>
 
-### 8.1 Signals (over a trailing window of snapshots)
+### Signals (over a trailing window of snapshots)
 
 ```text
 ins_frac = Σ n_tup_ins / Σ (n_tup_ins + n_tup_upd + n_tup_del)
@@ -741,7 +741,7 @@ is_static  = write_rate ≈ 0 over the whole window
 
 <a id="rules"></a>
 
-### 8.2 Rules (first match wins)
+### Rules (first match wins)
 
 ```text
 is_static and size large                      → archive
@@ -754,14 +754,14 @@ otherwise                                     → mixed
 
 <a id="hysteresis"></a>
 
-### 8.3 Hysteresis
+### Hysteresis
 
 A relation's class changes only after the rule has selected a *different* class for
-N consecutive **observation cycles** (`classify()` runs in the 1-min fast loop, [§14](#control-loop-functions),
+N consecutive **observation cycles** (`classify()` runs in the 1-min fast loop, [control loop functions](#control-loop-functions),
 so N=3 ≈ 3 min) — this prevents flapping. Manual overrides (`source = 'manual'`) are
 never auto-changed. Note the deliberate cadence asymmetry: reclassification settles
 in minutes, but the actuator changes it implies are still gated by the control
-loop's sustained-deviation and rate limits ([§11.2](#the-gates)), so a class flicker cannot
+loop's sustained-deviation and rate limits ([the gates](#the-gates)), so a class flicker cannot
 produce a DDL flurry.
 
 ```sql
@@ -773,7 +773,7 @@ CREATE TYPE pgfc_govern.relation_kind AS ENUM
 
 <a id="pgfc_govern-schema"></a>
 
-## 9. `pgfc_govern` Schema (DDL)
+## `pgfc_govern` Schema (DDL)
 
 ```sql
 CREATE SCHEMA IF NOT EXISTS pgfc_govern;
@@ -782,13 +782,13 @@ CREATE SCHEMA IF NOT EXISTS pgfc_govern;
 CREATE TABLE IF NOT EXISTS pgfc_govern.policy (
     policy_name        text PRIMARY KEY,
     description        text,
-    -- target dead fractions per class are looked up from a template ([§10](#policy-desired-state-model)),
+    -- target dead fractions per class are looked up from a template ([policy desired state model](#policy-desired-state-model)),
     -- but a policy can scale aggressiveness and cap I/O globally:
     aggressiveness     double precision NOT NULL DEFAULT 1.0,  -- >1 = cleaner
     io_budget_fraction double precision,                       -- reserved (Phase 3)
     freeze_posture     text NOT NULL DEFAULT 'standard'        -- standard|conservative
                        CHECK (freeze_posture IN ('standard','conservative')),
-    -- actuator-economy / catalog-mutation knobs (Appendix A & B, [§11.2](#the-gates)/[§16](#safety-system))
+    -- actuator-economy / catalog-mutation knobs (Appendix A & B, [the gates](#the-gates)/[safety system](#safety-system))
     min_interval       interval NOT NULL DEFAULT '1 hour',     -- per-relation rate limit
     global_max_changes_per_cycle integer NOT NULL DEFAULT 50,  -- cluster cap / control cycle
     daily_mutation_budget integer NOT NULL DEFAULT 500,        -- cluster cap / day (App B)
@@ -819,11 +819,11 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.relation_class (
 CREATE TABLE IF NOT EXISTS pgfc_govern.relation_estimate (
     relid               oid PRIMARY KEY,
     snapshot_id         bigint NOT NULL,
-    -- realized-behavior diagnostics ([§7.2](#controlled-variables-and-indicators)): logged, NOT control inputs
+    -- realized-behavior diagnostics ([controlled variables](#controlled-variables-and-indicators)): logged, NOT control inputs
     f_trigger_ewma      double precision,   -- realized dead fraction (≈ sf), peak-hold biased low
     mod_trigger_ewma    double precision,   -- realized mod fraction
     f_peak_current      double precision,   -- running peak this cycle
-    -- indicators (logged; drive saturation diagnosis [§11.3](#saturation-diagnosis), not the keeping-up move)
+    -- indicators (logged; drive saturation diagnosis [saturation diagnosis](#saturation-diagnosis), not the keeping-up move)
     vacuum_debt_ratio   double precision,
     analyze_debt_ratio  double precision,
     freeze_debt         double precision,
@@ -835,7 +835,7 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.relation_estimate (
     cleanup_per_run     bigint,
     maintenance_lag     interval,
     burstiness          double precision,
-    -- effectiveness & saturation (Appendix C, [§7.4](#cleanup-efficiency-effectiveness-and-lag)/[§11.3](#saturation-diagnosis))
+    -- effectiveness & saturation (Appendix C, [effectiveness](#cleanup-efficiency-effectiveness-and-lag)/[saturation diagnosis](#saturation-diagnosis))
     effectiveness       double precision,  -- EWMA: fraction of vacuums that cleaned
     freeze_progressing  boolean,           -- relfrozenxid advanced after recent vacuum?
     saturation_cause    text,              -- NULL | 'config' | 'io_limited' | 'inhibited'
@@ -869,7 +869,7 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.decision_log (
                                      -- |'escalate:io_limited'|'escalate:inhibited:<class>'
                                      -- suppressed reasons: rate_limited, daily_budget,
                                      -- user_owned, vacuum_busy, no_op, awaiting_sustain
-    proposed_value text,             -- quantized grid value ([§11.1](#the-keeping-up-move-is-feedforward-then-quantized))
+    proposed_value text,             -- quantized grid value ([feedforward](#the-keeping-up-move-is-feedforward-then-quantized))
     policy_rule    text,             -- which class/template/rule triggered this (App B)
     applied        boolean NOT NULL DEFAULT false,
     created_at     timestamptz NOT NULL DEFAULT now()
@@ -877,7 +877,7 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.decision_log (
 
 -- ── Audit: attempted changes (revert source of truth, success AND failure) ───
 -- One row per actuator. Actuators changed together in one ALTER TABLE share a
--- batch_id (and one applied_at) — see batching, [§12.2](#apply). A row is written even when
+-- batch_id (and one applied_at) — see batching, [apply](#apply). A row is written even when
 -- the apply FAILS (status='failed'), capturing desired/attempted/reason/timestamp
 -- per Appendix A "Actuator Failure Handling".
 CREATE TABLE IF NOT EXISTS pgfc_govern.action_history (
@@ -887,7 +887,7 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.action_history (
     relid          oid NOT NULL,
     relname        text,             -- captured for audit even if relation later dropped
     actuator       text NOT NULL,
-    old_value      text,             -- effective value before (read live, [§12.2](#apply))
+    old_value      text,             -- effective value before (read live, [apply](#apply))
     new_value      text NOT NULL,    -- desired value (attempted, even if it failed)
     prev_reloptions text[],          -- full live pg_class.reloptions before the change (App B)
     revert_kind    text CHECK (revert_kind IN ('SET','RESET')),  -- NULL when status='failed'
@@ -907,7 +907,7 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.action_history (
 );
 COMMENT ON TABLE pgfc_govern.action_history IS
   'Every actuator attempt (applied or failed). revert() replays only status=applied '
-  'after an ownership re-check against the live reloption ([§12.3](#rollback-baseline-capture)).';
+  'after an ownership re-check against the live reloption ([rollback baseline capture](#rollback-baseline-capture)).';
 
 -- ── Per-tick orchestration log ───────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS pgfc_govern.tick_log (
@@ -943,16 +943,16 @@ COMMENT ON TABLE pgfc_govern.diagnostics IS
 
 <a id="policy-desired-state-model"></a>
 
-## 10. Policy & Desired-State Model
+## Policy & Desired-State Model
 
 A relation's **desired state** is a set of target setpoints, derived from its class
 via a template, then scaled by policy `aggressiveness`.
 
 <a id="class-target-dead-fraction-template"></a>
 
-### 10.1 Class → target dead-fraction template
+### Class → target dead-fraction template
 
-The target is a **dead-tuple fraction** `f*` ([§7.2](#controlled-variables-and-indicators)). For a large table the scale
+The target is a **dead-tuple fraction** `f*` ([controlled variables](#controlled-variables-and-indicators)). For a large table the scale
 factor that achieves it is `sf ≈ f*`, so the column doubles as the scale-factor
 target the control law converges to.
 
@@ -976,37 +976,37 @@ tables.
 
 <a id="why-targets-not-parameters"></a>
 
-### 10.2 Why targets, not parameters
+### Why targets, not parameters
 
 The operator sets `aggressiveness` and `freeze_posture`; they never touch a scale
 factor. This is Principle 2 (Policy over Parameters) made concrete: policy selects
-*targets*, the control law ([§11](#control-law)) finds the *actuator values* that hold them.
+*targets*, the control law ([control law](#control-law)) finds the *actuator values* that hold them.
 
 ---
 
 <a id="control-law"></a>
 
-## 11. Control Law
+## Control Law
 
-Evaluated once per **planning cycle** ([§14](#control-loop-functions), [§18](#scheduling) — slower than observation), per
+Evaluated once per **planning cycle** ([control loop functions](#control-loop-functions), [scheduling](#scheduling) — slower than observation), per
 relation, per controlled objective. The gates below **are** the anti-oscillation
 mechanism (Principle 4) *and* the enforcement of the second control objective —
-minimum actuator activity ([§1](#design-frame), Appendix A) — stated explicitly because of the
-actuation dead-time established in [§1](#design-frame).
+minimum actuator activity ([design frame](#design-frame), Appendix A) — stated explicitly because of the
+actuation dead-time established in [design frame](#design-frame).
 
 <a id="the-keeping-up-move-is-feedforward-then-quantized"></a>
 
-### 11.1 The keeping-up move is feedforward, then quantized
+### The keeping-up move is feedforward, then quantized
 
-Loop gain is ≈1 — the scale factor *is* the dead fraction at trigger ([§7.2](#controlled-variables-and-indicators)) — so the
+Loop gain is ≈1 — the scale factor *is* the dead fraction at trigger ([controlled variables](#controlled-variables-and-indicators)) — so the
 keeping-up regime needs no measure-and-converge: we know what a given `sf` produces,
 so we compute it and **snap it to a bounded grid**, then set it. The target setting
 is feedforward from quantities known at plan time, then quantized:
 
 ```text
-r          = effective_f                            target dead fraction ([§10.1](#class-target-dead-fraction-template))
+r          = effective_f                            target dead fraction ([class targets](#class-target-dead-fraction-template))
 sf_cont    = clamp(r - base/reltuples, sf_min, sf_max)   continuous target
-sf_target  = snap(sf_cont, SF_GRID)                 nearest allowed grid value ([§11.4](#actuator-ranges-and-quantization-grids))
+sf_target  = snap(sf_cont, SF_GRID)                 nearest allowed grid value ([quantization grids](#actuator-ranges-and-quantization-grids))
 ```
 
 **Why quantize (Appendix B).** Each applied change mutates `pg_class.reloptions` —
@@ -1016,20 +1016,20 @@ a coarse grid bounds catalog entropy (most tables land on a handful of per-class
 values) and makes `0.020→0.021` churn impossible by construction. It does not fight
 feedforward — it *formalizes where feedforward already lands*: large tables have
 `base/reltuples ≈ 0`, so `sf_cont ≈ r` = the class value and they already cluster at
-a few values ([§11.4](#actuator-ranges-and-quantization-grids)); quantization just tightens an already-low entropy distribution
+a few values ([quantization grids](#actuator-ranges-and-quantization-grids)); quantization just tightens an already-low entropy distribution
 and gives the small-table threshold lever the same property.
 
-The measured dead fraction (`f_trigger_ewma`, [§7.2](#controlled-variables-and-indicators)) is **not** an input here — it is
+The measured dead fraction (`f_trigger_ewma`, [controlled variables](#controlled-variables-and-indicators)) is **not** an input here — it is
 a logged diagnostic, and a biased one. Feedback enters only through saturation
-diagnosis ([§11.3](#saturation-diagnosis)). The analyze loop is identical:
+diagnosis ([saturation diagnosis](#saturation-diagnosis)). The analyze loop is identical:
 `ana_sf_target = snap(clamp(mod_target - ana_base/reltuples, …), SF_GRID)`.
 
 <a id="the-gates"></a>
 
-### 11.2 The gates (anti-oscillation + minimum catalog mutation)
+### The gates (anti-oscillation + minimum catalog mutation)
 
 A quantized proposal must clear three gates, in order, to become an applied change.
-Because the target is already snapped to the grid ([§11.1](#the-keeping-up-move-is-feedforward-then-quantized)), there is **no continuous
+Because the target is already snapped to the grid ([feedforward](#the-keeping-up-move-is-feedforward-then-quantized)), there is **no continuous
 deadband, gain (`Kp`), or per-cycle max-step** — the controller jumps directly to the
 chosen grid value. (Those were artifacts of a continuous controller; with a quantized
 feedforward target they would only manufacture off-grid intermediate values and turn
@@ -1039,11 +1039,11 @@ the churn Appendix B forbids. The grid spacing *is* the deadband and the
 
 Gates 1–2 are decided *tentatively* in `plan()` from the snapshot, but the live-catalog
 versions of gates 1 (no-op) and the ownership check are **authoritatively enforced in
-`apply()` under the lock** ([§12.2](#apply)) — `plan()`'s view is advisory.
+`apply()` under the lock** ([apply](#apply)) — `plan()`'s view is advisory.
 
 1. **No-op vs the live catalog.** Read the relation's **current** `pg_class.reloptions`
    (the live value, read in `apply()` under the lock — not the stale snapshot or
-   `actuator_state`, [§12.2](#apply)). If the quantized `sf_target` equals the value already in
+   `actuator_state`, [apply](#apply)). If the quantized `sf_target` equals the value already in
    effect, do nothing (`decision = 'hold'`/`no_op`). Crucially this compares against the
    *effective* value including the inherited default: if `sf_target` equals the
    current **global default** and the table has no explicit reloption, the move is
@@ -1060,13 +1060,13 @@ versions of gates 1 (no-op) and the ownership check are **authoritatively enforc
 
 3. **Rate limit (three-tier) + budget.** At most one change per relation per
    `min_interval` (1h), at most `global_max_changes_per_cycle` per planning cycle, and
-   at most `daily_mutation_budget` catalog mutations per day ([§16](#safety-system), Appendix B). A
+   at most `daily_mutation_budget` catalog mutations per day ([safety system](#safety-system), Appendix B). A
    proposal exceeding any tier is `suppressed:rate_limited` (or
-   `suppressed:daily_budget`). Only the freeze emergency ([§11.5](#safety-override)) bypasses these.
+   `suppressed:daily_budget`). Only the freeze emergency ([safety override](#safety-override)) bypasses these.
 
 <a id="saturation-diagnosis"></a>
 
-### 11.3 Saturation → diagnosis (the only real feedback path)
+### Saturation → diagnosis (the only real feedback path)
 
 Feedforward sets the *trigger point*; it cannot tell whether autovacuum can *keep*
 that point — that is the one place observation carries information the actuator did
@@ -1076,7 +1076,7 @@ progress, not commands** (Appendix C). When debt stays high, the governor classi
 
 ```text
                        autovacuum_count        cleanup effectiveness     →  cause
-                       incrementing?           ([§7.4](#cleanup-efficiency-effectiveness-and-lag), EWMA, sustained)
+                       incrementing?           ([effectiveness](#cleanup-efficiency-effectiveness-and-lag), EWMA, sustained)
 config (not firing)    NO                      —                         →  suppressed:not_firing
                                                                             (hold + diagnose;
                                                                             actuator has NO authority)
@@ -1088,14 +1088,14 @@ inhibited              YES                     ≈ 0 (vacuums run, dead     → 
 
 So: **`autovacuum_count` delta separates `config` (not firing) from the
 running-but-stuck causes; effectiveness separates `io_limited` from `inhibited`; the
-xmin horizon ([§5.3a](#removability-horizons)) attributes *which* inhibitor.** All require ≥ K observed vacuum
+xmin horizon ([removability horizons](#removability-horizons)) attributes *which* inhibitor.** All require ≥ K observed vacuum
 cycles, so no cause is declared on a table the governor has not yet watched through a
 cycle.
 
 **A pinned, non-advancing horizon is a *necessary* condition for `inhibited` — low
 effectiveness alone is not enough.** This is the dangerous cell: a fast-churning
 `queue` table re-dirties between 1-min observations and reads as effectiveness ≈ 0
-*even though vacuum worked* (the [§7.4](#cleanup-efficiency-effectiveness-and-lag) sampling-bias trap), while its horizon is
+*even though vacuum worked* (the [effectiveness](#cleanup-efficiency-effectiveness-and-lag) sampling-bias trap), while its horizon is
 perfectly healthy. Classifying that as `inhibited` would suppress actuation on a
 table that genuinely needs it — the worse error direction. So: sustained low
 effectiveness **with a healthy horizon is treated as measurement noise**, never as an
@@ -1110,7 +1110,7 @@ high. `inhibited` requires the horizon evidence.
   and imminent?) instead of issuing a futile change. The genuinely *under-triggered,
   fixable* case — where the current setting is laxer than the class target — is
   **not** `debt_high`; it is the ordinary `saturation_cause IS NULL` regime, where
-  feedforward lowers `sf` toward `f*` ([§11.1](#the-keeping-up-move-is-feedforward-then-quantized)–[§11.2](#the-gates)). That normal control is not a
+  feedforward lowers `sf` toward `f*` ([feedforward](#the-keeping-up-move-is-feedforward-then-quantized)–[the gates](#the-gates)). That normal control is not a
   saturation cause and does not pass through here.
 
 - **`io_limited`** — vacuum fires and *does* reclaim, but churn outruns it. Lowering
@@ -1129,11 +1129,11 @@ high. `inhibited` requires the horizon evidence.
 
 Effectiveness is the *trigger to look*; the horizon is the *attributor*. A pinned,
 non-advancing horizon is near-conclusive on its own, which is why we never declare an
-inhibitor off a single noisy effectiveness sample ([§7.4](#cleanup-efficiency-effectiveness-and-lag)).
+inhibitor off a single noisy effectiveness sample ([effectiveness](#cleanup-efficiency-effectiveness-and-lag)).
 
 <a id="actuator-ranges-and-quantization-grids"></a>
 
-### 11.4 Actuator ranges and quantization grids
+### Actuator ranges and quantization grids
 
 | Actuator | min | max | grid (allowed values) |
 |---|---|---|---|
@@ -1142,7 +1142,7 @@ inhibitor off a single noisy effectiveness sample ([§7.4](#cleanup-efficiency-e
 | `autovacuum_analyze_scale_factor` | 0.01 | 0.50 | `SF_GRID` |
 | `autovacuum_analyze_threshold` | 50 | 1e7 | `THR_GRID` |
 
-Every applied value is one of these grid points ([§11.1](#the-keeping-up-move-is-feedforward-then-quantized)). The grids are configurable;
+Every applied value is one of these grid points ([feedforward](#the-keeping-up-move-is-feedforward-then-quantized)). The grids are configurable;
 they are coarse on purpose — the spacing is the unit of meaningful change and the
 bound on catalog entropy (Appendix B). **The threshold lever is quantized too, on a
 log-spaced grid:** `base_target = r·reltuples` is inherently per-table and
@@ -1153,7 +1153,7 @@ catalog-churn source, not the safest. Log spacing matches how thresholds matter
 **Which lever, by table size.** The two terms of `f_trigger = base/reltuples + sf`
 trade dominance with table size, and that directly picks the lever: when
 `sf·reltuples ≫ base` (large table) the scale factor controls the fraction, so snap
-and move `sf` per [§11.2](#the-gates); when `base ≳ sf·reltuples` (small table) the threshold
+and move `sf` per [the gates](#the-gates); when `base ≳ sf·reltuples` (small table) the threshold
 controls it, so snap `base_target = r·reltuples` to `THR_GRID` and move that instead,
 with the same gate discipline.
 
@@ -1163,23 +1163,23 @@ fraction, and moving both would confound attribution. The same holds within the
 *analyze* objective. But vacuum and analyze are *independent* objectives (they target
 `n_dead_tup`/`autovacuum_count` vs `n_mod_since_analyze`/`autoanalyze_count`), so when
 both want to move in the same cycle their changes are **batched into a single
-`ALTER TABLE`** ([§12.2](#apply)) — one lock, ≤2 parameters. `verify()` still attributes each
+`ALTER TABLE`** ([apply](#apply)) — one lock, ≤2 parameters. `verify()` still attributes each
 separately because their effects are independently observable. Attribution is not
 traded for the lock saving.
 
 <a id="safety-override"></a>
 
-### 11.5 Safety override (inhibitor-aware)
+### Safety override (inhibitor-aware)
 
 Before any of the above: if `freeze_debt > freeze_action_threshold` (default 0.6) or
 `mxid_freeze_debt > 0.6`, the relation is driven to its *cleanest* vacuum target
-regardless of class ([§13](#freeze-safety-in-the-mvp)). Safety dominates (Principle 3).
+regardless of class ([freeze safety in the mvp](#freeze-safety-in-the-mvp)). Safety dominates (Principle 3).
 
 **But escalation must be inhibitor-aware (Appendix C), and this nuance is exact —
 the obvious simplification is a wraparound hole:**
 
 - Inhibitor-awareness suppresses *further escalation and catalog churn* — it does
-  **not** relax the standing aggressive posture. The [§13](#freeze-safety-in-the-mvp) guard ("never reduce
+  **not** relax the standing aggressive posture. The [freeze safety in the mvp](#freeze-safety-in-the-mvp) guard ("never reduce
   cleanup aggressiveness on a freeze-stressed table") still **dominates**. "Inhibitor
   present" must never become "back off vacuum."
 - When `freeze_debt` is rising **and** `oldest_xmin`/`oldest_catalog_xmin` is pinned
@@ -1196,11 +1196,11 @@ the obvious simplification is a wraparound hole:**
 
 <a id="actuators-apply"></a>
 
-## 12. Actuators & `apply()`
+## Actuators & `apply()`
 
 <a id="mvp-actuators"></a>
 
-### 12.1 MVP actuators
+### MVP actuators
 
 The six actuators named in the vision doc, **but cost-based two are deferred** for a
 mechanical reason:
@@ -1231,18 +1231,18 @@ is reserved and unused.
 
 <a id="apply"></a>
 
-### 12.2 `apply()` — batched, non-blocking, failure-recording
+### `apply()` — batched, non-blocking, failure-recording
 
 `apply()` takes **all** approved actuator changes for one relation in a planning
-cycle (≤2: at most one vacuum lever + one analyze lever, [§11.4](#actuator-ranges-and-quantization-grids)) and applies them in a
+cycle (≤2: at most one vacuum lever + one analyze lever, [quantization grids](#actuator-ranges-and-quantization-grids)) and applies them in a
 **single `ALTER TABLE`** — one lock acquisition per relation, never one per
 parameter (Appendix A, Batching).
 
 ```sql
 -- Pseudocode; runs one relation's batch of approved decisions.
--- Pre-checks (skip the whole batch if any fail; record per [§17](#decision-logging-auditability)):
+-- Pre-checks (skip the whole batch if any fail; record per [decision logging](#decision-logging-auditability)):
 --   * policy.advisory_only = false             (else: log decision, do not apply)
---   * per-relation, per-cycle, AND per-day budgets OK ([§16](#safety-system); freeze bypasses all)
+--   * per-relation, per-cycle, AND per-day budgets OK ([safety system](#safety-system); freeze bypasses all)
 --   * no autovacuum in progress on relid (pg_stat_progress_vacuum)
 
 SET LOCAL lock_timeout = '100ms';        -- "Never wait" (Appendix A): fail fast.
@@ -1287,7 +1287,7 @@ END;
 Operational notes:
 
 - **Live catalog is the single ground truth, and `apply()` is its authoritative
-  arbiter.** No-op detection, ownership detection, and revert-safety ([§12.3](#rollback-baseline-capture)) all read
+  arbiter.** No-op detection, ownership detection, and revert-safety ([rollback baseline capture](#rollback-baseline-capture)) all read
   the relation's current `pg_class.reloptions` under the apply lock — never the
   snapshot or `actuator_state`, which can miss a human's intervening change. Division
   of labor: `plan()` runs in `control_tick` holding no lock and sees only the
@@ -1306,7 +1306,7 @@ Operational notes:
 
 - **Actuated set = relkind `'r'` and `'m'` only.** Partitioned parents (`'p'`) are
   excluded from actuation in `plan()` (still observed); their leaves are governed
-  individually — the apply-side resolution of the partitioning open question ([§21](#open-questions)).
+  individually — the apply-side resolution of the partitioning open question ([open questions](#open-questions)).
 
 - **Never block.** With `lock_timeout = 100ms` a contended `ALTER TABLE` fails fast,
   is recorded, and is retried in a future cycle. The governor never joins a lock
@@ -1314,7 +1314,7 @@ Operational notes:
 
 <a id="rollback-baseline-capture"></a>
 
-### 12.3 Rollback baseline capture (the correctness trap)
+### Rollback baseline capture (the correctness trap)
 
 Reverting is **not** "set it back to the number it had." It is:
 
@@ -1336,7 +1336,7 @@ actually true.
 `revert()` replays `action_history` rows with `status='applied'` only (failed
 attempts changed nothing, so there is nothing to undo). Reverting a relation batches
 its actuators back into one `ALTER TABLE` mixing `SET` and `RESET` per actuator —
-one lock, consistent with [§12.2](#apply).
+one lock, consistent with [apply](#apply).
 
 **Revert is ownership-checked, not blind (Appendix B).** Before reverting an
 actuator, `revert()` reads the **live** `pg_class.reloptions` and confirms the
@@ -1347,40 +1347,40 @@ over an intervening human change would itself be an unwanted mutation.
 
 <a id="actuator-cost-model"></a>
 
-### 12.4 Actuator cost model (future, Phase 3)
+### Actuator cost model (future, Phase 3)
 
 The MVP treats every actuator move as having the same (high) cost and minimizes
-moves via [§11.2](#the-gates). A later phase may model cost explicitly — lock-acquisition risk, DDL
+moves via [the gates](#the-gates). A later phase may model cost explicitly — lock-acquisition risk, DDL
 frequency, operational disruption, rollback complexity — and let `plan()` choose
 between **(A)** changing storage parameters and **(B)** issuing one targeted
 `VACUUM`/`ANALYZE` when that is cheaper for the expected benefit (Appendix A,
 Actuator Cost Model). Option B is a different actuator class (an imperative command,
 not a setpoint move) and is explicitly out of MVP scope; the two-objective framing
-([§1](#design-frame)) is what makes it expressible later.
+([design frame](#design-frame)) is what makes it expressible later.
 
 ---
 
 <a id="freeze-safety-in-the-mvp"></a>
 
-## 13. Freeze Safety in the MVP
+## Freeze Safety in the MVP
 
 Freeze *actuators* (`freeze_min_age`, `freeze_table_age`, `freeze_max_age`) are
 Phase 2+. But anti-wraparound dominates everything (Principle 3), so the MVP must
 **observe and respond to freeze debt now** — using the actuators it already has.
 
 - **Observe:** `freeze_debt = age(relfrozenxid)/autovacuum_freeze_max_age` and the
-  MultiXact analogue are computed every observation cycle ([§7.2](#controlled-variables-and-indicators)).
+  MultiXact analogue are computed every observation cycle ([controlled variables](#controlled-variables-and-indicators)).
 
 - **Respond:** when `freeze_debt` crosses `freeze_action_threshold` (default 0.6),
-  the safety override ([§11.5](#safety-override)) drives the relation's vacuum target to its
+  the safety override ([safety override](#safety-override)) drives the relation's vacuum target to its
   cleanest setting. A normal autovacuum advances `relfrozenxid` (it opportunistically
   freezes), so making ordinary vacuum more eager *is* a valid wraparound mitigation
   with only the MVP's threshold/scale levers.
 
 - **Inhibitor-aware (Appendix C):** if freeze debt rises while the xmin horizon is
-  pinned old by an inhibitor ([§5.3a](#removability-horizons)), freezing cannot advance `relfrozenxid` — so the
+  pinned old by an inhibitor ([removability horizons](#removability-horizons)), freezing cannot advance `relfrozenxid` — so the
   governor holds at cleanest, stops escalating, and raises a `critical` diagnostic
-  naming the owner ([§11.5](#safety-override)). This does **not** relax aggressiveness; it stops *futile*
+  naming the owner ([safety override](#safety-override)). This does **not** relax aggressiveness; it stops *futile*
   escalation. A replication slot or long-running transaction driving a table toward
   wraparound is a real incident whose fix is clearing the inhibitor, not more vacuum.
 
@@ -1397,7 +1397,7 @@ wraparound, nor hammers a futile actuator when an inhibitor is the real cause.
 
 <a id="control-loop-functions"></a>
 
-## 14. Control-Loop Functions (multi-rate)
+## Control-Loop Functions (multi-rate)
 
 Appendix A mandates that observation run much faster than actuation. The loop is
 therefore split into **two entry points on two cadences**, not one `tick()`:
@@ -1418,12 +1418,12 @@ therefore split into **two entry points on two cadences**, not one `tick()`:
 
 <a id="fast-loop"></a>
 
-### 14.1 Fast loop: `observe_tick()` (every ~1 min)
+### Fast loop: `observe_tick()` (every ~1 min)
 
 ```text
 observe_tick():
-  s := pgfc_observe.observe()    -- fresh snapshot (incl. xmin horizons, [§6.1a](#removability_horizons))
-  classify(s)                    -- update relation_class (+ hysteresis, [§8.3](#hysteresis))
+  s := pgfc_observe.observe()    -- fresh snapshot (incl. xmin horizons, [removability_horizons](#removability_horizons))
+  classify(s)                    -- update relation_class (+ hysteresis, [hysteresis](#hysteresis))
   estimate(s)                    -- relation_estimate: EWMA, f_peak, indicators,
                                  --   effectiveness, freeze_progressing, saturation_cause
   return s
@@ -1433,30 +1433,30 @@ Cheap and read-only-to-the-database (writes only pgfc tables). Running it often
 keeps rate estimates, `f_peak` peak-holds, and effectiveness EWMAs sharp, and —
 crucially — **observing often does not mean acting often**: this loop never calls
 `apply()`. `estimate()` also computes `saturation_cause` (config / io_limited /
-inhibited, [§11.3](#saturation-diagnosis)) so `plan()` can act on it; the attribution itself uses the
+inhibited, [saturation diagnosis](#saturation-diagnosis)) so `plan()` can act on it; the attribution itself uses the
 snapshot's horizon columns.
 
 <a id="control-loop"></a>
 
-### 14.2 Control loop: `control_tick()` (every ~5 min)
+### Control loop: `control_tick()` (every ~5 min)
 
 ```text
 control_tick():
   c := open tick_log row
-  n := plan(c)                   -- evaluate control law ([§11](#control-law)) against latest estimate;
+  n := plan(c)                   -- evaluate control law ([control law](#control-law)) against latest estimate;
                                  --   if saturation_cause set: route to diagnosis
                                  --   (escalate:io_limited / escalate:inhibited:<class>,
                                  --   write diagnostics row, suppress actuation) instead
                                  --   of a futile move; else quantize → no-op(vs live
                                  --   catalog) → sustained → rate-limit/budget; log rows
   if not advisory_only:
-    -- service order (caps, [§16](#safety-system)): freeze-emergency relations first (uncapped),
+    -- service order (caps, [safety system](#safety-system)): freeze-emergency relations first (uncapped),
     -- then non-freeze ordered by actuator-delta (grid levels) desc, FIFO on ties,
     -- up to global_max_changes_per_cycle and the remaining daily_mutation_budget.
     -- Unserved relations are NOT dropped — their decision rows persist and they
     -- compete again next cycle (no starvation).
     for each relation in service order:
-        apply(c, relid)          -- ONE batched ALTER TABLE per relation ([§12.2](#apply))
+        apply(c, relid)          -- ONE batched ALTER TABLE per relation ([apply](#apply))
   verify(c)                      -- attribute outcomes of PAST actions
   close tick_log row (counts, finished_at)
   return c
@@ -1474,12 +1474,12 @@ target after the change? It logs the realized `f_trigger_ewma` as a diagnostic
 (noting its peak-hold bias) and feeds `maintenance_lag`, effectiveness, and
 saturation detection. It is the "Verify" step of the vision's control loop and the
 basis for explainability — but it does not feed a correction back into the
-feedforward move ([§11.1](#the-keeping-up-move-is-feedforward-then-quantized)); persistent failure to converge surfaces as a saturation
-diagnosis — `escalate:io_limited` or `escalate:inhibited:<class>` ([§11.3](#saturation-diagnosis)).
+feedforward move ([feedforward](#the-keeping-up-move-is-feedforward-then-quantized)); persistent failure to converge surfaces as a saturation
+diagnosis — `escalate:io_limited` or `escalate:inhibited:<class>` ([saturation diagnosis](#saturation-diagnosis)).
 
 <a id="advisory-only-mode"></a>
 
-### 14.3 Advisory-only mode
+### Advisory-only mode
 
 `policy.advisory_only = true` (the default) runs both loops in full *including*
 `plan()`, writing complete `decision_log` entries, but **never calls `apply()`**.
@@ -1491,7 +1491,7 @@ active control is a single policy change.
 
 <a id="views"></a>
 
-## 15. Views
+## Views
 
 ```sql
 -- One-stop operator view: per relation, current class, target, observed debt,
@@ -1542,19 +1542,19 @@ WHERE resolved_at IS NULL
 ORDER BY (severity = 'critical') DESC, detected_at DESC;
 ```
 
-Plus the observe-side `relation_health` and `maintenance_debt` ([§6.2](#observe-views)).
+Plus the observe-side `relation_health` and `maintenance_debt` ([observe views](#observe-views)).
 
 **MVP surfaces catalog health; it does not yet brake on it.** A closed loop —
 "`pg_class` dead tuples / size rising → tighten the mutation budget or pause
 non-emergency actuation" — is a clean **Phase 2** addition but is deliberately out of
 the MVP to avoid scope creep. The MVP's catalog protections are the *open-loop* ones:
-quantization, no-op suppression, and the three-tier budget ([§11](#control-law), [§16](#safety-system)).
+quantization, no-op suppression, and the three-tier budget ([control law](#control-law), [safety system](#safety-system)).
 
 ---
 
 <a id="safety-system"></a>
 
-## 16. Safety System
+## Safety System
 
 Hard constraints, enforced in `plan()`/`apply()` (never disabled, vision Safety):
 
@@ -1562,7 +1562,7 @@ Hard constraints, enforced in `plan()`/`apply()` (never disabled, vision Safety)
   `autovacuum_enabled = false`; that GUC/reloption is not in the actuator set, and
   `apply()` rejects it defensively.
 
-- **Never exceed freeze safety.** [§13](#freeze-safety-in-the-mvp) guard; no change may reduce cleanup
+- **Never exceed freeze safety.** [freeze safety in the mvp](#freeze-safety-in-the-mvp) guard; no change may reduce cleanup
   aggressiveness on a freeze-stressed relation.
 
 - **Catalog-mutation budget — three tiers (Appendix B).** Per-relation: **max 1
@@ -1576,14 +1576,14 @@ Hard constraints, enforced in `plan()`/`apply()` (never disabled, vision Safety)
   largest actuator delta in grid levels, FIFO on ties**; unserved relations keep
   their decision rows and compete next cycle, so none starves. When the **daily cap
   itself halts actuation**, that is logged (decision `suppressed:daily_budget`) so
-  "why is nothing happening?" is answerable. These are in addition to the [§11.2](#the-gates)
-  gates. **Only the freeze emergency ([§13](#freeze-safety-in-the-mvp)) bypasses all three** — and when it does,
+  "why is nothing happening?" is answerable. These are in addition to the [the gates](#the-gates)
+  gates. **Only the freeze emergency ([freeze safety in the mvp](#freeze-safety-in-the-mvp)) bypasses all three** — and when it does,
   the action is written with `emergency_override = true` and `budget_consumed =
   false` (Appendix B emergency logging).
 
 - **No no-op DDL.** Never issue `ALTER TABLE` when the quantized target already
   equals the live effective value; if it equals the global default and no explicit
-  reloption exists, `RESET`/skip rather than `SET` ([§11.2](#the-gates), [§12.2](#apply)).
+  reloption exists, `RESET`/skip rather than `SET` ([the gates](#the-gates), [apply](#apply)).
 
 - **Respect setting ownership.** A relation whose reloption was set by a user or
   another system *before* the governor first touched it (`actuator_state` has no
@@ -1592,25 +1592,25 @@ Hard constraints, enforced in `plan()`/`apply()` (never disabled, vision Safety)
   `suppressed:user_owned`. Governor-owned, inherited-default, and emergency-override
   states are tracked distinctly (Appendix B "Setting Ownership").
 
-- **Diagnose, don't escalate (Appendix C).** When `saturation_cause` is set ([§11.3](#saturation-diagnosis)),
+- **Diagnose, don't escalate (Appendix C).** When `saturation_cause` is set ([saturation diagnosis](#saturation-diagnosis)),
   the governor stops spending actuator budget — `io_limited` and especially
   `inhibited` mean more DDL cannot produce maintenance progress (its third cost,
-  opportunity cost, [§1](#design-frame)). It writes a `diagnostics` finding and suppresses actuation on
+  opportunity cost, [design frame](#design-frame)). It writes a `diagnostics` finding and suppresses actuation on
   the affected relations instead of repeatedly increasing aggressiveness. This even
-  governs the freeze emergency path ([§11.5](#safety-override)): futile escalation under a pinned horizon
+  governs the freeze emergency path ([safety override](#safety-override)): futile escalation under a pinned horizon
   is replaced by a `critical` diagnostic.
 
-- **No conflicting actions.** One lever per *objective* per cycle ([§11.4](#actuator-ranges-and-quantization-grids)); vacuum and
+- **No conflicting actions.** One lever per *objective* per cycle ([quantization grids](#actuator-ranges-and-quantization-grids)); vacuum and
   analyze levers may move together but are combined into one atomic `ALTER TABLE`
-  ([§12.2](#apply)) — no two levers for the *same* objective ever move together.
+  ([apply](#apply)) — no two levers for the *same* objective ever move together.
 
 - **Actuator failure is not system failure.** A failed apply (lock timeout,
   privilege, conflict) is recorded in `action_history` with `status='failed'`,
   `failure_reason`, and `lock_wait_outcome`, then retried in a future cycle
   (Appendix A). It never aborts the cycle or leaves a partial change (the batch DDL
-  is atomic, [§12.2](#apply)).
+  is atomic, [apply](#apply)).
 
-- **Reversible, with an ownership re-check.** [§12.3](#rollback-baseline-capture); `action_history` carries
+- **Reversible, with an ownership re-check.** [rollback baseline capture](#rollback-baseline-capture); `action_history` carries
   `revert_kind` / `revert_value` for every applied change. `pgfc_govern.revert()` /
   `revert_all()` replay only `status='applied'` rows **and only when the live
   reloption still matches what the governor last set** — if a human changed it since,
@@ -1625,7 +1625,7 @@ Hard constraints, enforced in `plan()`/`apply()` (never disabled, vision Safety)
 
 <a id="decision-logging-auditability"></a>
 
-## 17. Decision Logging & Auditability
+## Decision Logging & Auditability
 
 Every control cycle writes, per relation considered, a `decision_log` row capturing
 the six elements the vision requires: **observation, previous state, desired state,
@@ -1654,7 +1654,7 @@ have done" before granting actuation.
 
 <a id="scheduling"></a>
 
-## 18. Scheduling (multi-rate)
+## Scheduling (multi-rate)
 
 `pg_cron` drives the two loops on **separate cadences** (Appendix A: "observation
 cadence significantly faster than actuation cadence"):
@@ -1696,28 +1696,28 @@ The cadence ladder (matches Appendix A):
 
 <a id="phased-implementation-plan"></a>
 
-## 19. Phased Implementation Plan
+## Phased Implementation Plan
 
 Sequenced so risk rises only after the prior layer is trustworthy.
 
 ### Phase 0 — `pgfc_observe` (read-only telemetry)
 
 - `snapshots` (incl. `pg_class` catalog-health **and xmin-horizon** header columns,
-  [§5.3](#cluster-guc-context)/[§5.3a](#removability-horizons)/[§6](#pgfc_observe-schema)), `relation_samples`, `effective_reloption()`,
+  [cluster guc context](#cluster-guc-context)/[removability horizons](#removability-horizons)/[pgfc_observe schema](#pgfc_observe-schema)), `relation_samples`, `effective_reloption()`,
   `removability_horizons()`, `observe()`, `relation_health`, `maintenance_debt`,
-  **and the retention job** ([§18](#scheduling)).
+  **and the retention job** ([scheduling](#scheduling)).
 - pg_cron schedule for `observe()` at 1-min cadence + daily retention.
 - **Exit:** snapshots accumulate correctly on PG 15–18; debt views match
   hand-computed values; `pg_class` health and the data/catalog horizons are captured
   (a held-open txn / slot moves `oldest_xmin_age`); retention keeps the tables
   bounded; zero writes outside `pgfc_observe`. Independently useful as a monitoring
-  tool (this validates the two-extension split — [§2](#architecture-decision)).
+  tool (this validates the two-extension split — [architecture decision](#architecture-decision)).
 
 ### Phase 1 — `pgfc_govern` advisory (decide, never act)
 
 - All govern tables (incl. `diagnostics`); `classify()`, `estimate()` (with
   effectiveness + `saturation_cause`), `observe_tick()`, `plan()`, `verify()`,
-  `control_tick()` — both loops on their cadences ([§14](#control-loop-functions), [§18](#scheduling)).
+  `control_tick()` — both loops on their cadences ([control loop functions](#control-loop-functions), [scheduling](#scheduling)).
 - `apply()` exists but is gated off by `advisory_only = true` (default).
 - `governor_status`, `catalog_health`, `active_diagnostics` views.
 - **Exit:** decision_log shows sensible, stable proposals on real workloads; no
@@ -1729,13 +1729,13 @@ Sequenced so risk rises only after the prior layer is trustworthy.
 
 - Enable `apply()` for the four threshold/scale actuators behind
   `advisory_only = false`, with **quantized targets, batched DDL + 100ms locks**
-  ([§11](#control-law), [§12.2](#apply)).
+  ([control law](#control-law), [apply](#apply)).
 - Full safety system: quantization + no-op suppression, sustained-deviation,
   three-tier catalog budget, setting-ownership guard, **saturation→diagnosis with
-  action suppression**, **inhibitor-aware freeze override** ([§11.3](#saturation-diagnosis), [§11.5](#safety-override)), freeze
+  action suppression**, **inhibitor-aware freeze override** ([saturation diagnosis](#saturation-diagnosis), [safety override](#safety-override)), freeze
   override (bypasses budgets, logged as `emergency_override`), failure recording,
   ownership-checked `revert()`.
-- Surface `catalog_health` and `active_diagnostics` ([§15](#views)); the bloat-driven *braking*
+- Surface `catalog_health` and `active_diagnostics` ([views](#views)); the bloat-driven *braking*
   loop is deferred to a later Phase-2 increment (open-loop protections ship first).
 - **Exit:** on a soak workload, controlled relations converge to their (quantized)
   target dead fractions without oscillation; **catalog mutation is rare** (most
@@ -1748,10 +1748,10 @@ Sequenced so risk rises only after the prior layer is trustworthy.
 
 ### Phase 3 — I/O budget, cost actuators & catalog braking
 
-- Resolve the cost-balancing tradeoff ([§12.1](#mvp-actuators)); introduce a cluster-wide I/O
+- Resolve the cost-balancing tradeoff ([mvp actuators](#mvp-actuators)); introduce a cluster-wide I/O
   model before touching `cost_limit`/`cost_delay`.
 - Close the catalog loop: rising `pg_class` bloat tightens the mutation budget /
-  pauses non-emergency actuation ([§15](#views)).
+  pauses non-emergency actuation ([views](#views)).
 - Begin freeze-parameter actuators under conservative bounds.
 
 ### Phase 4+ — per vision Future Directions
@@ -1763,7 +1763,7 @@ Sequenced so risk rises only after the prior layer is trustworthy.
 
 <a id="testing-strategy"></a>
 
-## 20. Testing Strategy
+## Testing Strategy
 
 pgTAP, run via `./test.sh` on PG 15/16/17/18 (matches `CLAUDE.md`).
 
@@ -1814,11 +1814,11 @@ pgTAP, run via `./test.sh` on PG 15/16/17/18 (matches `CLAUDE.md`).
   value** and then *holds* across subsequent cycles (no further DDL — Act Rarely),
   that most cycles apply nothing, and that the overdue indicator `vacuum_debt_ratio`
   stays bounded. The realized dead fraction is logged but **not asserted as the
-  success criterion** — it is a biased peak-hold ([§7.2](#controlled-variables-and-indicators)); convergence is judged by the
+  success criterion** — it is a biased peak-hold ([controlled variables](#controlled-variables-and-indicators)); convergence is judged by the
   actuator reaching its grid target and the indicator staying healthy.
 
 - **Saturation classification (`pgfc_govern/tests/`, Appendix C):** the three-way
-  discriminator ([§11.3](#saturation-diagnosis)) — (a) debt high with `autovacuum_count` *not* incrementing →
+  discriminator ([saturation diagnosis](#saturation-diagnosis)) — (a) debt high with `autovacuum_count` *not* incrementing →
   `config` (hold + diagnose, never lowers threshold); (b) incrementing with
   `cleanup_per_run > 0` but debt refilling → `io_limited`; (c) incrementing with
   effectiveness ≈ 0 and a pinned `oldest_xmin` → `inhibited`. Effectiveness is judged over K cycles, never
@@ -1829,7 +1829,7 @@ pgTAP, run via `./test.sh` on PG 15/16/17/18 (matches `CLAUDE.md`).
   produces `escalate:inhibited:long_running_txn`, a `diagnostics` row naming the pid,
   and **suppressed actuation** (no further DDL). Critically: a *freeze-stressed* table
   under the same pin **holds at cleanest, does not escalate, and raises a `critical`
-  diagnostic** — and the [§13](#freeze-safety-in-the-mvp) guard still blocks any aggressiveness *reduction*
+  diagnostic** — and the [freeze safety in the mvp](#freeze-safety-in-the-mvp) guard still blocks any aggressiveness *reduction*
   (inhibitor-awareness must not become back-off). When the transaction ends and the
   horizon advances, the diagnostic is marked `resolved_at`.
 
@@ -1847,24 +1847,24 @@ pgTAP, run via `./test.sh` on PG 15/16/17/18 (matches `CLAUDE.md`).
 
 <a id="open-questions"></a>
 
-## 21. Open Questions
+## Open Questions
 
 - **Effective-threshold helper:** *resolved* — `pgfc_observe.effective_reloption()`
-  and the `maintenance_debt` CTE ([§6.2](#observe-views)) compute it observe-side; govern reuses the
+  and the `maintenance_debt` CTE ([observe views](#observe-views)) compute it observe-side; govern reuses the
   function. (Left here only as a pointer; it is a Phase 0 deliverable, not an open
   question.) Revisit only if it ever forces a non-additive observe change.
 
 - **Grid spacing and `τ` defaults:** the quantization grids (`SF_GRID`, `THR_GRID`,
-  [§11.4](#actuator-ranges-and-quantization-grids)) and EWMA time constant (`τ=1h`) are the tunables now that the continuous
-  gain `Kp`/max-step are retired ([§11.2](#the-gates)). Coarser grids = less catalog mutation but
+  [quantization grids](#actuator-ranges-and-quantization-grids)) and EWMA time constant (`τ=1h`) are the tunables now that the continuous
+  gain `Kp`/max-step are retired ([the gates](#the-gates)). Coarser grids = less catalog mutation but
   blunter control — Phase 2 soak data should tune the trade-off; consider per-class
   grids.
 
 - **Partitioned tables:** leaf partitions are classified and controlled
-  individually; the parent is observed but never actuated ([§12.2](#apply)). Open: whether a
+  individually; the parent is observed but never actuated ([apply](#apply)). Open: whether a
   policy set on the parent should *inherit* to its leaves — a later refinement.
 
-- **Catalog braking (deferred):** the MVP only *surfaces* `pg_class` health ([§15](#views)) and
+- **Catalog braking (deferred):** the MVP only *surfaces* `pg_class` health ([views](#views)) and
   protects the catalog open-loop (quantize / no-op / budget). A closed loop that
   tightens the budget or pauses non-emergency actuation as `pg_class` bloat rises is
   a Phase-2/3 increment, named here so it is a deliberate choice, not an omission.
@@ -1884,7 +1884,7 @@ pgTAP, run via `./test.sh` on PG 15/16/17/18 (matches `CLAUDE.md`).
   never itself kills a backend or drops a slot — those are operator actions, out of
   scope by design (the governor's actuator surface is autovacuum settings only).
 
-- **MultiXact inhibitor attribution unmodeled:** `removability_horizons()` ([§6.1a](#removability_horizons))
+- **MultiXact inhibitor attribution unmodeled:** `removability_horizons()` ([removability_horizons](#removability_horizons))
   models the xid data/catalog horizons only. A `mxid_freeze_debt` stall pinned by the
   oldest *MultiXact* horizon would escalate without an owner to name. Narrower and
   rarer than xid wraparound; attributing it is deferred.
@@ -1897,14 +1897,14 @@ pgTAP, run via `./test.sh` on PG 15/16/17/18 (matches `CLAUDE.md`).
 
 <a id="out-of-scope"></a>
 
-## 22. Out of Scope (Phase I)
+## Out of Scope (Phase I)
 
 Per the vision: the MVP does not control checkpointer, bgwriter, WAL settings,
 shared buffers, work_mem, or replication. It *may observe* WAL generation
 (`pg_stat_wal.wal_bytes`), `pg_class` catalog health, and the xmin removability
-horizons ([§5.3a](#removability-horizons)) as context only. Cost-based autovacuum actuators are deferred to
-Phase 3 for the balancing reason in [§12.1](#mvp-actuators). Catalog-bloat *braking* (closed
-loop) and Option-B targeted `VACUUM`/`ANALYZE` actuators ([§12.4](#actuator-cost-model)) are likewise out of
+horizons ([removability horizons](#removability-horizons)) as context only. Cost-based autovacuum actuators are deferred to
+Phase 3 for the balancing reason in [mvp actuators](#mvp-actuators). Catalog-bloat *braking* (closed
+loop) and Option-B targeted `VACUUM`/`ANALYZE` actuators ([actuator cost model](#actuator-cost-model)) are likewise out of
 the MVP — the MVP protects the catalog open-loop via quantization, no-op suppression,
 and the three-tier mutation budget. For maintenance inhibitors (Appendix C) the MVP
 **detects, diagnoses, and surfaces** (suppressing futile actuation) but never
