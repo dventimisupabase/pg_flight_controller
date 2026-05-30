@@ -96,6 +96,20 @@ Operator-expressed outcomes. advisory_only=true means plan but never apply.
 | `enabled` | `boolean` |  |
 | `advisory_only` | `boolean` |  |
 
+### pgfc_govern.policy_history
+
+Append-only audit of policy changes (insert/update/delete); retained indefinitely.
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `history_id` | `bigint` |  |
+| `policy_name` | `text` |  |
+| `operation` | `text` |  |
+| `old_row` | `jsonb` |  |
+| `new_row` | `jsonb` |  |
+| `changed_by` | `text` |  |
+| `changed_at` | `timestamp with time zone` |  |
+
 ### pgfc_govern.relation_class
 
 | Column | Type | Description |
@@ -199,6 +213,10 @@ Operator-expressed outcomes. advisory_only=true means plan but never apply.
 
 ### `pgfc_govern._findings(p_snapshot_id bigint) → TABLE(relid oid, inhibitor_class text, severity text, recommendation text, evidence jsonb)`
 
+### `pgfc_govern._log_policy_change() → trigger`
+
+AFTER row trigger: records every policy insert/update/delete into policy_history.
+
 ### `pgfc_govern._reconcile_diagnostics(p_snapshot_id bigint) → void`
 
 ### `pgfc_govern.apply(p_tick_id bigint, p_relid oid) → boolean`
@@ -224,6 +242,10 @@ Derive hidden state (rates, effectiveness, saturation) into relation_estimate.
 ### `pgfc_govern.plan(p_tick_id bigint, p_snapshot_id bigint) → integer`
 
 Advisory: write decision_log per relation (vacuum objective) + reconcile diagnostics.
+
+### `pgfc_govern.retain(keep_decisions interval, keep_actions interval, keep_ticks interval, keep_diagnostics interval) → TABLE(relation text, deleted bigint)`
+
+Prune audit tables by time cutoff (decisions/actions 180d, ticks 180d, resolved diagnostics 365d); policy_history is never pruned. Returns per-table delete counts.
 
 ### `pgfc_govern.snap_sf(x double precision) → double precision`
 

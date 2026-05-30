@@ -28,6 +28,13 @@ section in the same pull request as your change (this is a convention, not a CI 
   doctests, internal link integrity, and an advisory AI doc-drift reviewer. `main` is
   branch-protected with these checks required.
 
+- **Storage Phase 1.5 — S1 (govern-audit retention).** A `pgfc_govern.retain()`
+  function prunes the append-only audit tables by time cutoff (decisions/actions
+  180 d, tick log 180 d, resolved diagnostics 365 d), closing the unbounded-growth
+  gap; it respects the `action_history → decision_log` FK and never ages out an
+  unresolved diagnostic. New `policy_history` table (with an `AFTER` trigger on
+  `policy`) records human-owned policy changes and is retained indefinitely.
+
 ### Notes
 
 - No tagged releases yet; the project is pre-1.0 and active control (Phase 2) is in

@@ -101,9 +101,15 @@ Run the two loops on separate cadences with `pg_cron` (observe often, act rarely
 SELECT cron.schedule('pgfc_observe', '* * * * *',   $$SELECT pgfc_govern.observe_tick()$$);
 SELECT cron.schedule('pgfc_control', '*/5 * * * *', $$SELECT pgfc_govern.control_tick()$$);
 
--- prune old telemetry daily so the snapshot tables stay bounded:
-SELECT cron.schedule('pgfc_retain', '7 3 * * *',    $$SELECT pgfc_observe.retain()$$);
+-- prune old data daily so neither schema grows without bound:
+SELECT cron.schedule('pgfc_observe_retain', '7 3 * * *',  $$SELECT pgfc_observe.retain()$$);
+SELECT cron.schedule('pgfc_govern_retain',  '17 3 * * *', $$SELECT pgfc_govern.retain()$$);
 ```
+
+`pgfc_observe.retain()` trims the high-volume telemetry (snapshots and their samples,
+default 14 days). `pgfc_govern.retain()` prunes the audit tables — decisions and
+actions (180 days), tick log (180 days), and resolved diagnostics (365 days);
+`policy_history` is kept indefinitely. Both windows are arguments you can override.
 
 ## Enabling active control
 
