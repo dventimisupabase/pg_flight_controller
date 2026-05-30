@@ -124,6 +124,16 @@ diagnostics (365 days); `policy_history` is kept indefinitely. All windows are
 arguments you can override. Inspect partitions with
 `SELECT * FROM pgfc_observe._partition_inventory()`.
 
+`observe()` also logs **sparsely**: it writes a `relation_samples` row only when a
+relation's observed state changed since its last sample, so quiet relations cost
+nothing per run. The per-relation last state lives in the `UNLOGGED`
+`relation_last_state` side table — a rebuildable cache, so it is expected to be empty
+after a crash (the next `observe()` re-samples every relation once and refills it).
+Never query `relation_samples` directly for "the current state of every relation";
+use `pgfc_observe.current_relation_state()` (or the `relation_health` /
+`maintenance_debt` views built on it), which reconstructs the dense view from sparse
+storage and recomputes freeze ages live.
+
 ## Enabling active control
 
 > **Phase status.** Active control is **experimental** in this release. `apply()`

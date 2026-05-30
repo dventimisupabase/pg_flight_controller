@@ -41,10 +41,14 @@ INSERT INTO pgfc_govern.relation_estimate (relid, snapshot_id, saturation_cause,
   (92007, 1, 'inhibited',  0.1, 2.0),     -- inhibited, horizon pinned (S2)
   (92008, 1, NULL,         0.7, 0.3);     -- freeze-stressed + horizon pinned (S2)
 
+-- S1 (horizon healthy). Under sparse-storage reconciliation plan() always evaluates
+-- EVERY current relation against the snapshot it is given, so the healthy-horizon
+-- relations (92001-92006) are asserted here, before plan(S2) re-evaluates them (carried
+-- forward) under the pinned horizon -- which is correct production behavior but would
+-- otherwise overwrite 92006's "latest decision" with a pinned-horizon escalation.
 SELECT pgfc_govern.plan(1, (SELECT snapshot_id FROM pgfc_observe.snapshots WHERE collected_at='2026-01-01 00:00:00+00'));
-SELECT pgfc_govern.plan(1, (SELECT snapshot_id FROM pgfc_observe.snapshots WHERE collected_at='2026-01-02 00:00:00+00'));
 
--- decision routing (latest decision per relation)
+-- decision routing under the healthy horizon (latest decision per relation)
 SELECT is((SELECT decision FROM pgfc_govern.decision_log WHERE relid=92001 ORDER BY decision_id DESC LIMIT 1),
           'adjust', 'queue under lax setting => adjust');
 SELECT is((SELECT proposed_value FROM pgfc_govern.decision_log WHERE relid=92001 ORDER BY decision_id DESC LIMIT 1),
@@ -61,14 +65,19 @@ SELECT is((SELECT decision FROM pgfc_govern.decision_log WHERE relid=92006 ORDER
           'adjust', 'freeze floor drives toward cleanest => adjust');
 SELECT is((SELECT proposed_value FROM pgfc_govern.decision_log WHERE relid=92006 ORDER BY decision_id DESC LIMIT 1),
           '0.01', 'freeze floor target is sf_min (0.01)');
+
+-- diagnostic opened under the healthy horizon
+SELECT is((SELECT count(*) FROM pgfc_govern.diagnostics WHERE relid=92003 AND resolved_at IS NULL),
+          1::bigint, 'io_limited opened one diagnostic');
+
+-- S2 (horizon pinned): the two pinned-horizon relations
+SELECT pgfc_govern.plan(1, (SELECT snapshot_id FROM pgfc_observe.snapshots WHERE collected_at='2026-01-02 00:00:00+00'));
+
 SELECT is((SELECT decision FROM pgfc_govern.decision_log WHERE relid=92007 ORDER BY decision_id DESC LIMIT 1),
           'escalate:inhibited:long_running_txn', 'inhibited names the owner class');
 SELECT is((SELECT decision FROM pgfc_govern.decision_log WHERE relid=92008 ORDER BY decision_id DESC LIMIT 1),
           'escalate:inhibited:long_running_txn', 'freeze + pinned horizon: floor + diagnose, do not churn');
 
--- diagnostics opened
-SELECT is((SELECT count(*) FROM pgfc_govern.diagnostics WHERE relid=92003 AND resolved_at IS NULL),
-          1::bigint, 'io_limited opened one diagnostic');
 SELECT is((SELECT severity FROM pgfc_govern.diagnostics WHERE relid=92007 AND resolved_at IS NULL),
           'critical', 'inhibited diagnostic is critical');
 

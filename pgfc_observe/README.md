@@ -45,6 +45,15 @@ retention is whole-partition rotation, so it produces zero dead tuples:
 
 Inspect partitions with `SELECT * FROM pgfc_observe._partition_inventory()`.
 
+Logging is also **sparse**: `observe()` writes a `relation_samples` row only when a
+relation's observed state changed since its last sample (tracked in the `UNLOGGED`
+`relation_last_state` side table), so quiet relations cost nothing per run. To read
+"the current state of every relation," use `current_relation_state()` — or the
+`relation_health` / `maintenance_debt` views built on it — which reconstructs the
+dense view from sparse storage and recomputes the (globally-ticking) freeze ages live
+from the stored raw `relfrozenxid` / `relminmxid`. `relation_last_state` is a
+rebuildable cache, so it is empty after a crash until the next `observe()` refills it.
+
 ## Schema evolution
 
 Additive-only: new columns are nullable; existing columns are never dropped or

@@ -8,6 +8,39 @@ pg_flight_controller telemetry: snapshots of autovacuum-relevant state (read-onl
 
 ## Tables
 
+### pgfc_observe.relation_last_state
+
+UNLOGGED last-observed state per relation: the change-signature cache for sparse logging (S3). Rebuilt from the catalogs after a crash.
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `relid` | `oid` |  |
+| `schemaname` | `name` |  |
+| `relname` | `name` |  |
+| `n_live_tup` | `bigint` |  |
+| `n_dead_tup` | `bigint` |  |
+| `n_mod_since_analyze` | `bigint` |  |
+| `n_ins_since_vacuum` | `bigint` |  |
+| `n_tup_ins` | `bigint` |  |
+| `n_tup_upd` | `bigint` |  |
+| `n_tup_del` | `bigint` |  |
+| `n_tup_hot_upd` | `bigint` |  |
+| `last_autovacuum` | `timestamp with time zone` |  |
+| `last_autoanalyze` | `timestamp with time zone` |  |
+| `vacuum_count` | `bigint` |  |
+| `autovacuum_count` | `bigint` |  |
+| `analyze_count` | `bigint` |  |
+| `autoanalyze_count` | `bigint` |  |
+| `total_autovacuum_time` | `double precision` |  |
+| `reltuples` | `real` |  |
+| `relpages` | `integer` |  |
+| `relallvisible` | `integer` |  |
+| `relfrozenxid` | `xid` |  |
+| `relminmxid` | `xid` |  |
+| `relation_size_bytes` | `bigint` |  |
+| `total_size_bytes` | `bigint` |  |
+| `reloptions` | `text[]` |  |
+
 ### pgfc_observe.relation_samples
 
 Per-relation observed state for one snapshot. reloptions is the governor rollback baseline. Daily RANGE partitioned on collected_day.
@@ -39,6 +72,8 @@ Per-relation observed state for one snapshot. reloptions is the governor rollbac
 | `relallvisible` | `integer` |  |
 | `relfrozenxid_age` | `bigint` |  |
 | `relminmxid_age` | `bigint` |  |
+| `relfrozenxid` | `xid` |  |
+| `relminmxid` | `xid` |  |
 | `relation_size_bytes` | `bigint` |  |
 | `total_size_bytes` | `bigint` |  |
 | `reloptions` | `text[]` |  |
@@ -124,6 +159,10 @@ Whole UTC days since 1970-01-01 — the int4 daily RANGE partition key.
 
 Child partitions of the telemetry tables with day, decoded range, est. rows, and size.
 
+### `pgfc_observe.current_relation_state(p_as_of bigint) → TABLE(snapshot_id bigint, collected_day integer, relid oid, schemaname name, relname name, n_live_tup bigint, n_dead_tup bigint, n_mod_since_analyze bigint, n_ins_since_vacuum bigint, n_tup_ins bigint, n_tup_upd bigint, n_tup_del bigint, n_tup_hot_upd bigint, last_autovacuum timestamp with time zone, last_autoanalyze timestamp with time zone, vacuum_count bigint, autovacuum_count bigint, analyze_count bigint, autoanalyze_count bigint, total_autovacuum_time double precision, reltuples real, relpages integer, relallvisible integer, relfrozenxid_age bigint, relminmxid_age bigint, relation_size_bytes bigint, total_size_bytes bigint, reloptions text[])`
+
+Dense current state per relation as-of a snapshot, reconstructed from sparse storage with live-computed freeze ages (S3).
+
 ### `pgfc_observe.drop_empty_partitions(keep interval) → bigint`
 
 Tier-2 GC: DROP empty telemetry partitions older than keep (default 30 days). Returns partitions dropped.
@@ -134,7 +173,7 @@ Value of storage parameter opt in reloptions, or NULL if not explicitly set.
 
 ### `pgfc_observe.observe() → bigint`
 
-Collect one snapshot: header (GUC defaults + pg_class health) and per-relation samples.
+Collect one snapshot: header (always) + per-relation samples only for relations whose observed state changed (sparse change-logging, S3).
 
 ### `pgfc_observe.removability_horizons() → TABLE(oldest_xmin_age bigint, oldest_xmin_owner text, oldest_xmin_owner_detail text, oldest_catalog_xmin_age bigint, oldest_catalog_xmin_owner text)`
 
