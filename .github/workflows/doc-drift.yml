@@ -1,0 +1,53 @@
+name: Doc Drift Review
+
+# Advisory only: an AI reviewer comments where a PR's code/schema changes likely make
+# the hand-written docs stale. It never blocks merges (not a required status check) and
+# is deliberately scoped away from what the deterministic gates already cover.
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: read
+
+jobs:
+  doc-drift:
+    name: Doc Drift Review
+    runs-on: ubuntu-latest
+    # Skip PRs from forks, where the API-key secret is unavailable.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Review for documentation drift
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          claude_args: "--max-turns 20"
+          prompt: |
+            You are a documentation-drift reviewer for the pg_flight_controller repo.
+
+            Hand-maintained docs that CAN drift live in: README.md, docs/ (especially
+            docs/guide/), pgfc_observe/README.md, pgfc_govern/README.md, and the design
+            narrative out/technical-design.md. Files under docs/reference/ are GENERATED
+            by scripts/gen-reference.sh — never comment on them.
+
+            Deterministic CI gates already cover reference staleness, doctest execution,
+            and internal-link integrity. Do NOT duplicate those, and do not review code
+            quality or style.
+
+            Review ONLY the changes in this pull request. Flag places where the code or
+            schema changed but the prose, guides, or design narrative likely no longer
+            match — e.g. renamed/removed functions, columns, decisions, or behaviors that
+            are still described the old way; usage examples or claims that are now wrong.
+
+            Post a single, concise PR comment with concrete, file-specific suggestions.
+            If the docs look consistent with the change, say so in one line. This is
+            advisory, not a gate — be brief and high-signal.
