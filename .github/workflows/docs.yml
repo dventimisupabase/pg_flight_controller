@@ -1,0 +1,30 @@
+name: Docs
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  reference-up-to-date:
+    name: Reference up to date
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Regenerate the reference docs
+        run: ./scripts/gen-reference.sh
+
+      - name: Fail if docs/reference drifted from the schema
+        run: |
+          if ! git diff --quiet -- docs/reference; then
+            echo "::error::docs/reference is stale. Run scripts/gen-reference.sh and commit the result."
+            git --no-pager diff -- docs/reference
+            exit 1
+          fi
+          echo "docs/reference is up to date with the installed schema."
