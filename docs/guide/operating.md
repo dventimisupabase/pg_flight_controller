@@ -101,8 +101,12 @@ Run the two loops on separate cadences with `pg_cron` (observe often, act rarely
 SELECT cron.schedule('pgfc_observe', '* * * * *',   $$SELECT pgfc_govern.observe_tick()$$);
 SELECT cron.schedule('pgfc_control', '*/5 * * * *', $$SELECT pgfc_govern.control_tick()$$);
 
+-- roll raw samples up into the long-range tiers BEFORE retain() truncates them:
+SELECT cron.schedule('pgfc_observe_rollup', '2 3 * * *',   $$SELECT pgfc_observe.rollup()$$);
+
 -- prune old data so neither schema grows without bound:
 SELECT cron.schedule('pgfc_observe_retain', '7 3 * * *',   $$SELECT pgfc_observe.retain()$$);
+SELECT cron.schedule('pgfc_observe_rollup_gc', '12 3 * * *', $$SELECT pgfc_observe.rollup_retain()$$);
 SELECT cron.schedule('pgfc_observe_gc',     '23 4 1 * *',  $$SELECT pgfc_observe.drop_empty_partitions()$$);
 SELECT cron.schedule('pgfc_govern_retain',  '17 3 * * *',  $$SELECT pgfc_govern.retain()$$);
 ```
@@ -123,6 +127,20 @@ by time cutoff — decisions and actions (180 days), tick log (180 days), and re
 diagnostics (365 days); `policy_history` is kept indefinitely. All windows are
 arguments you can override. Inspect partitions with
 `SELECT * FROM pgfc_observe._partition_inventory()`.
+
+Raw samples rotate away within a couple of days, so long-range history lives in three
+aggregate tiers — `rollup_1m`, `rollup_1h`, `rollup_1d` — built by
+`pgfc_observe.rollup()`. It **must run before raw is truncated**, but the real
+guarantee is the raw retention *window*, not cron ordering: as long as `rollup()` runs
+at least once per window (run it daily), no raw bucket is lost — `rollup()` is
+idempotent, so an extra run never double-counts. The tiers are partition-rotated like
+raw, but the partition span tracks the tier (1m daily, 1h/1d monthly), and
+`rollup_retain()` drops them on **cascading per-tier windows** (1m 7 days, 1h 90 days,
+1d 365 days — all overridable). Because rollups are sparse like raw, query long-range
+state with `pgfc_observe.current_rollup('1h')` (or `'1m'`/`'1d'`), which carries the
+last known bucket forward so a quiet relation stays answerable after its raw samples
+are gone. Inspect rollup partitions with
+`SELECT * FROM pgfc_observe._rollup_inventory()`.
 
 `observe()` also logs **sparsely**: it writes a `relation_samples` row only when a
 relation's observed state changed since its last sample, so quiet relations cost
