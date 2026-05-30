@@ -27,6 +27,9 @@ jobs:
 
       - name: Review for documentation drift
         uses: anthropics/claude-code-action@v1
+        # Advisory only: a transient API/SDK error (e.g. the model hitting the
+        # turn limit) must never fail the job and block the merge.
+        continue-on-error: true
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
