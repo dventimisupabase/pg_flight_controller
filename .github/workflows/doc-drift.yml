@@ -33,7 +33,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          claude_args: "--max-turns 20"
+          claude_args: "--max-turns 40"
           prompt: |
             You are a documentation-drift reviewer for the pg_flight_controller repo.
 
