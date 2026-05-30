@@ -19,7 +19,10 @@ section in the same pull request as your change (this is a convention, not a CI 
   and diagnoses but changes nothing.
 - **Documentation** — top-level `README.md`, the `docs/` guide set (getting started,
   concepts, operating), generated schema reference under `docs/reference/`, and the
-  `out/technical-design.md` architecture narrative.
+  `out/technical-design.md` architecture narrative — including the decided
+  **observation storage and self-maintenance** model (partition-rotation retention,
+  sparse change-logging, rollups, governor self-maintenance) and the **Phase 1.5**
+  storage increments (S1–S6), built before active control.
 - **Test & docs tooling** — `test.sh` pgTAP suites across PostgreSQL 15–18; CI for
   the test matrix, markdown/shell lint, generated-reference staleness, documentation
   doctests, internal link integrity, and an advisory AI doc-drift reviewer. `main` is

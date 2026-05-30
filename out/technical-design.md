@@ -1685,12 +1685,119 @@ The cadence ladder (matches Appendix A):
   never overlaps the next cron firing; a missed control cycle is harmless (the next
   one re-reads current state).
 
-- **Snapshot retention (consequence of 1-min cadence).** Observation now writes
-  `relations × 1440/day` sample rows. Phase 0 must ship a retention job — e.g. a
-  daily `pg_cron` task that deletes `pgfc_observe.snapshots` older than a configurable
-  window (default 14 days; cascades to `relation_samples`), optionally downsampling
-  older data — so the observe tables stay bounded. Do not let the mandated cadence
-  silently grow an unbounded table.
+- **Snapshot retention (consequence of 1-min cadence).** Observation writes
+  `relations × 1440/day` sample rows, so Phase 0 ships a simple `retain()`
+  time-cutoff prune (default 14 days) to keep the observe tables bounded from day
+  one. That `DELETE`-based prune is a placeholder: a maintenance system must not
+  silently grow an unbounded table, and it must not *fight bloat with bloat* either
+  (a daily `DELETE` of yesterday's rows is itself a churn-and-vacuum problem). The
+  durable storage model — partition-rotation retention, sparse change-logging,
+  rollups, and the governor maintaining its own schema — is specified in
+  [observation storage and self-maintenance](#observation-storage) and built in
+  [Phase 1.5](#phase-1-5).
+
+---
+
+<a id="observation-storage"></a>
+
+## Observation storage and self-maintenance
+
+A maintenance system that observes the database every minute becomes a storage
+problem of its own ([Appendix D](../in/appendix_d.md)). The governor must not grow
+without bound, and — more subtly — it must not fight bloat *with* bloat: a daily
+`DELETE` of expired telemetry is exactly the churn-and-vacuum pattern the governor
+exists to manage. The storage model is therefore part of the design, not an
+afterthought, and it is built as its own phase ([Phase 1.5](#phase-1-5)) before any
+mutation is enabled.
+
+The model is adapted from a proven lineage — Skytools PGQ (Skype, 2006) → Nikolay
+Samokhvalov's `pg_ash`/`pgque` → the author's own `pg_flight_recorder`. Those tools
+solved the identical problem (high-frequency PostgreSQL telemetry that must not bloat)
+and converged on the same answers. We adopt the parts that fit a 1-minute,
+per-relation cadence and deliberately skip the parts that don't.
+
+### Decided storage model
+
+- **Partition-rotation retention, never row-by-row `DELETE`.** High-volume tables
+  (`relation_samples`, `snapshots`) become daily `RANGE`-partitioned parents.
+  Retention drops or `TRUNCATE`s whole partitions. This produces **zero dead tuples
+  and zero bloat by construction** — the governor stops being its own maintenance
+  burden. `TRUNCATE` of an expired day reclaims space instantly with no vacuum.
+
+- **Sparse change-logging.** Most relations are quiet most minutes, yet a dense
+  collector records every relation every minute regardless. Instead the collector
+  writes a sample **only when a relation's observed state changed** since its last
+  sample. An `UNLOGGED` `relation_last_state` side table (HOT-friendly:
+  `fillfactor=70`, no index on mutable columns, aggressive autovacuum, rebuilt from
+  the catalogs on crash) gives O(1) "did this change?" comparison. Readers
+  reconstruct a dense view by joining forward from the last known sample. On a
+  typical workload this is the dominant space win — and it **subsumes Appendix D's
+  observation tiers**: a cold table simply stops producing rows on its own, with no
+  per-table cadence machinery to configure.
+
+- **Rollups for long-range history.** Raw samples rotate away fast (24–72h);
+  `1m`/`1h`/`1d` aggregates are computed *before* the raw partitions are truncated
+  and live much longer. Long-range trend analysis reads rollups, not raw data.
+
+- **The governor maintains its own schema.** Append-only and last-state tables get
+  explicit, *static* autovacuum reloptions (the governor does not govern itself —
+  that would be a control loop observing its own actuator). A storage-budget report
+  and a graceful-degrade prune order (raw → derived → fine rollups → coarse rollups →
+  routine diagnostics → actions → policy, last) bound worst-case growth.
+
+- **Govern-side audit retention.** The decision/action/tick/diagnostic tables in
+  `pgfc_govern` are append-only with **no retention today** — the real
+  unbounded-growth gap. They are low-volume (≤1 action/relation/hour), so a simple
+  time-cutoff prune is acceptable there; partition rotation is reserved for the
+  high-volume observe tables. A `policy_history` table is added so human-owned
+  desired-state changes are explained over time.
+
+### Deliberately skipped
+
+- **Per-table observation tiers (hot/warm/cold/inactive).** Sparse change-logging
+  already stops cold tables from producing rows; adding tier cadences on top would be
+  redundant machinery and a second source of configuration error.
+
+- **Dictionary / `integer[]` string encoding.** `pg_flight_recorder` and `pg_ash`
+  encode high-cardinality query text into dictionaries; our high-cardinality key is
+  `relid`, which is already a compact `oid`. No dictionary needed.
+
+- **Sub-minute N-slot ring buffer.** A fixed-slot in-memory ring makes sense for
+  sub-second sampling; at a 1-minute cadence ordinary partitioned tables are simpler
+  and sufficient.
+
+### Migration stance
+
+Telemetry is disposable operational data, not business data. When partitioning lands
+([Phase 1.5, S2](#phase-1-5)), the observe tables are **destructively recreated**
+rather than migrated in place — the cheapest correct path for throwaway data, and a
+deliberate, one-time exception to `pgfc_observe`'s otherwise additive-only schema
+rule. The exception does not extend to `pgfc_govern`'s audit tables, whose history is
+worth keeping.
+
+### Data-class retention windows
+
+Defaults, not universal recommendations; all configurable. Raw and rollup tables use
+partition rotation; the rest use time-cutoff pruning.
+
+| Data class | Lives in | Default retention | Mechanism |
+|---|---|---|---|
+| Raw observations | `pgfc_observe` samples | 24–72 h | partition drop/truncate |
+| Derived state | `pgfc_observe` | 7–14 d | partition / cutoff |
+| `1m` rollups | `pgfc_observe` rollups | 7 d | partition drop |
+| `1h` rollups | `pgfc_observe` rollups | 30–90 d | partition drop |
+| `1d` rollups | `pgfc_observe` rollups | 365 d | partition drop |
+| Decisions / actions | `pgfc_govern` | 180 d | time-cutoff prune |
+| Diagnostics | `pgfc_govern` | 365 d | time-cutoff prune |
+| Policy history | `pgfc_govern` | indefinite | pruned last, explicitly |
+
+### Benchmark-first
+
+Each increment lands with a measurement, not just an assertion: sparse storage is
+justified by a measured row-reduction ratio on a representative workload; partition
+GC by reclaimed-space and dead-tuple numbers; rollups by query-latency on long ranges.
+The recorder's discipline of proving the storage win before declaring it is carried
+over.
 
 ---
 
@@ -1724,6 +1831,49 @@ Sequenced so risk rises only after the prior layer is trustworthy.
   classification flapping; the multi-rate split runs cleanly; **saturation is
   correctly classified** (a held-open txn produces an `inhibited` diagnostic naming
   the owner, not endless `adjust` proposals); no `apply()` ever fires.
+
+<a id="phase-1-5"></a>
+
+### Phase 1.5 — Observation storage & self-maintenance
+
+Builds the [storage model](#observation-storage) in full before active control, so a
+governor that is about to start *acting* is first made to not be its own storage
+liability. Each increment is a separate PR through the required gates and lands with
+its benchmark. Sequenced by dependency:
+
+- **S1 — Govern-audit retention + policy history.** Add time-cutoff pruning to the
+  append-only `decision_log`/`action_history`/`tick_log`/`diagnostics` tables (the
+  current unbounded-growth gap) and a `policy_history` table. Depends on nothing;
+  fixes the most concrete bug first.
+
+- **S2 — Partition infrastructure + GC.** Daily `RANGE`-partitioned
+  `relation_samples`/`snapshots` (BRIN on an `int4` epoch time column), an O(1)
+  `_ensure_partition()`, a `_partition_inventory()` over `pg_inherits`, and two-tier
+  GC (nightly `TRUNCATE` + monthly `DROP` of empty shells). Bundles the
+  `relispartition` filter into `gen_reference.sql` (else the Reference gate floods
+  with child partitions) and the **destructive recreate** of the observe tables.
+
+- **S3 — Sparse storage.** `UNLOGGED` `relation_last_state` HOT side table; the
+  collector writes a sample only on observed change; reader reconciliation for
+  `maintenance_debt` and `estimate()`. Subsumes the reloptions data-minimization
+  requirement (no more storing the full `reloptions` array every minute).
+
+- **S4 — Rollups.** `1m`/`1h`/`1d` aggregate tables, a rollup job that runs
+  *before* raw truncation, and cascading retention across the tiers.
+
+- **S5 — Cardinality filters.** Exclude temporary, sub-threshold, and
+  extension-owned relations, and by-schema policy. No tiered cadence — sparse storage
+  already handles cold tables.
+
+- **S6 — Storage budget + self-health.** Static autovacuum reloptions on the
+  governor's own tables, a storage-budget report, the graceful-degrade prune order,
+  and a self-health view.
+
+- **Exit:** on a soak workload the governor's own schema is **flat or bounded**, not
+  growing; raw partitions rotate by `TRUNCATE`/`DROP` with **zero accumulated dead
+  tuples**; sparse storage shows a measured row-reduction versus dense collection;
+  rollups answer long-range queries after raw data is gone; the budget report is
+  accurate and the prune order degrades gracefully under pressure.
 
 ### Phase 2 — Active vacuum/analyze control
 
