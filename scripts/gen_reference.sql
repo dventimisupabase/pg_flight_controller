@@ -26,14 +26,18 @@ BEGIN
     END IF;
 
     -- Tables ------------------------------------------------------------------
+    -- relkind 'r' ordinary + 'p' partitioned parent; exclude child partitions
+    -- (relispartition) so a daily-partitioned table lists once, not once per day.
     IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-               WHERE n.nspname = sch AND c.relkind = 'r') THEN
+               WHERE n.nspname = sch AND c.relkind IN ('r','p')
+                 AND NOT c.relispartition) THEN
         RETURN NEXT '## Tables';
         RETURN NEXT '';
         FOR rel IN
             SELECT c.oid, c.relname, obj_description(c.oid, 'pg_class') AS cmt
             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = sch AND c.relkind = 'r'
+            WHERE n.nspname = sch AND c.relkind IN ('r','p')
+              AND NOT c.relispartition
             ORDER BY c.relname
         LOOP
             RETURN NEXT '### ' || sch || '.' || rel.relname;

@@ -10,11 +10,12 @@ pg_flight_controller telemetry: snapshots of autovacuum-relevant state (read-onl
 
 ### pgfc_observe.relation_samples
 
-Per-relation observed state for one snapshot. reloptions is the governor rollback baseline.
+Per-relation observed state for one snapshot. reloptions is the governor rollback baseline. Daily RANGE partitioned on collected_day.
 
 | Column | Type | Description |
 | --- | --- | --- |
 | `snapshot_id` | `bigint` |  |
+| `collected_day` | `integer` |  |
 | `relid` | `oid` |  |
 | `schemaname` | `name` |  |
 | `relname` | `name` |  |
@@ -44,11 +45,12 @@ Per-relation observed state for one snapshot. reloptions is the governor rollbac
 
 ### pgfc_observe.snapshots
 
-Header row per observe() run: timestamp + cluster/GUC + pg_class health + xmin horizons.
+Header row per observe() run: timestamp + cluster/GUC + pg_class health + xmin horizons. Daily RANGE partitioned on collected_day.
 
 | Column | Type | Description |
 | --- | --- | --- |
 | `snapshot_id` | `bigint` |  |
+| `collected_day` | `integer` |  |
 | `collected_at` | `timestamp with time zone` |  |
 | `datname` | `name` |  |
 | `server_version_num` | `integer` |  |
@@ -110,6 +112,22 @@ Header row per observe() run: timestamp + cluster/GUC + pg_class health + xmin h
 
 ## Functions
 
+### `pgfc_observe._ensure_partition(p_day integer) → void`
+
+Create the daily partition for p_day (default today) on both telemetry tables if missing; O(1) and race-safe.
+
+### `pgfc_observe._epoch_day(ts timestamp with time zone) → integer`
+
+Whole UTC days since 1970-01-01 — the int4 daily RANGE partition key.
+
+### `pgfc_observe._partition_inventory() → TABLE(parent text, partition text, day integer, range_start timestamp with time zone, range_end timestamp with time zone, approx_rows bigint, size_bytes bigint)`
+
+Child partitions of the telemetry tables with day, decoded range, est. rows, and size.
+
+### `pgfc_observe.drop_empty_partitions(keep interval) → bigint`
+
+Tier-2 GC: DROP empty telemetry partitions older than keep (default 30 days). Returns partitions dropped.
+
 ### `pgfc_observe.effective_reloption(reloptions text[], opt text) → text`
 
 Value of storage parameter opt in reloptions, or NULL if not explicitly set.
@@ -124,4 +142,4 @@ Oldest xmin data/catalog removability horizons with attributed owner class (Appe
 
 ### `pgfc_observe.retain(keep interval) → bigint`
 
-Delete snapshots older than keep (default 14 days); relation_samples cascade.
+Tier-1 GC: TRUNCATE telemetry partitions older than keep (default 3 days). Returns partitions truncated.

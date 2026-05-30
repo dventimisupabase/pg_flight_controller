@@ -101,15 +101,28 @@ Run the two loops on separate cadences with `pg_cron` (observe often, act rarely
 SELECT cron.schedule('pgfc_observe', '* * * * *',   $$SELECT pgfc_govern.observe_tick()$$);
 SELECT cron.schedule('pgfc_control', '*/5 * * * *', $$SELECT pgfc_govern.control_tick()$$);
 
--- prune old data daily so neither schema grows without bound:
-SELECT cron.schedule('pgfc_observe_retain', '7 3 * * *',  $$SELECT pgfc_observe.retain()$$);
-SELECT cron.schedule('pgfc_govern_retain',  '17 3 * * *', $$SELECT pgfc_govern.retain()$$);
+-- prune old data so neither schema grows without bound:
+SELECT cron.schedule('pgfc_observe_retain', '7 3 * * *',   $$SELECT pgfc_observe.retain()$$);
+SELECT cron.schedule('pgfc_observe_gc',     '23 4 1 * *',  $$SELECT pgfc_observe.drop_empty_partitions()$$);
+SELECT cron.schedule('pgfc_govern_retain',  '17 3 * * *',  $$SELECT pgfc_govern.retain()$$);
 ```
 
-`pgfc_observe.retain()` trims the high-volume telemetry (snapshots and their samples,
-default 14 days). `pgfc_govern.retain()` prunes the audit tables — decisions and
-actions (180 days), tick log (180 days), and resolved diagnostics (365 days);
-`policy_history` is kept indefinitely. Both windows are arguments you can override.
+The high-volume telemetry tables (`snapshots`, `relation_samples`) are **daily
+`RANGE` partitioned** on an `int4` epoch-day key, and retention is whole-partition
+rotation — never row-by-row `DELETE` — so it reclaims space instantly and leaves zero
+dead tuples (the governor never becomes its own vacuum burden). Two tiers:
+
+- `pgfc_observe.retain()` (nightly) `TRUNCATE`s partitions older than the window
+  (default 3 days), keeping the empty shell.
+- `pgfc_observe.drop_empty_partitions()` (monthly) `DROP`s the long-empty shells
+  (default 30 days); it never drops a partition that still holds data.
+
+`pgfc_observe.observe()` creates each day's partition on demand, so no partition
+pre-creation job is needed. `pgfc_govern.retain()` prunes the low-volume audit tables
+by time cutoff — decisions and actions (180 days), tick log (180 days), and resolved
+diagnostics (365 days); `policy_history` is kept indefinitely. All windows are
+arguments you can override. Inspect partitions with
+`SELECT * FROM pgfc_observe._partition_inventory()`.
 
 ## Enabling active control
 

@@ -35,6 +35,40 @@ section in the same pull request as your change (this is a convention, not a CI 
   unresolved diagnostic. New `policy_history` table (with an `AFTER` trigger on
   `policy`) records human-owned policy changes and is retained indefinitely.
 
+- **Storage Phase 1.5 — S2 (partition infrastructure + GC).** `pgfc_observe`'s
+  high-volume tables (`snapshots`, `relation_samples`) are now **daily `RANGE`
+  partitioned** on an `int4` epoch-day key (`collected_day`), with a bloat-free BRIN
+  index. New `_ensure_partition()` (O(1), race-safe; called by `observe()`) and
+  `_partition_inventory()` helpers. Retention is now whole-partition rotation —
+  **zero dead tuples** — in two tiers: `retain()` `TRUNCATE`s out-of-window
+  partitions (now default 3 days, was a 14-day `DELETE`) and the new
+  `drop_empty_partitions()` `DROP`s the empty shells (default 30 days). The
+  generated-reference script now lists partitioned parents once instead of flooding
+  with child partitions.
+
+### Changed
+
+- **`pgfc_observe.retain(interval)` is no longer row-by-row `DELETE`** — it `TRUNCATE`s
+  whole daily partitions, and its default window changed from 14 days to 3 days
+  (raw-telemetry retention; long-range history is served by rollups in a later
+  increment). The `relation_samples → snapshots` foreign key was removed (partition
+  rotation makes a row-level cascade both unused and an obstacle to `TRUNCATE`).
+
+### Removed
+
+- The `relation_samples.snapshot_id → snapshots` foreign key (see Changed).
+
+### Breaking
+
+- **Upgrading `pgfc_observe` across S2 destructively recreates the telemetry tables.**
+  Partitioning cannot be added in place, and telemetry is disposable, so re-running
+  `pgfc_observe/install.sql` over a pre-S2 install drops and recreates `snapshots`
+  and `relation_samples` (existing rows are discarded). The `DROP ... CASCADE` also
+  drops dependent cross-schema views such as `pgfc_govern.catalog_health`; re-run
+  `pgfc_govern/install.sql` afterward to restore them. This is a deliberate one-time
+  exception to `pgfc_observe`'s additive-only rule and does not extend to
+  `pgfc_govern`'s audit tables.
+
 ### Notes
 
 - No tagged releases yet; the project is pre-1.0 and active control (Phase 2) is in
