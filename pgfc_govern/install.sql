@@ -484,3 +484,188 @@ END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.classify(bigint) IS
   'Assign each relation a workload class with a signal floor and N-cycle hysteresis.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- plan(): decide per-relation setpoints (advisory) + reconcile diagnostics
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Phase 1 scope: the VACUUM objective via the scale-factor lever. The threshold
+-- lever (small tables) and the ANALYZE objective are deferred follow-ups. The
+-- actuation-economy gates (rate limits, sustained-deviation) are deferred to Phase 2
+-- since apply() is gated off here; plan() only writes the decision/diagnosis trail.
+
+-- Snap a scale factor to the bounded grid (SF_GRID).
+CREATE OR REPLACE FUNCTION pgfc_govern.snap_sf(x double precision)
+RETURNS double precision IMMUTABLE LANGUAGE sql AS $$
+    SELECT g FROM (VALUES (0.01),(0.02),(0.05),(0.10),(0.20),(0.30),(0.50)) AS grid(g)
+    ORDER BY abs(g - x) LIMIT 1
+$$;
+
+CREATE OR REPLACE FUNCTION pgfc_govern.plan(p_tick_id bigint, p_snapshot_id bigint)
+RETURNS integer LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_sf_min     double precision := 0.01;
+    v_sf_max     double precision := 0.50;
+    v_freeze_thr double precision := 0.6;
+    v_aggr       double precision;
+    v_manage     boolean;
+    n integer;
+BEGIN
+    SELECT aggressiveness, manage_user_owned INTO v_aggr, v_manage
+      FROM pgfc_govern.policy WHERE enabled ORDER BY policy_name LIMIT 1;
+    v_aggr   := COALESCE(v_aggr, 1.0);
+    v_manage := COALESCE(v_manage, false);
+
+    INSERT INTO pgfc_govern.decision_log
+      (tick_id, relid, actuator, observation, prev_state, desired_state,
+       decision, proposed_value, policy_rule)
+    WITH
+    base AS (
+        SELECT rc.relid, rc.kind, rs.reltuples, rs.reloptions,
+               sn.def_vac_scale_factor, sn.def_vac_threshold,
+               sn.oldest_xmin_owner, sn.oldest_xmin_owner_detail,
+               re.saturation_cause, re.freeze_debt, re.mxid_freeze_debt,
+               re.vacuum_debt_ratio, re.effectiveness
+        FROM pgfc_govern.relation_class rc
+        JOIN pgfc_govern.relation_estimate re ON re.relid = rc.relid
+        JOIN pgfc_observe.relation_samples rs
+             ON rs.relid = rc.relid AND rs.snapshot_id = p_snapshot_id
+        JOIN pgfc_observe.snapshots sn ON sn.snapshot_id = p_snapshot_id
+    ),
+    tgt AS (
+        SELECT *,
+            CASE kind
+                WHEN 'queue' THEN 0.05 WHEN 'delete_heavy' THEN 0.10
+                WHEN 'oltp' THEN 0.20  WHEN 'mixed' THEN 0.20
+                WHEN 'append_only' THEN 0.40 WHEN 'archive' THEN 0.50
+            END AS f_template,
+            COALESCE(pgfc_observe.effective_reloption(reloptions,'autovacuum_vacuum_scale_factor')::float8,
+                     def_vac_scale_factor) AS cur_sf,
+            COALESCE(pgfc_observe.effective_reloption(reloptions,'autovacuum_vacuum_threshold')::bigint,
+                     def_vac_threshold)    AS cur_base,
+            (pgfc_observe.effective_reloption(reloptions,'autovacuum_vacuum_scale_factor') IS NOT NULL)
+                                           AS sf_user_set,
+            (freeze_debt > v_freeze_thr OR COALESCE(mxid_freeze_debt,0) > v_freeze_thr)
+                                           AS freeze_stress,
+            (oldest_xmin_owner IS NOT NULL AND oldest_xmin_owner <> 'none')
+                                           AS horizon_pinned
+        FROM base
+    ),
+    decided AS (
+        SELECT *,
+            -- freeze floor = cleanest; else policy-scaled class target, clamped
+            CASE WHEN freeze_stress THEN v_sf_min
+                 ELSE LEAST(GREATEST(f_template / v_aggr, v_sf_min), v_sf_max) END AS eff_f
+        FROM tgt
+    ),
+    q AS (
+        SELECT *,
+            pgfc_govern.snap_sf(
+                LEAST(GREATEST(eff_f - cur_base::float8 / NULLIF(reltuples, 0), v_sf_min), v_sf_max)
+            ) AS sf_target
+        FROM decided
+    )
+    SELECT
+        p_tick_id, relid, 'autovacuum_vacuum_scale_factor',
+        jsonb_build_object('vacuum_debt_ratio', vacuum_debt_ratio,
+                           'effectiveness', effectiveness,
+                           'reltuples', reltuples, 'cur_sf', cur_sf),
+        jsonb_build_object('saturation_cause', saturation_cause,
+                           'freeze_debt', freeze_debt,
+                           'horizon_owner', oldest_xmin_owner),
+        jsonb_build_object('f_template', f_template, 'eff_f', eff_f, 'sf_target', sf_target),
+        -- precedence: freeze floor dominates saturation suppression (§11.5/§13)
+        CASE
+            WHEN freeze_stress AND horizon_pinned
+                 THEN 'escalate:inhibited:' || COALESCE(oldest_xmin_owner,'unknown')
+            WHEN freeze_stress AND sf_target = cur_sf THEN 'hold'
+            WHEN freeze_stress                          THEN 'adjust'
+            WHEN saturation_cause = 'inhibited'
+                 THEN 'escalate:inhibited:' || COALESCE(oldest_xmin_owner,'unknown')
+            WHEN saturation_cause = 'io_limited'        THEN 'escalate:io_limited'
+            WHEN saturation_cause = 'config'            THEN 'suppressed:not_firing'
+            WHEN NOT v_manage AND sf_user_set           THEN 'suppressed:user_owned'
+            WHEN sf_target = cur_sf                      THEN 'hold'
+            ELSE 'adjust'
+        END,
+        sf_target::text,
+        'class=' || kind::text || ' f*=' || f_template
+    FROM q;
+    GET DIAGNOSTICS n = ROW_COUNT;
+
+    PERFORM pgfc_govern._reconcile_diagnostics(p_snapshot_id);
+    RETURN n;
+END
+$fn$;
+COMMENT ON FUNCTION pgfc_govern.plan(bigint, bigint) IS
+  'Advisory: write decision_log per relation (vacuum objective) + reconcile diagnostics.';
+
+-- Findings worthy of a diagnostic for the relations in a snapshot: (relid, class,
+-- severity, recommendation, evidence). Set-returning so it composes into the
+-- reconcile statements without a per-call temp table.
+CREATE OR REPLACE FUNCTION pgfc_govern._findings(p_snapshot_id bigint)
+RETURNS TABLE (relid oid, inhibitor_class text, severity text,
+               recommendation text, evidence jsonb)
+LANGUAGE sql STABLE AS $fn$
+    SELECT re.relid,
+        CASE
+            WHEN re.saturation_cause = 'io_limited' THEN 'io_limited'
+            WHEN re.saturation_cause = 'config'     THEN 'autovacuum_not_running'
+            ELSE sn.oldest_xmin_owner               -- inhibited / freeze-pinned: the owner
+        END,
+        CASE
+            WHEN (re.freeze_debt > 0.6 OR COALESCE(re.mxid_freeze_debt,0) > 0.6)
+                 AND sn.oldest_xmin_owner <> 'none'        THEN 'critical'
+            WHEN re.saturation_cause = 'inhibited'         THEN 'critical'
+            ELSE 'warning'
+        END,
+        CASE
+            WHEN re.saturation_cause = 'io_limited'
+                 THEN 'Vacuum runs but cannot keep up (I/O-bound). More aggressive '
+                      || 'settings will not help; consider cost limits / more workers (Phase 3).'
+            WHEN re.saturation_cause = 'config'
+                 THEN 'Debt is high but autovacuum has not run. Check that autovacuum is '
+                      || 'enabled and keeping up; lowering thresholds will not help an '
+                      || 'already-overdue table.'
+            ELSE 'Cleanup blocked by ' || sn.oldest_xmin_owner || ' ('
+                 || COALESCE(sn.oldest_xmin_owner_detail,'?')
+                 || '); clear it -- more vacuuming cannot advance past a pinned xmin horizon.'
+        END,
+        jsonb_build_object('saturation_cause', re.saturation_cause,
+                           'vacuum_debt_ratio', re.vacuum_debt_ratio,
+                           'effectiveness', re.effectiveness,
+                           'freeze_debt', re.freeze_debt,
+                           'horizon_owner', sn.oldest_xmin_owner,
+                           'horizon_age', sn.oldest_xmin_age)
+    FROM pgfc_govern.relation_estimate re
+    JOIN pgfc_observe.snapshots sn ON sn.snapshot_id = p_snapshot_id
+    WHERE re.relid IN (SELECT relid FROM pgfc_observe.relation_samples
+                        WHERE snapshot_id = p_snapshot_id)
+      AND (re.saturation_cause IN ('inhibited','io_limited','config')
+           OR ((re.freeze_debt > 0.6 OR COALESCE(re.mxid_freeze_debt,0) > 0.6)
+               AND sn.oldest_xmin_owner <> 'none'));
+$fn$;
+
+-- Open a diagnostic per (relid, class) that lacks an unresolved one this cycle, and
+-- resolve open findings whose condition has cleared. Keeps active_diagnostics from
+-- filling with one duplicate row per control cycle.
+CREATE OR REPLACE FUNCTION pgfc_govern._reconcile_diagnostics(p_snapshot_id bigint)
+RETURNS void LANGUAGE plpgsql AS $fn$
+BEGIN
+    -- open new findings (dedup against unresolved ones)
+    INSERT INTO pgfc_govern.diagnostics (relid, severity, inhibitor_class, evidence, recommendation)
+    SELECT f.relid, f.severity, f.inhibitor_class, f.evidence, f.recommendation
+    FROM pgfc_govern._findings(p_snapshot_id) f
+    WHERE NOT EXISTS (
+        SELECT 1 FROM pgfc_govern.diagnostics d
+        WHERE d.resolved_at IS NULL AND d.relid = f.relid
+          AND d.inhibitor_class IS NOT DISTINCT FROM f.inhibitor_class);
+
+    -- resolve open findings whose condition cleared this cycle
+    UPDATE pgfc_govern.diagnostics d SET resolved_at = now()
+    WHERE d.resolved_at IS NULL
+      AND d.relid IN (SELECT relid FROM pgfc_observe.relation_samples WHERE snapshot_id = p_snapshot_id)
+      AND NOT EXISTS (
+        SELECT 1 FROM pgfc_govern._findings(p_snapshot_id) f
+        WHERE f.relid = d.relid AND f.inhibitor_class IS NOT DISTINCT FROM d.inhibitor_class);
+END
+$fn$;
