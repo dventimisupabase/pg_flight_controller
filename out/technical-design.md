@@ -48,22 +48,34 @@ section:
   anti-wraparound protection is delayed (Sections 12, 13).
 
 - **Actuator movement has cost, so it is a second controlled variable.** Each
-  actuator move is an `ALTER TABLE` with *two* costs: a **lock cost** (DDL takes a
-  table-level lock that can fail, delay, or contend with maintenance — Appendix A)
-  and a **catalog cost** (it mutates `pg_class.reloptions`, and because catalogs are
-  MVCC relations each change leaves dead tuples that can bloat `pg_class` —
-  Appendix B). The governor therefore regulates *two* things at once: (1) the
-  maintenance state of each relation, and (2) the *frequency of its own actuator
-  activity*. The optimal controller is not the one that hits the target fastest; it
-  is the one that reaches convergence with the **minimum necessary catalog
-  mutation**. This synergizes with the feedforward design (§7.2, §11): we compute a
-  target, **quantize it to a coarse grid**, and hold it — so we never drip tiny
-  unique values into the catalog. It governs cadence (§14, §18), batching and
-  locking (§12), quantization (§11), rate limits and a catalog-mutation budget
-  (§16), and catalog self-monitoring (§5, §15).
+  actuator move is an `ALTER TABLE` with *three* costs: a **lock cost** (DDL takes a
+  table-level lock that can fail, delay, or contend with maintenance — Appendix A), a
+  **catalog cost** (it mutates `pg_class.reloptions`, and because catalogs are MVCC
+  relations each change leaves dead tuples that can bloat `pg_class` — Appendix B),
+  and an **opportunity cost** (the move may have *no effect at all* when an external
+  inhibitor is preventing cleanup — Appendix C). The governor therefore regulates
+  *two* things at once: (1) the maintenance state of each relation, and (2) the
+  *frequency of its own actuator activity*. The optimal controller is not the one
+  that hits the target fastest; it is the one that reaches convergence with the
+  **minimum necessary catalog mutation**. This synergizes with the feedforward design
+  (§7.2, §11): we compute a target, **quantize it to a coarse grid**, and hold it. It
+  governs cadence (§14, §18), batching and locking (§12), quantization (§11), rate
+  limits and a catalog-mutation budget (§16), catalog self-monitoring (§5, §15), and
+  saturation/inhibitor diagnosis (§11.3).
 
-The operating doctrine, drawn from Appendices A and B: **Observe frequently. Estimate
-continuously. Decide carefully. Mutate catalogs rarely. Never wait.**
+- **The governor controls maintenance _progress_, not autovacuum (Appendix C).**
+  "Vacuum ran" does not imply "cleanup happened" — vacuum can only remove tuples
+  older than the cluster's xmin horizon, and an external inhibitor (a long-running
+  transaction, a replication slot, a prepared transaction, hot-standby feedback) can
+  pin that horizon so that vacuum runs and reclaims *nothing*. So the governor
+  **measures outcomes, not commands**: when more actuator input stops producing
+  maintenance progress (actuator saturation), it does not escalate further — it
+  switches from control mode to **diagnosis mode**, attributes the inhibitor, and
+  surfaces it (§11.3). More input ≠ more progress.
+
+The operating doctrine, drawn from Appendices A–C: **Observe frequently. Estimate
+continuously. Decide carefully. Mutate catalogs rarely. Diagnose before escalating.
+Never wait.**
 
 The autovacuum trigger formulas we are steering (PostgreSQL 15–18):
 
@@ -237,6 +249,28 @@ notes matter because we test on PG 15–18 and the schema is additive.
   The governor's *own* mutation rate is derived separately from `action_history`
   (§15), no extra storage.
 
+### 5.3a Removability horizons (Appendix C — why cleanup may be impossible)
+
+Vacuum can only remove a dead tuple older than the cluster's xmin horizon. An
+external **inhibitor** can pin that horizon, so vacuum runs and reclaims nothing. The
+six inhibitor classes of Appendix C are not six phenomena — they are different
+*owners* of **two** horizons, which is how PostgreSQL actually computes removability.
+We observe both, with the **age and the owning class** of whichever source is oldest:
+
+- **`oldest_xmin` (data horizon)** = min xmin across: running transactions
+  (`pg_stat_activity.backend_xmin`), replication slots (`pg_replication_slots.xmin`,
+  including walsender slots that carry hot-standby feedback), and prepared
+  transactions (`pg_prepared_xacts`). Owner class ∈ {long_running_txn,
+  replication_slot, standby_feedback, prepared_xact}.
+- **`oldest_catalog_xmin` (catalog horizon)** = min `catalog_xmin` across logical
+  replication slots. A pinned catalog horizon is exactly the catalog bloat the
+  Appendix B machinery *observes but cannot vacuum away* — Class 5 cross-links here.
+
+These are cluster-level signals (snapshot header), the structural twins of the
+catalog-health columns. Inhibitor **Class 6** (lock/interruption) is a *different*
+mechanism — partial progress, not horizon pinning — and is already covered by
+`lock_wait_outcome` / `vacuum_busy` (§12.2); it is not part of the horizon model.
+
 ### 5.4 Optional / best-effort
 
 - `pg_stat_progress_vacuum` for in-flight vacuums. **Column layout changed in
@@ -273,7 +307,14 @@ CREATE TABLE IF NOT EXISTS pgfc_observe.snapshots (
     pg_class_size_bytes      bigint,         -- pg_total_relation_size('pg_class')
     pg_class_n_dead_tup      bigint,         -- from pg_stat_all_tables for pg_class
     pg_class_n_live_tup      bigint,
-    pg_class_last_autovacuum timestamptz
+    pg_class_last_autovacuum timestamptz,
+    -- removability horizons (Appendix C): why cleanup may be impossible (§5.3a).
+    oldest_xmin_age          bigint,         -- age() of the oldest DATA horizon
+    oldest_xmin_owner        text,           -- class: long_running_txn | replication_slot
+                                             --   | standby_feedback | prepared_xact | none
+    oldest_xmin_owner_detail text,           -- pid / slot_name / gid for the operator
+    oldest_catalog_xmin_age  bigint,         -- age() of the oldest CATALOG horizon
+    oldest_catalog_xmin_owner text           -- usually a logical replication slot, else 'none'
 );
 COMMENT ON TABLE pgfc_observe.snapshots IS
   'Header row per observe() run: timestamp + cluster/GUC + pg_class health, shared by all samples.';
@@ -338,7 +379,9 @@ BEGIN
         def_vac_cost_delay, def_freeze_max_age, def_mxid_freeze_max_age,
         autovacuum_max_workers, wal_bytes,
         pg_class_size_bytes, pg_class_n_dead_tup, pg_class_n_live_tup,
-        pg_class_last_autovacuum)
+        pg_class_last_autovacuum,
+        oldest_xmin_age, oldest_xmin_owner, oldest_xmin_owner_detail,
+        oldest_catalog_xmin_age, oldest_catalog_xmin_owner)
     SELECT
         current_setting('server_version_num')::int,
         current_setting('autovacuum_vacuum_scale_factor')::float8,
@@ -352,8 +395,12 @@ BEGIN
         current_setting('autovacuum_max_workers')::int,
         (SELECT wal_bytes FROM pg_stat_wal),
         pg_total_relation_size('pg_catalog.pg_class'::regclass),
-        c.n_dead_tup, c.n_live_tup, c.last_autovacuum
-    FROM pg_stat_all_tables c WHERE c.relid = 'pg_catalog.pg_class'::regclass
+        c.n_dead_tup, c.n_live_tup, c.last_autovacuum,
+        h.oldest_xmin_age, h.oldest_xmin_owner, h.oldest_xmin_owner_detail,
+        h.oldest_catalog_xmin_age, h.oldest_catalog_xmin_owner
+    FROM pg_stat_all_tables c
+    CROSS JOIN pgfc_observe.removability_horizons() h   -- §6.1a
+    WHERE c.relid = 'pg_catalog.pg_class'::regclass
     RETURNING snapshot_id INTO v_snapshot_id;
 
     INSERT INTO pgfc_observe.relation_samples (
@@ -388,6 +435,46 @@ END $$;
 `total_autovacuum_time` (PG18+) is collected by a version-guarded variant; on older
 servers the column stays `NULL`. Keep one code path simple per major version rather
 than dynamic SQL where reasonable.
+
+### 6.1a `removability_horizons()` — the inhibitor observable (Appendix C)
+
+Computes the two horizons of §5.3a as one record: the oldest data-xmin and the
+oldest catalog-xmin, each with the *age* and the *owning class* of the oldest source.
+This is the single observable that explains why vacuum may reclaim nothing — and the
+attributor the diagnostic logic (§11.3) keys on.
+
+```sql
+CREATE OR REPLACE FUNCTION pgfc_observe.removability_horizons()
+RETURNS TABLE (oldest_xmin_age bigint, oldest_xmin_owner text,
+               oldest_xmin_owner_detail text,
+               oldest_catalog_xmin_age bigint, oldest_catalog_xmin_owner text)
+LANGUAGE sql STABLE AS $$
+WITH sources AS (   -- DATA horizon: each row is one candidate xmin and its owner
+    SELECT backend_xmin AS x, 'long_running_txn' AS owner, pid::text AS detail
+      FROM pg_stat_activity WHERE backend_xmin IS NOT NULL
+    UNION ALL
+    SELECT xmin, 'replication_slot', slot_name FROM pg_replication_slots
+      WHERE xmin IS NOT NULL
+    UNION ALL
+    SELECT transaction::xid, 'prepared_xact', gid FROM pg_prepared_xacts
+    -- standby_feedback surfaces as a walsender slot/backend xmin above; if a site
+    -- runs hot_standby_feedback without a slot, add pg_stat_replication.backend_xmin.
+), oldest AS (
+    SELECT x, owner, detail, age(x) AS a FROM sources
+    ORDER BY age(x) DESC LIMIT 1            -- oldest = largest age
+), cat AS (   -- CATALOG horizon: logical slots pin catalog_xmin
+    SELECT slot_name, age(catalog_xmin) AS a FROM pg_replication_slots
+      WHERE catalog_xmin IS NOT NULL ORDER BY age(catalog_xmin) DESC LIMIT 1
+)
+SELECT (SELECT a FROM oldest), COALESCE((SELECT owner FROM oldest), 'none'),
+       (SELECT detail FROM oldest),
+       (SELECT a FROM cat),     COALESCE((SELECT slot_name FROM cat), 'none');
+$$;
+```
+
+Cheap (a handful of small system views), `STABLE`, and the source columns should be
+re-confirmed against pg_stat_activity / pg_replication_slots / pg_prepared_xacts at
+scaffold time across PG 15–18.
 
 ### 6.2 Observe views
 
@@ -538,10 +625,10 @@ av_since_apply  = autovacuum_count_t - autovacuum_count_at_last_apply
 
 `av_since_apply` counts completed vacuum cycles since our last change. It is **not** a
 correction gate (the keeping-up move is feedforward, §11.1); it is consumed by
-`verify()` to attribute outcomes and by the regime guard's K-cycle requirement
-(§11.3), which must not declare `io_limited` before watching at least one cycle.
+`verify()` to attribute outcomes and by the saturation-diagnosis K-cycle requirement
+(§11.3), which must not declare a saturation cause before watching at least one cycle.
 
-### 7.4 Cleanup efficiency and lag
+### 7.4 Cleanup efficiency, effectiveness, and lag
 
 ```text
 -- dead tuples cleared per autovacuum run, observed across a run boundary
@@ -554,6 +641,25 @@ maintenance_lag = now() - (first snapshot where vacuum_debt_ratio crossed 1.0
 
 `maintenance_lag` measures observed actuation dead-time and is the empirical bound
 on how often we may safely re-correct.
+
+**Maintenance effectiveness (Appendix C) — the saturation discriminator.** Did a
+vacuum that *ran* actually *remove* tuples? Directionally (Appendix C prefers
+directional correctness over precision):
+
+```text
+-- per cycle in which autovacuum_count increased:
+effective_cycle = (cleanup_per_run > ε) ? 1 : 0          -- did dead tuples drop?
+effectiveness   = EWMA_α(effective_cycle)                -- smoothed over K cycles
+```
+
+Effectiveness is **smoothed, never judged off one cycle** — it inherits the exact
+sampling-bias trap of `f_peak` (§7.2): a fast-churning `queue` table re-dirties in
+the gap between 1-min observations, so a single before/after delta can read as low
+effectiveness even when the vacuum worked. So we require *sustained* low
+effectiveness before suspecting saturation, and treat the **xmin horizon (§5.3a) as
+the dispositive attributor** — a horizon pinned old and not advancing is near
+conclusive on its own; effectiveness just says "go look." Analogous freeze signal:
+`freeze_progressing = (relfrozenxid_age dropped after a vacuum)`.
 
 ### 7.5 Burstiness
 
@@ -662,7 +768,7 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.relation_estimate (
     f_trigger_ewma      double precision,   -- realized dead fraction (≈ sf), peak-hold biased low
     mod_trigger_ewma    double precision,   -- realized mod fraction
     f_peak_current      double precision,   -- running peak this cycle
-    -- indicators (logged; drive the regime guard, not the keeping-up move)
+    -- indicators (logged; drive saturation diagnosis §11.3, not the keeping-up move)
     vacuum_debt_ratio   double precision,
     analyze_debt_ratio  double precision,
     freeze_debt         double precision,
@@ -674,6 +780,10 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.relation_estimate (
     cleanup_per_run     bigint,
     maintenance_lag     interval,
     burstiness          double precision,
+    -- effectiveness & saturation (Appendix C, §7.4/§11.3)
+    effectiveness       double precision,  -- EWMA: fraction of vacuums that cleaned
+    freeze_progressing  boolean,           -- relfrozenxid advanced after recent vacuum?
+    saturation_cause    text,              -- NULL | 'config' | 'io_limited' | 'inhibited'
     estimated_at        timestamptz NOT NULL DEFAULT now()
 );
 
@@ -700,7 +810,8 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.decision_log (
     observation    jsonb NOT NULL,   -- relevant observed values
     prev_state     jsonb NOT NULL,   -- relevant derived state
     desired_state  jsonb NOT NULL,   -- target setpoint(s)
-    decision       text NOT NULL,    -- 'hold'|'adjust'|'suppressed:<reason>'|'escalate:io_limited'
+    decision       text NOT NULL,    -- 'hold'|'adjust'|'suppressed:<reason>'
+                                     -- |'escalate:io_limited'|'escalate:inhibited:<class>'
                                      -- suppressed reasons: rate_limited, daily_budget,
                                      -- user_owned, vacuum_busy, no_op, awaiting_sustain
     proposed_value text,             -- quantized grid value (§11.1)
@@ -754,6 +865,23 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.tick_log (
     n_applied      integer,
     error          text
 );
+
+-- ── Diagnostic findings (Appendix C): saturation root-cause + recommendation ──
+CREATE TABLE IF NOT EXISTS pgfc_govern.diagnostics (
+    diagnostic_id  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    relid          oid,              -- NULL = cluster-level finding (e.g. pinned horizon)
+    detected_at    timestamptz NOT NULL DEFAULT now(),
+    severity       text NOT NULL DEFAULT 'warning'
+                   CHECK (severity IN ('info','warning','critical')),
+    inhibitor_class text,           -- long_running_txn|replication_slot|standby_feedback|
+                                    --   prepared_xact|catalog_horizon|lock_conflict|io_limited
+    evidence       jsonb NOT NULL,  -- the observations that triggered it (debt, av_count
+                                    --   deltas, effectiveness, horizon age + owner detail)
+    recommendation text,            -- templated, human-readable: "terminate PID 4242" etc.
+    resolved_at    timestamptz      -- set when the condition clears (horizon advances)
+);
+COMMENT ON TABLE pgfc_govern.diagnostics IS
+  'When control saturates, the cause + an actionable recommendation, not more DDL.';
 ```
 
 ---
@@ -827,8 +955,8 @@ a few values (§11.4); quantization just tightens an already-low entropy distrib
 and gives the small-table threshold lever the same property.
 
 The measured dead fraction (`f_trigger_ewma`, §7.2) is **not** an input here — it is
-a logged diagnostic, and a biased one. Feedback enters only through the regime guard
-(§11.3). The analyze loop is identical:
+a logged diagnostic, and a biased one. Feedback enters only through saturation
+diagnosis (§11.3). The analyze loop is identical:
 `ana_sf_target = snap(clamp(mod_target - ana_base/reltuples, …), SF_GRID)`.
 
 ### 11.2 The gates (anti-oscillation + minimum catalog mutation)
@@ -869,26 +997,62 @@ versions of gates 1 (no-op) and the ownership check are **authoritatively enforc
    proposal exceeding any tier is `suppressed:rate_limited` (or
    `suppressed:daily_budget`). Only the freeze emergency (§11.5) bypasses these.
 
-### 11.3 Regime guard — the only real feedback path
+### 11.3 Saturation → diagnosis (the only real feedback path)
 
 Feedforward sets the *trigger point*; it cannot tell whether autovacuum can *keep*
-that point. That is what the overdue/overshoot indicators (§7.2) are for, and it is
-the one regime where the measurement carries information the actuator did not already
-determine:
+that point — that is the one place observation carries information the actuator did
+not already determine, and it is where the governor must measure **maintenance
+progress, not commands** (Appendix C). When debt stays high, the governor classifies
+*why* before doing anything, using three observables it already has:
 
 ```text
-io_limited  ⇔  vacuum_debt_ratio > 1 persisting across K cycles
-               (n_dead_tup stays above the effective threshold even though
-                autovacuum_count keeps incrementing)
-            OR n_dead_tup ≫ effective threshold at the instant a vacuum fires
+                       autovacuum_count        cleanup effectiveness     →  cause
+                       incrementing?           (§7.4, EWMA, sustained)
+config-insufficient    NO                      —                         →  normal control:
+                                                                            lower threshold
+                                                                            (actuator HAS authority)
+io_limited             YES                     OK (vacuums DO drop dead   →  escalate:io_limited
+                                               tuples; refills faster)
+inhibited              YES                     ≈ 0 (vacuums run, dead     →  diagnose: inhibitor
+                                               tuples do NOT drop)
 ```
 
-When detected the table is **I/O-limited, not threshold-limited** — lowering `sf`
-further does nothing, because the trigger is already always tripped. Emit decision =
-`escalate:io_limited` (surfaced for the operator; resolved by Phase 3 cost actuators
-or more workers) rather than a useless `sf` correction. The call requires at least K
-observed vacuum cycles, so it is never made on a table the governor has not yet
-watched through a cycle.
+So: **`autovacuum_count` delta separates config from saturation; effectiveness
+separates `io_limited` from inhibited; the xmin horizon (§5.3a) attributes _which_
+inhibitor.** All require ≥ K observed vacuum cycles, so no cause is declared on a
+table the governor has not yet watched through a cycle.
+
+**A pinned, non-advancing horizon is a _necessary_ condition for `inhibited` — low
+effectiveness alone is not enough.** This is the dangerous cell: a fast-churning
+`queue` table re-dirties between 1-min observations and reads as effectiveness ≈ 0
+*even though vacuum worked* (the §7.4 sampling-bias trap), while its horizon is
+perfectly healthy. Classifying that as `inhibited` would suppress actuation on a
+table that genuinely needs it — the worse error direction. So: sustained low
+effectiveness **with a healthy horizon is treated as measurement noise**, never as an
+inhibitor; it falls through to `io_limited` only if debt is genuinely and persistently
+high. `inhibited` requires the horizon evidence.
+
+- **config-insufficient** is not saturation at all — autovacuum simply is not firing
+  often enough; the actuator has authority, so this is ordinary control (lower the
+  threshold/scale per §11.1–11.2).
+
+- **`io_limited`** — vacuum fires and *does* reclaim, but churn outruns it. Lowering
+  `sf` further is futile (the trigger is already always tripped). Emit
+  `escalate:io_limited`, write a `diagnostics` row (resolved by Phase 3 cost actuators
+  or more workers), and stop pushing the actuator.
+
+- **inhibited** — vacuum fires but reclaims nothing because tuples are not removable.
+  The dispositive evidence is the **horizon**: if `oldest_xmin` (or
+  `oldest_catalog_xmin`) is pinned old and not advancing, attribute the
+  `oldest_xmin_owner` class, emit `escalate:inhibited:<class>`, write a `diagnostics`
+  row naming the owner (`pid` / `slot_name` / `gid`) with a templated recommendation,
+  and **suppress further actuation** on the affected tables. More aggressiveness
+  cannot help — only the operator clearing the inhibitor can. *Diagnose, don't
+  escalate* (Appendix C).
+
+Effectiveness is the *trigger to look*; the horizon is the *attributor*. A pinned,
+non-advancing horizon is near-conclusive on its own, which is why we never declare an
+inhibitor off a single noisy effectiveness sample (§7.4).
 
 ### 11.4 Actuator ranges and quantization grids
 
@@ -924,11 +1088,28 @@ both want to move in the same cycle their changes are **batched into a single
 separately because their effects are independently observable. Attribution is not
 traded for the lock saving.
 
-### 11.5 Safety override
+### 11.5 Safety override (inhibitor-aware)
 
 Before any of the above: if `freeze_debt > freeze_action_threshold` (default 0.6) or
 `mxid_freeze_debt > 0.6`, the relation is driven to its *cleanest* vacuum target
 regardless of class (Section 13). Safety dominates (Principle 3).
+
+**But escalation must be inhibitor-aware (Appendix C), and this nuance is exact —
+the obvious simplification is a wraparound hole:**
+
+- Inhibitor-awareness suppresses *further escalation and catalog churn* — it does
+  **not** relax the standing aggressive posture. The §13 guard ("never reduce
+  cleanup aggressiveness on a freeze-stressed table") still **dominates**. "Inhibitor
+  present" must never become "back off vacuum."
+- When `freeze_debt` is rising **and** `oldest_xmin`/`oldest_catalog_xmin` is pinned
+  old by an attributed inhibitor, freezing *cannot* advance `relfrozenxid` past that
+  horizon — so additional actuation is futile and only burns the budget the emergency
+  path otherwise bypasses. The governor therefore **holds at cleanest, stops pushing
+  the actuator, and raises a `critical` diagnostic naming the owner**. Its real value
+  in this emergency is *diagnosis*: the fix is a human clearing the slot/txn.
+- PostgreSQL *itself* forces anti-wraparound vacuum regardless of our settings, which
+  is exactly why the governor hammering the actuator here adds nothing but churn —
+  reinforcing diagnose-don't-escalate.
 
 ---
 
@@ -1103,14 +1284,21 @@ Phase 2+. But anti-wraparound dominates everything (Principle 3), so the MVP mus
   freezes), so making ordinary vacuum more eager *is* a valid wraparound mitigation
   with only the MVP's threshold/scale levers.
 
+- **Inhibitor-aware (Appendix C):** if freeze debt rises while the xmin horizon is
+  pinned old by an inhibitor (§5.3a), freezing cannot advance `relfrozenxid` — so the
+  governor holds at cleanest, stops escalating, and raises a `critical` diagnostic
+  naming the owner (§11.5). This does **not** relax aggressiveness; it stops *futile*
+  escalation. A replication slot or long-running transaction driving a table toward
+  wraparound is a real incident whose fix is clearing the inhibitor, not more vacuum.
+
 - **Never:** the governor will not raise any threshold/scale factor on a relation
   whose `freeze_debt` is elevated, and (when freeze actuators arrive) will never set
   `freeze_max_age` upward past safe bounds. There is a hard guard in `plan()` that
   drops any proposed change that would *reduce* cleanup aggressiveness on a
   freeze-stressed table.
 
-This way the doc neither pretends to tune freeze parameters in the MVP nor ignores
-wraparound.
+This way the doc neither pretends to tune freeze parameters in the MVP, ignores
+wraparound, nor hammers a futile actuator when an inhibitor is the real cause.
 
 ---
 
@@ -1137,15 +1325,19 @@ therefore split into **two entry points on two cadences**, not one `tick()`:
 
 ```text
 observe_tick():
-  s := pgfc_observe.observe()    -- fresh snapshot
+  s := pgfc_observe.observe()    -- fresh snapshot (incl. xmin horizons, §6.1a)
   classify(s)                    -- update relation_class (+ hysteresis, §8.3)
-  estimate(s)                    -- write relation_estimate (EWMA, f_peak, indicators)
+  estimate(s)                    -- relation_estimate: EWMA, f_peak, indicators,
+                                 --   effectiveness, freeze_progressing, saturation_cause
   return s
 ```
 
 Cheap and read-only-to-the-database (writes only pgfc tables). Running it often
-keeps rate estimates and `f_peak` peak-holds sharp, and — crucially — **observing
-often does not mean acting often**: this loop never calls `apply()`.
+keeps rate estimates, `f_peak` peak-holds, and effectiveness EWMAs sharp, and —
+crucially — **observing often does not mean acting often**: this loop never calls
+`apply()`. `estimate()` also computes `saturation_cause` (config / io_limited /
+inhibited, §11.3) so `plan()` can act on it; the attribution itself uses the
+snapshot's horizon columns.
 
 ### 14.2 Control loop: `control_tick()` (every ~5 min)
 
@@ -1153,8 +1345,11 @@ often does not mean acting often**: this loop never calls `apply()`.
 control_tick():
   c := open tick_log row
   n := plan(c)                   -- evaluate control law (§11) against latest estimate;
-                                 --   quantize → no-op(vs live catalog) → sustained →
-                                 --   rate-limit/budget; write decision_log rows
+                                 --   if saturation_cause set: route to diagnosis
+                                 --   (escalate:io_limited / escalate:inhibited:<class>,
+                                 --   write diagnostics row, suppress actuation) instead
+                                 --   of a futile move; else quantize → no-op(vs live
+                                 --   catalog) → sustained → rate-limit/budget; log rows
   if not advisory_only:
     -- service order (caps, §16): freeze-emergency relations first (uncapped),
     -- then non-freeze ordered by actuator-delta (grid levels) desc, FIFO on ties,
@@ -1177,10 +1372,11 @@ cycles apply *nothing*; that is the intended "Act Rarely" steady state.
 observable (`av_since_apply ≥ 1`) and checks the **overdue indicators**: did
 `vacuum_debt_ratio` settle and the realized dead fraction move toward the class
 target after the change? It logs the realized `f_trigger_ewma` as a diagnostic
-(noting its peak-hold bias) and feeds `maintenance_lag` and `io_limited` detection.
-It is the "Verify" step of the vision's control loop and the basis for
-explainability — but it does not feed a correction back into the feedforward move
-(§11.1); persistent failure to converge surfaces as `escalate:io_limited` (§11.3).
+(noting its peak-hold bias) and feeds `maintenance_lag`, effectiveness, and
+saturation detection. It is the "Verify" step of the vision's control loop and the
+basis for explainability — but it does not feed a correction back into the
+feedforward move (§11.1); persistent failure to converge surfaces as a saturation
+diagnosis — `escalate:io_limited` or `escalate:inhibited:<class>` (§11.3).
 
 ### 14.3 Advisory-only mode
 
@@ -1232,6 +1428,15 @@ SELECT
 FROM pgfc_observe.snapshots sn
 ORDER BY sn.snapshot_id DESC
 LIMIT 1;
+
+-- Maintenance inhibitors / saturation findings the operator should act on
+-- (Appendix C): unresolved diagnostics, newest first, with the actionable text.
+CREATE OR REPLACE VIEW pgfc_govern.active_diagnostics AS
+SELECT diagnostic_id, detected_at, severity, relid::regclass AS relation,
+       inhibitor_class, recommendation, evidence
+FROM pgfc_govern.diagnostics
+WHERE resolved_at IS NULL
+ORDER BY (severity = 'critical') DESC, detected_at DESC;
 ```
 
 Plus the observe-side `relation_health` and `maintenance_debt` (Section 6.2).
@@ -1281,6 +1486,14 @@ Hard constraints, enforced in `plan()`/`apply()` (never disabled, vision Safety)
   unless `policy.manage_user_owned = true`. Otherwise the decision is
   `suppressed:user_owned`. Governor-owned, inherited-default, and emergency-override
   states are tracked distinctly (Appendix B "Setting Ownership").
+
+- **Diagnose, don't escalate (Appendix C).** When `saturation_cause` is set (§11.3),
+  the governor stops spending actuator budget — `io_limited` and especially
+  `inhibited` mean more DDL cannot produce maintenance progress (its third cost,
+  opportunity cost, §1). It writes a `diagnostics` finding and suppresses actuation on
+  the affected relations instead of repeatedly increasing aggressiveness. This even
+  governs the freeze emergency path (§11.5): futile escalation under a pinned horizon
+  is replaced by a `critical` diagnostic.
 
 - **No conflicting actions.** One lever per *objective* per cycle (§11.4); vacuum and
   analyze levers may move together but are combined into one atomic `ALTER TABLE`
@@ -1378,24 +1591,28 @@ Sequenced so risk rises only after the prior layer is trustworthy.
 
 ### Phase 0 — `pgfc_observe` (read-only telemetry)
 
-- `snapshots` (incl. `pg_class` catalog-health header columns, §5.3/§6),
-  `relation_samples`, `effective_reloption()`, `observe()`, `relation_health`,
-  `maintenance_debt`, **and the retention job** (§18).
+- `snapshots` (incl. `pg_class` catalog-health **and xmin-horizon** header columns,
+  §5.3/§5.3a/§6), `relation_samples`, `effective_reloption()`,
+  `removability_horizons()`, `observe()`, `relation_health`, `maintenance_debt`,
+  **and the retention job** (§18).
 - pg_cron schedule for `observe()` at 1-min cadence + daily retention.
 - **Exit:** snapshots accumulate correctly on PG 15–18; debt views match
-  hand-computed values; `pg_class` health is captured; retention keeps the tables
+  hand-computed values; `pg_class` health and the data/catalog horizons are captured
+  (a held-open txn / slot moves `oldest_xmin_age`); retention keeps the tables
   bounded; zero writes outside `pgfc_observe`. Independently useful as a monitoring
   tool (this validates the two-extension split — Section 2).
 
 ### Phase 1 — `pgfc_govern` advisory (decide, never act)
 
-- All govern tables; `classify()`, `estimate()`, `observe_tick()`, `plan()`,
-  `verify()`, `control_tick()` — both loops on their cadences (§14, §18).
+- All govern tables (incl. `diagnostics`); `classify()`, `estimate()` (with
+  effectiveness + `saturation_cause`), `observe_tick()`, `plan()`, `verify()`,
+  `control_tick()` — both loops on their cadences (§14, §18).
 - `apply()` exists but is gated off by `advisory_only = true` (default).
-- `governor_status` view.
+- `governor_status`, `catalog_health`, `active_diagnostics` views.
 - **Exit:** decision_log shows sensible, stable proposals on real workloads; no
-  classification flapping; the multi-rate split runs cleanly; no `apply()` ever
-  fires.
+  classification flapping; the multi-rate split runs cleanly; **saturation is
+  correctly classified** (a held-open txn produces an `inhibited` diagnostic naming
+  the owner, not endless `adjust` proposals); no `apply()` ever fires.
 
 ### Phase 2 — Active vacuum/analyze control
 
@@ -1403,17 +1620,20 @@ Sequenced so risk rises only after the prior layer is trustworthy.
   `advisory_only = false`, with **quantized targets, batched DDL + 100ms locks**
   (§11, §12.2).
 - Full safety system: quantization + no-op suppression, sustained-deviation,
-  three-tier catalog budget, setting-ownership guard, regime guard, freeze override
-  (bypasses budgets, logged as `emergency_override`), failure recording,
+  three-tier catalog budget, setting-ownership guard, **saturation→diagnosis with
+  action suppression**, **inhibitor-aware freeze override** (§11.3, §11.5), freeze
+  override (bypasses budgets, logged as `emergency_override`), failure recording,
   ownership-checked `revert()`.
-- Surface `catalog_health` (§15); the bloat-driven *braking* loop is deferred to a
-  later Phase-2 increment (open-loop protections ship first).
+- Surface `catalog_health` and `active_diagnostics` (§15); the bloat-driven *braking*
+  loop is deferred to a later Phase-2 increment (open-loop protections ship first).
 - **Exit:** on a soak workload, controlled relations converge to their (quantized)
   target dead fractions without oscillation; **catalog mutation is rare** (most
   cycles apply nothing; no no-op DDL; values stay on-grid); user-owned settings are
-  untouched unless policy allows; I/O-limited tables are flagged
-  `escalate:io_limited`; failed applies are recorded and retried, never blocking;
-  every change is logged and ownership-checked-reversible; freeze debt never worsens.
+  untouched unless policy allows; saturated tables are **diagnosed, not escalated**
+  (`io_limited` flagged; inhibitor pins produce a `critical` finding naming the owner
+  and suppress actuation, including on the freeze path); failed applies are recorded
+  and retried, never blocking; every change is logged and ownership-checked-reversible;
+  freeze debt never worsens.
 
 ### Phase 3 — I/O budget, cost actuators & catalog braking
 
@@ -1438,7 +1658,10 @@ pgTAP, run via `./test.sh` on PG 15/16/17/18 (matches `CLAUDE.md`).
   reloptions captured verbatim; debt views match hand-computed thresholds; version
   guards (e.g. `total_autovacuum_time` NULL on <18, populated on 18); excludes
   catalog/own schemas; **retention** deletes snapshots past the window and cascades
-  to `relation_samples`.
+  to `relation_samples`; **`removability_horizons()`** — opening a transaction that
+  holds a snapshot moves `oldest_xmin_age` and attributes `owner='long_running_txn'`
+  with the right pid; a replication slot attributes `replication_slot`; no inhibitor
+  → owner `'none'`.
 
 - **`pgfc_govern/tests/`:** classification rules + hysteresis (no flap over N
   cycles); `estimate()` formulas on synthetic snapshot pairs (known deltas →
@@ -1450,11 +1673,9 @@ pgTAP, run via `./test.sh` on PG 15/16/17/18 (matches `CLAUDE.md`).
   `min_interval`, per-cycle suppresses the (N+1)th, per-day suppresses past
   `daily_mutation_budget` (`suppressed:rate_limited` / `suppressed:daily_budget`);
   **freeze emergency bypasses all three** and writes `emergency_override=true`,
-  `budget_consumed=false`; **regime guard** emits `escalate:io_limited` only after K
-  cycles of `vacuum_debt_ratio > 1` despite `autovacuum_count` incrementing (never
-  before one observed cycle); freeze override forces cleanest target; partitioned
-  parent never actuated; matview uses `ALTER MATERIALIZED VIEW`; advisory_only never
-  writes a reloption.
+  `budget_consumed=false`; freeze override forces cleanest target; partitioned parent
+  never actuated; matview uses `ALTER MATERIALIZED VIEW`; advisory_only never writes a
+  reloption. (Saturation/inhibitor diagnosis has its own bullet below.)
 
 - **No-op & ownership (`pgfc_govern/tests/`):** target == live value → no DDL,
   `decision='hold'`/`no_op`; target == global default with no explicit reloption →
@@ -1483,10 +1704,27 @@ pgTAP, run via `./test.sh` on PG 15/16/17/18 (matches `CLAUDE.md`).
   success criterion** — it is a biased peak-hold (§7.2); convergence is judged by the
   actuator reaching its grid target and the indicator staying healthy.
 
+- **Saturation classification (`pgfc_govern/tests/`, Appendix C):** the three-way
+  discriminator (§11.3) — (a) debt high with `autovacuum_count` *not* incrementing →
+  `config` (normal control, lowers threshold); (b) incrementing with `cleanup_per_run
+  > 0` but debt refilling → `io_limited`; (c) incrementing with effectiveness ≈ 0 and
+  a pinned `oldest_xmin` → `inhibited`. Effectiveness is judged over K cycles, never
+  one; no cause is declared before K observed cycles.
+
+- **Inhibitor diagnosis & freeze interaction (`pgfc_govern/tests/`):** with an
+  open held-snapshot transaction, a churning table that vacuums but does not clean
+  produces `escalate:inhibited:long_running_txn`, a `diagnostics` row naming the pid,
+  and **suppressed actuation** (no further DDL). Critically: a *freeze-stressed* table
+  under the same pin **holds at cleanest, does not escalate, and raises a `critical`
+  diagnostic** — and the §13 guard still blocks any aggressiveness *reduction*
+  (inhibitor-awareness must not become back-off). When the transaction ends and the
+  horizon advances, the diagnostic is marked `resolved_at`.
+
 - **Integration — falling-behind regime:** drive churn faster than autovacuum can
-  keep up (low `cost_limit` / heavy write load); assert the governor stops lowering
-  `sf` and instead emits `escalate:io_limited` rather than chasing an unreachable
-  target. This is the test the earlier "dead fraction ≈ sf" check would have missed.
+  keep up (low `cost_limit` / heavy write load, no inhibitor); assert the governor
+  stops lowering `sf` and emits `escalate:io_limited` — *not* `inhibited` (the horizon
+  is healthy). This is the test the earlier "dead fraction ≈ sf" check would have
+  missed, and it must distinguish `io_limited` from `inhibited`.
 
 - **Mid-vacuum guard:** simulate an in-progress vacuum (or assert the
   `pg_stat_progress_vacuum` precheck path) so `apply()` yields
@@ -1520,14 +1758,38 @@ pgTAP, run via `./test.sh` on PG 15/16/17/18 (matches `CLAUDE.md`).
   negative deltas; `estimate()` must detect counter regressions and skip the rate
   for that interval rather than emit garbage.
 
----
+- **Inhibitor Class 6 (lock/interruption) detection:** the MVP covers horizon-based
+  inhibitors (Classes 1/2/4/5) via `removability_horizons()`, and partial-progress
+  lock conflicts surface through `lock_wait_outcome`/`vacuum_busy`. Dedicated
+  detection of *repeated vacuum interruption* (distinct from horizon pinning) is
+  deferred — it needs progress-tracking across `pg_stat_progress_vacuum` runs.
+
+- **Recommendation actions stay advisory:** `diagnostics.recommendation` is
+  human-readable text ("terminate pid 4242", "drop/advance slot X"). The governor
+  never itself kills a backend or drops a slot — those are operator actions, out of
+  scope by design (the governor's actuator surface is autovacuum settings only).
+
+- **MultiXact inhibitor attribution unmodeled:** `removability_horizons()` (§6.1a)
+  models the xid data/catalog horizons only. A `mxid_freeze_debt` stall pinned by the
+  oldest *MultiXact* horizon would escalate without an owner to name. Narrower and
+  rarer than xid wraparound; attributing it is deferred.
+
+- **Self/background backends in the horizon scan:** `removability_horizons()` reads
+  `pg_stat_activity`, which includes the governor's own session and autovacuum
+  workers. Usually harmless (observe() is quick), but at scaffold time confirm
+  whether to filter the calling pid / non-client `backend_type` so the governor never
+  attributes a pin to itself.
 
 ## 22. Out of Scope (Phase I)
 
 Per the vision: the MVP does not control checkpointer, bgwriter, WAL settings,
 shared buffers, work_mem, or replication. It *may observe* WAL generation
-(`pg_stat_wal.wal_bytes`) and `pg_class` catalog health as context only. Cost-based
-autovacuum actuators are deferred to Phase 3 for the balancing reason in Section
-12.1. Catalog-bloat *braking* (closed loop) and Option-B targeted `VACUUM`/`ANALYZE`
-actuators (§12.4) are likewise out of the MVP — the MVP protects the catalog
-open-loop via quantization, no-op suppression, and the three-tier mutation budget.
+(`pg_stat_wal.wal_bytes`), `pg_class` catalog health, and the xmin removability
+horizons (§5.3a) as context only. Cost-based autovacuum actuators are deferred to
+Phase 3 for the balancing reason in Section 12.1. Catalog-bloat *braking* (closed
+loop) and Option-B targeted `VACUUM`/`ANALYZE` actuators (§12.4) are likewise out of
+the MVP — the MVP protects the catalog open-loop via quantization, no-op suppression,
+and the three-tier mutation budget. For maintenance inhibitors (Appendix C) the MVP
+**detects, diagnoses, and surfaces** (suppressing futile actuation) but never
+**remediates**: it will not terminate backends or drop replication slots — clearing
+an inhibitor is an operator action.
