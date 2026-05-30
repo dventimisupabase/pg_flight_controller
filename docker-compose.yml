@@ -1,0 +1,18 @@
+# Base test infrastructure. Merged at invocation time with each extension's
+# docker-compose.yml (see test.sh): the extension files add volume mounts whose
+# paths are resolved relative to THIS file's directory (the project root).
+services:
+  db:
+    build:
+      context: .
+      args:
+        PG_VERSION: ${PG_VERSION:-17}
+    environment:
+      POSTGRES_DB: pgfc_test
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_HOST_AUTH_METHOD: trust
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pgfc_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 40
