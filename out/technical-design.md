@@ -47,6 +47,20 @@ section:
   autovacuum more aggressive, but we must never configure a table such that
   anti-wraparound protection is delayed (Sections 12, 13).
 
+- **Actuator movement has cost, so it is a second controlled variable.** Each
+  actuator move is an `ALTER TABLE` — DDL that takes a table-level lock and can
+  fail, delay, or contend with maintenance. The governor therefore regulates *two*
+  things at once: (1) the maintenance state of each relation, and (2) the *frequency
+  of its own actuator activity*. The optimal controller is not the one that hits the
+  target fastest; it is the one that reaches convergence with the **minimum
+  necessary DDL**. This axis — drawn from Appendix A — has a happy synergy with the
+  feedforward design (§7.2, §11): because we set the scale factor to a computed
+  target and hold it behind a deadband, we do not re-issue DDL chasing noise. It
+  governs cadence (§14, §18), batching and locking (§12), and rate limits (§16).
+
+The operating doctrine, verbatim from Appendix A: **Observe frequently. Decide
+carefully. Act rarely. Never wait.**
+
 The autovacuum trigger formulas we are steering (PostgreSQL 15–18):
 
 ```text
@@ -134,19 +148,23 @@ cheaper option open.
                                     ▼
                 pgfc_govern (Decide + Act)
    ┌───────────────────────────────────────────────────┐
-   │ classify() → relation_class                        │
-   │ estimate() → relation_estimate (derived state)     │
-   │ plan()     → decision_log (proposed actions)       │
-   │ apply()    → action_history, ALTER TABLE SET(...)  │
-   │ verify()   → close the loop, mark outcomes         │
-   │ tick()     → orchestrates one full cycle           │
+   │ FAST LOOP  observe_tick()  (pg_cron, ~1 min)       │
+   │   classify() → relation_class                      │
+   │   estimate() → relation_estimate (derived state)   │
+   │                                                    │
+   │ CONTROL LOOP  control_tick()  (pg_cron, ~5 min)    │
+   │   plan()   → decision_log (proposed actions)       │
+   │   apply()  → action_history, batched ALTER TABLE   │
+   │             (≤1 change/relation/hour, 100ms lock)  │
+   │   verify() → close the loop, mark outcomes         │
    │ views: governor_status                             │
    └───────────────────────────────────────────────────┘
                                     ▲
-                                pg_cron (every 1–5 min)
+                      pg_cron: observe ~1 min · control ~5 min
 ```
 
-`tick()` is the only thing pg_cron calls. Everything else is a step it invokes.
+Two entry points, two cadences (§14, §18): `observe_tick()` runs fast and never
+acts; `control_tick()` runs slower and acts rarely. Observe frequently, act rarely.
 
 ---
 
@@ -364,8 +382,36 @@ FROM pgfc_observe.relation_samples rs
 JOIN pgfc_observe.snapshots sn USING (snapshot_id)
 ORDER BY rs.relid, sn.collected_at DESC;
 
+-- Effective-reloption helper: explicit per-table storage param if set, else NULL.
+-- pg_options_to_table(NULL) yields no rows, so NULL reloptions → NULL result.
+CREATE OR REPLACE FUNCTION pgfc_observe.effective_reloption(reloptions text[], opt text)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+    SELECT option_value
+    FROM pg_options_to_table(reloptions)
+    WHERE option_name = opt
+$$;
+
 -- Controlled variables (dead-tuple / mod fractions) plus overdue indicators.
+-- Effective threshold = explicit reloption (this relation) ?? snapshot global default.
 CREATE OR REPLACE VIEW pgfc_observe.maintenance_debt AS
+WITH latest AS (
+    SELECT DISTINCT ON (rs.relid) rs.*, sn.def_vac_threshold, sn.def_vac_scale_factor,
+           sn.def_ana_threshold, sn.def_ana_scale_factor, sn.def_freeze_max_age
+    FROM pgfc_observe.relation_samples rs
+    JOIN pgfc_observe.snapshots sn USING (snapshot_id)
+    ORDER BY rs.relid, sn.snapshot_id DESC
+), eff AS (
+    SELECT *,
+      COALESCE(pgfc_observe.effective_reloption(reloptions,'autovacuum_vacuum_threshold')::bigint,
+               def_vac_threshold)
+      + COALESCE(pgfc_observe.effective_reloption(reloptions,'autovacuum_vacuum_scale_factor')::float8,
+                 def_vac_scale_factor) * reltuples                          AS vacuum_threshold,
+      COALESCE(pgfc_observe.effective_reloption(reloptions,'autovacuum_analyze_threshold')::bigint,
+               def_ana_threshold)
+      + COALESCE(pgfc_observe.effective_reloption(reloptions,'autovacuum_analyze_scale_factor')::float8,
+                 def_ana_scale_factor) * reltuples                         AS analyze_threshold
+    FROM latest
+)
 SELECT relid, schemaname, relname,
        n_dead_tup, n_mod_since_analyze, reltuples,
        vacuum_threshold, analyze_threshold,
@@ -376,12 +422,13 @@ SELECT relid, schemaname, relname,
        (n_dead_tup::float8          / NULLIF(vacuum_threshold,0))  AS vacuum_debt_ratio,
        (n_mod_since_analyze::float8 / NULLIF(analyze_threshold,0)) AS analyze_debt_ratio,
        relfrozenxid_age::float8 / NULLIF(def_freeze_max_age,0)      AS freeze_debt
-FROM ( /* latest sample + effective-threshold computation; see helper below */ ) e;
+FROM eff;
 ```
 
-Effective thresholds are computed by a helper that prefers a relation's explicit
-reloption and otherwise uses the snapshot's global default. This logic lives in one
-place and is reused by the estimator (Section 9).
+The `effective_reloption()` helper is the single source of truth for "explicit
+per-table value or global default," reused by the estimator (Section 9). It must
+compile and return correct values against a live PG 15–18 instance before §6 is
+considered built — verify on first scaffold.
 
 ---
 
@@ -529,8 +576,12 @@ otherwise                                     → mixed
 ### 8.3 Hysteresis
 
 A relation's class changes only after the rule has selected a *different* class for
-N consecutive ticks (default N=3) — this prevents flapping. Manual overrides
-(`source = 'manual'`) are never auto-changed.
+N consecutive **observation cycles** (`classify()` runs in the 1-min fast loop, §14,
+so N=3 ≈ 3 min) — this prevents flapping. Manual overrides (`source = 'manual'`) are
+never auto-changed. Note the deliberate cadence asymmetry: reclassification settles
+in minutes, but the actuator changes it implies are still gated by the control
+loop's sustained-deviation and rate limits (§11.2), so a class flicker cannot
+produce a DDL flurry.
 
 ```sql
 CREATE TYPE pgfc_govern.relation_kind AS ENUM
@@ -554,6 +605,10 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.policy (
     io_budget_fraction double precision,                       -- reserved (Phase 3)
     freeze_posture     text NOT NULL DEFAULT 'standard'        -- standard|conservative
                        CHECK (freeze_posture IN ('standard','conservative')),
+    -- actuator-economy knobs (Appendix A, §11.2/§16)
+    min_interval       interval NOT NULL DEFAULT '1 hour',     -- per-relation rate limit
+    global_max_changes_per_cycle integer NOT NULL DEFAULT 50,  -- cluster cap / control cycle
+    n_sustain          integer NOT NULL DEFAULT 3,             -- sustained-deviation cycles
     enabled            boolean NOT NULL DEFAULT true,
     advisory_only      boolean NOT NULL DEFAULT true            -- dry-run gate
 );
@@ -624,19 +679,30 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.decision_log (
     created_at     timestamptz NOT NULL DEFAULT now()
 );
 
--- ── Audit: only the changes we actually made (revert source of truth) ────────
+-- ── Audit: attempted changes (revert source of truth, success AND failure) ───
+-- One row per actuator. Actuators changed together in one ALTER TABLE share a
+-- batch_id (and one applied_at) — see batching, §12.2. A row is written even when
+-- the apply FAILS (status='failed'), capturing desired/attempted/reason/timestamp
+-- per Appendix A "Actuator Failure Handling".
 CREATE TABLE IF NOT EXISTS pgfc_govern.action_history (
     action_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    batch_id       bigint NOT NULL,  -- groups actuators applied in one DDL
     decision_id    bigint REFERENCES pgfc_govern.decision_log(decision_id),
     relid          oid NOT NULL,
     actuator       text NOT NULL,
     old_value      text,             -- effective value before
-    new_value      text NOT NULL,
-    revert_kind    text NOT NULL CHECK (revert_kind IN ('SET','RESET')),
+    new_value      text NOT NULL,    -- desired value (attempted, even if it failed)
+    revert_kind    text CHECK (revert_kind IN ('SET','RESET')),  -- NULL when status='failed'
     revert_value   text,             -- value to SET if revert_kind='SET'
+    status         text NOT NULL DEFAULT 'applied'
+                   CHECK (status IN ('applied','failed')),
+    failure_reason text,             -- e.g. 'lock_timeout','insufficient_privilege',
+                                     -- 'conflicting_maintenance','safety_restriction'
     applied_at     timestamptz NOT NULL DEFAULT now(),
     reverted_at    timestamptz
 );
+COMMENT ON TABLE pgfc_govern.action_history IS
+  'Every actuator attempt (applied or failed). revert() replays only status=applied.';
 
 -- ── Per-tick orchestration log ───────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS pgfc_govern.tick_log (
@@ -692,9 +758,11 @@ factor. This is Principle 2 (Policy over Parameters) made concrete: policy selec
 
 ## 11. Control Law
 
-For each relation and each controlled actuator, once per tick. The triad below
-**is** the anti-oscillation mechanism (Principle 4) and is stated explicitly because
-of the actuation dead-time established in Section 1.
+Evaluated once per **planning cycle** (§14, §18 — slower than observation), per
+relation, per controlled objective. The gates below **are** the anti-oscillation
+mechanism (Principle 4) *and* the enforcement of the second control objective —
+minimum actuator activity (§1, Appendix A) — stated explicitly because of the
+actuation dead-time established in Section 1.
 
 ### 11.1 The keeping-up move is feedforward
 
@@ -713,21 +781,36 @@ a logged diagnostic, and a biased one. Feedback enters only through the regime g
 (§11.3). The analyze loop is identical:
 `ana_sf_target = clamp(mod_target - ana_base/reltuples, …)`.
 
-### 11.2 The triad (anti-oscillation — all inputs observable)
+### 11.2 The gates (anti-oscillation + minimum actuator activity — all inputs observable)
+
+Four gates, each suppressing a different cause of needless DDL. A proposal must clear
+all four to become an applied change.
 
 1. **Deadband on the actuator, not the measurement.** If
    `|sf_target − old_sf| ≤ tol_sf` (default `tol_sf = 0.01`), decision = `hold`.
    Because `sf_target` is computed from `r`, `base`, and `reltuples`, this gate is
    fully observable and free of the peak-hold sampling bias a `|y − r|` deadband
    would carry (§7.2). It fires a change only when policy or table size actually
-   moved the target.
+   moved the target — this is the gate that makes the feedforward move *Act Rarely*:
+   the discarded debt-ratio model would have re-issued DDL every cycle chasing the
+   sawtooth; feedforward + deadband sets a value once and holds it.
 
-2. **Rate limit.** At most one change per (relation, actuator) per `min_interval`
-   (default 1h; §16). Bounds how fast a slowly-drifting `reltuples` re-estimate can
-   walk the setting, and prevents thrash. A second proposal inside the window is
-   `suppressed:rate_limited`.
+2. **Sustained deviation (hysteresis vs transients).** Even past the deadband, the
+   target must stay on the same side for `N_sustain` consecutive planning cycles
+   (default 3) before acting — so a momentary `reltuples` re-estimate or a load
+   spike does not trigger DDL. Direction must be **monotonic**: a proposal that
+   reverses the last applied direction is held unless it also clears a wider band,
+   killing the `0.02→0.03→0.02` flap of Appendix A. Distinct from the rate limit:
+   this bounds acting on a *transient*; the rate limit bounds *frequency*.
 
-3. **Clamp + max step.** Step toward the target, bounding per-tick step and absolute
+3. **Rate limit (per-relation and global).** At most one change per relation per
+   `min_interval` (default 1h), and at most `global_max_changes_per_cycle` across the
+   whole cluster per planning cycle (§16). A proposal exceeding either is
+   `suppressed:rate_limited`. The global cap is the thundering-herd guard: a workload
+   shift can make hundreds of tables want a change at once; the per-relation limit
+   would permit them all in one cycle, the global cap will not.
+
+4. **Clamp + max step.** Step toward the target, bounding per-cycle step and absolute
    range:
 
    ```text
@@ -737,7 +820,7 @@ a logged diagnostic, and a biased one. Feedback enters only through the regime g
    ```
 
    Step-limiting is belt-and-suspenders for the feedforward move: a large `reltuples`
-   re-estimate cannot yank the setting in one tick.
+   re-estimate cannot yank the setting in one cycle.
 
 ### 11.3 Regime guard — the only real feedback path
 
@@ -774,8 +857,17 @@ trade dominance with table size, and that directly picks the lever: when
 `sf·reltuples ≫ base` (large table) the scale factor controls the fraction, so move
 `sf` per §11.2; when `base ≳ sf·reltuples` (small table) the threshold controls it,
 so move the threshold toward `base_target = r·reltuples` instead, with the same
-deadband/rate-limit/step discipline. Exactly one lever is moved per relation per
-tick, to keep each `action_history` row an attributable cause.
+gate discipline.
+
+**One lever per objective; batch across objectives.** Within the *vacuum* objective
+we move `sf` **or** threshold, never both — they are substitutes for the same dead
+fraction, and moving both would confound attribution. The same holds within the
+*analyze* objective. But vacuum and analyze are *independent* objectives (they target
+`n_dead_tup`/`autovacuum_count` vs `n_mod_since_analyze`/`autoanalyze_count`), so when
+both want to move in the same cycle their changes are **batched into a single
+`ALTER TABLE`** (§12.2) — one lock, ≤2 parameters. `verify()` still attributes each
+separately because their effects are independently observable. Attribution is not
+traded for the lock saving.
 
 ### 11.5 Safety override
 
@@ -816,43 +908,64 @@ an independent, unbalanced I/O allowance. I/O-budget control needs a coherent
 cluster-wide model (Phase 3), not a per-table poke. Until then `io_budget_fraction`
 is reserved and unused.
 
-### 12.2 `apply()` — mechanics that must be correct
+### 12.2 `apply()` — batched, non-blocking, failure-recording
+
+`apply()` takes **all** approved actuator changes for one relation in a planning
+cycle (≤2: at most one vacuum lever + one analyze lever, §11.4) and applies them in a
+**single `ALTER TABLE`** — one lock acquisition per relation, never one per
+parameter (Appendix A, Batching).
 
 ```sql
--- Pseudocode; runs one approved decision.
--- Pre-checks:
---   * policy.advisory_only = false           (else: record, do not apply)
---   * rate limit not exceeded (Section 18)
---   * no autovacuum currently in progress on relid (pg_stat_progress_vacuum)
--- because ALTER TABLE ... SET (...) takes SHARE UPDATE EXCLUSIVE, which
--- CONFLICTS with an in-progress (auto)vacuum: apply would block, and must not
--- run mid-vacuum. If a vacuum is in progress, decision = suppressed:vacuum_busy.
+-- Pseudocode; runs one relation's batch of approved decisions.
+-- Pre-checks (skip the whole batch if any fail; record per §12.4):
+--   * policy.advisory_only = false             (else: log decision, do not apply)
+--   * per-relation AND global rate limits OK    (§16; freeze emergency bypasses both)
+--   * no autovacuum in progress on relid (pg_stat_progress_vacuum)
+-- The pre-check and the lock_timeout are COMPLEMENTARY, not redundant: the
+-- pg_stat_progress_vacuum check avoids even attempting against a known-busy table;
+-- the lock_timeout bounds the attempt for the vacuum that starts in the race window
+-- between the check and the DDL. ALTER ... SET (...) takes SHARE UPDATE EXCLUSIVE,
+-- which conflicts with an in-progress (auto)vacuum.
 
--- relkind dictates the DDL and whether the relation is actuable at all:
---   'r' ordinary table     → ALTER TABLE ... SET (...)
---   'm' materialized view  → ALTER MATERIALIZED VIEW ... SET (...)
---   'p' partitioned parent → NOT actuable. Storage params on the parent do not
---       drive autovacuum (it runs per-leaf). plan() targets the leaf partitions
---       ('r') instead; the parent is observed but never actuated.
-EXECUTE format(
-  'ALTER %s %s SET (%I = %s)',
-  CASE relkind WHEN 'm' THEN 'MATERIALIZED VIEW' ELSE 'TABLE' END,
-  relid::regclass, actuator, new_value);
+SET LOCAL lock_timeout = '100ms';        -- "Never wait" (Appendix A): fail fast.
+
+BEGIN
+    -- relkind dictates DDL and actuability:
+    --   'r' ordinary table    → ALTER TABLE
+    --   'm' materialized view → ALTER MATERIALIZED VIEW
+    --   'p' partitioned parent→ NOT actuable (params on parent don't drive
+    --       per-leaf autovacuum); plan() targets the leaves ('r') instead.
+    EXECUTE format(
+      'ALTER %s %s SET (%s)',                 -- batched: e.g.
+      CASE relkind WHEN 'm' THEN 'MATERIALIZED VIEW' ELSE 'TABLE' END,
+      relid::regclass,
+      string_agg(format('%I = %s', actuator, new_value), ', '));  -- all levers, one DDL
+    -- success: one action_history row per actuator, shared batch_id, status='applied'
+EXCEPTION
+    WHEN lock_not_available THEN
+        -- abandon, record, retry next cycle. NOT a system failure (Appendix A).
+        -- one action_history row per intended actuator, status='failed',
+        -- failure_reason='lock_timeout', new_value=desired. No partial apply:
+        -- the whole ALTER TABLE is atomic, so the batch is all-or-nothing.
+    WHEN insufficient_privilege THEN  -- failure_reason='insufficient_privilege'
+    WHEN OTHERS THEN                  -- failure_reason=SQLSTATE/message
+END;
 ```
 
-Operational notes baked into the implementation:
+Operational notes:
+
+- **Atomic batch.** A single `ALTER TABLE` either sets all listed params or none, so
+  there is no partial-apply state to reconcile — the batch shares one `batch_id` and
+  one `applied_at`, and on failure every intended actuator gets a `status='failed'`
+  row.
 
 - **Actuated set = relkind `'r'` and `'m'` only.** Partitioned parents (`'p'`) are
   excluded from actuation in `plan()` (still observed); their leaves are governed
-  individually. This is the apply-side resolution of the partitioning open question
-  (§21).
+  individually — the apply-side resolution of the partitioning open question (§21).
 
-- Run `apply()` with a short `lock_timeout` (e.g. `SET LOCAL lock_timeout = '2s'`)
-  so a contended `ALTER TABLE` fails fast and is retried next tick rather than
-  blocking the governor.
-
-- One actuator change per relation per tick (Section 11.4) keeps the
-  `action_history` row a clean cause for the next observed effect.
+- **Never block.** With `lock_timeout = 100ms` a contended `ALTER TABLE` fails fast,
+  is recorded, and is retried in a future cycle. The governor never joins a lock
+  queue (Appendix A: "never become a contributor to lock queues").
 
 ### 12.3 Rollback baseline capture (the correctness trap)
 
@@ -867,9 +980,27 @@ Reverting is **not** "set it back to the number it had." It is:
   which would freeze a now-stale default into the table.
 
 `baseline_explicit` / `baseline_value` are captured from `pg_class.reloptions` in
-`actuator_state` the first time the governor touches each (relation, actuator), and
-never overwritten afterward. This makes "every action reversible" (vision Safety
-System) actually true.
+`actuator_state` **the first time the governor _successfully_ changes** each
+(relation, actuator), and never overwritten afterward. A failed `ALTER TABLE`
+touched nothing, so it must not record a baseline (and its `action_history` row has
+`revert_kind = NULL`). This makes "every action reversible" (vision Safety System)
+actually true.
+
+`revert()` replays `action_history` rows with `status='applied'` only (failed
+attempts changed nothing, so there is nothing to undo). Reverting a relation batches
+its actuators back into one `ALTER TABLE` mixing `SET` and `RESET` per actuator —
+one lock, consistent with §12.2.
+
+### 12.4 Actuator cost model (future, Phase 3)
+
+The MVP treats every actuator move as having the same (high) cost and minimizes
+moves via §11.2. A later phase may model cost explicitly — lock-acquisition risk, DDL
+frequency, operational disruption, rollback complexity — and let `plan()` choose
+between **(A)** changing storage parameters and **(B)** issuing one targeted
+`VACUUM`/`ANALYZE` when that is cheaper for the expected benefit (Appendix A,
+Actuator Cost Model). Option B is a different actuator class (an imperative command,
+not a setpoint move) and is explicitly out of MVP scope; the two-objective framing
+(§1) is what makes it expressible later.
 
 ---
 
@@ -880,7 +1011,7 @@ Phase 2+. But anti-wraparound dominates everything (Principle 3), so the MVP mus
 **observe and respond to freeze debt now** — using the actuators it already has.
 
 - **Observe:** `freeze_debt = age(relfrozenxid)/autovacuum_freeze_max_age` and the
-  MultiXact analogue are computed every tick (Section 7.2).
+  MultiXact analogue are computed every observation cycle (Section 7.2).
 
 - **Respond:** when `freeze_debt` crosses `freeze_action_threshold` (default 0.6),
   the safety override (Section 11.5) drives the relation's vacuum target to its
@@ -899,34 +1030,65 @@ wraparound.
 
 ---
 
-## 14. Control-Loop Functions
+## 14. Control-Loop Functions (multi-rate)
+
+Appendix A mandates that observation run much faster than actuation. The loop is
+therefore split into **two entry points on two cadences**, not one `tick()`:
 
 ```sql
--- pgfc_govern.classify(snapshot_id) -> int   (relations (re)classified)
--- pgfc_govern.estimate(snapshot_id) -> int   (estimates written)
--- pgfc_govern.plan(tick_id, snapshot_id) -> int   (decisions logged)
--- pgfc_govern.apply(decision_id) -> bool     (one approved change)
--- pgfc_govern.verify(tick_id) -> int         (close loop on prior actions)
--- pgfc_govern.tick() -> bigint               (orchestrator; returns tick_id)
+-- Fast loop (observe + orient) — every ~1 min:
+-- pgfc_observe.observe()        -> bigint  (fresh snapshot)
+-- pgfc_govern.classify(snap)    -> int     (relations (re)classified, hysteresis)
+-- pgfc_govern.estimate(snap)    -> int     (derived state written)
+-- pgfc_govern.observe_tick()    -> bigint  (orchestrates the above; returns snap)
+
+-- Control loop (decide + act + verify) — every ~5 min:
+-- pgfc_govern.plan(cycle)       -> int     (decisions logged, reads latest estimate)
+-- pgfc_govern.apply(cycle,relid)-> int     (one relation's batched change)
+-- pgfc_govern.verify(cycle)     -> int     (attribute outcomes of PAST actions)
+-- pgfc_govern.control_tick()    -> bigint  (orchestrates the above; returns cycle)
 ```
 
-### 14.1 `tick()` orchestration
+### 14.1 Fast loop: `observe_tick()` (every ~1 min)
 
 ```text
-tick():
-  s   := pgfc_observe.observe()           -- fresh snapshot
-  t   := open tick_log row (snapshot_id = s)
-  classify(s)                              -- update relation_class (+ hysteresis)
-  estimate(s)                              -- write relation_estimate
-  n   := plan(t, s)                        -- write decision_log rows
-  for each decision where decision='adjust' and policy.advisory_only=false:
-        apply(decision_id)                 -- guarded; updates action_history
-  verify(t)                                -- attribute outcomes of PAST actions
-  close tick_log row (counts, finished_at)
-  return t
+observe_tick():
+  s := pgfc_observe.observe()    -- fresh snapshot
+  classify(s)                    -- update relation_class (+ hysteresis, §8.3)
+  estimate(s)                    -- write relation_estimate (EWMA, f_peak, indicators)
+  return s
 ```
 
-`verify()` looks at actions applied in earlier ticks whose effect should now be
+Cheap and read-only-to-the-database (writes only pgfc tables). Running it often
+keeps rate estimates and `f_peak` peak-holds sharp, and — crucially — **observing
+often does not mean acting often**: this loop never calls `apply()`.
+
+### 14.2 Control loop: `control_tick()` (every ~5 min)
+
+```text
+control_tick():
+  c := open tick_log row
+  n := plan(c)                   -- evaluate control law (§11) against latest estimate;
+                                 --   write decision_log rows; enforce all four gates
+                                 --   incl. the GLOBAL per-cycle change cap
+  if not advisory_only:
+    -- service order (global cap, §16): freeze-emergency relations first (uncapped),
+    -- then non-freeze ordered by |sf_target - old_sf| desc, FIFO on ties, up to
+    -- global_max_changes_per_cycle. Unserved relations are NOT dropped — their
+    -- decision rows persist and they compete again next cycle (no starvation).
+    for each relation in service order:
+        apply(c, relid)          -- ONE batched ALTER TABLE per relation (§12.2)
+  verify(c)                      -- attribute outcomes of PAST actions
+  close tick_log row (counts, finished_at)
+  return c
+```
+
+`plan()` reads the most recent `relation_estimate` (produced by the fast loop) — it
+does not collect its own snapshot, so decision and observation cadences are
+genuinely decoupled. The per-relation rate limit (≤1 change/hour) means most control
+cycles apply *nothing*; that is the intended "Act Rarely" steady state.
+
+`verify()` looks at actions applied in earlier cycles whose effect should now be
 observable (`av_since_apply ≥ 1`) and checks the **overdue indicators**: did
 `vacuum_debt_ratio` settle and the realized dead fraction move toward the class
 target after the change? It logs the realized `f_trigger_ewma` as a diagnostic
@@ -935,11 +1097,11 @@ It is the "Verify" step of the vision's control loop and the basis for
 explainability — but it does not feed a correction back into the feedforward move
 (§11.1); persistent failure to converge surfaces as `escalate:io_limited` (§11.3).
 
-### 14.2 Advisory-only mode
+### 14.3 Advisory-only mode
 
-`policy.advisory_only = true` (the default) runs the entire loop *including*
-`plan()`, writing full `decision_log` entries, but **never calls `apply()`**. This
-is the safe default and the recommended Phase-1 operating mode: the governor
+`policy.advisory_only = true` (the default) runs both loops in full *including*
+`plan()`, writing complete `decision_log` entries, but **never calls `apply()`**.
+This is the safe default and the recommended Phase-1 operating mode: the governor
 produces an auditable stream of "what I would do" with zero mutation. Flipping to
 active control is a single policy change.
 
@@ -983,34 +1145,48 @@ Hard constraints, enforced in `plan()`/`apply()` (never disabled, vision Safety)
 - **Never exceed freeze safety.** Section 13 guard; no change may reduce cleanup
   aggressiveness on a freeze-stressed relation.
 
-- **No rapid repeated adjustments.** Rate limit: **max 1 change per (relation,
-  actuator) per `min_interval`** (default 1h; Section 11.2), plus the actuator-side
-  deadband and per-tick max-step. Enforced by checking
-  `actuator_state.set_at_snapshot`.
+- **No rapid repeated adjustments — two-level rate limit.** Per-relation: **max 1
+  change per relation per `min_interval`** (default 1h), checked against
+  `actuator_state.set_at_snapshot`. Cluster-wide: **max
+  `global_max_changes_per_cycle`** applied per control cycle (thundering-herd guard
+  when a workload shift makes many tables want changes at once). When more relations
+  want a change than the cap allows, service order is **freeze-emergency first
+  (uncapped), then non-freeze by largest actuator delta `|sf_target − old_sf|`, FIFO
+  on ties**; unserved relations keep their decision rows and compete again next
+  cycle, so none starves. Both limits are *in addition to* the actuator deadband,
+  sustained-deviation, and max-step gates (§11.2). **The freeze emergency exception
+  (§13) bypasses both rate limits** — and only that exception does.
 
-- **No conflicting actions.** One actuator per relation per tick (Section 11.4); the
-  size heuristic ensures threshold and scale are never moved in the same tick.
+- **No conflicting actions.** One lever per *objective* per cycle (§11.4); vacuum and
+  analyze levers may move together but are combined into one atomic `ALTER TABLE`
+  (§12.2) — no two levers for the *same* objective ever move together.
+
+- **Actuator failure is not system failure.** A failed apply (lock timeout,
+  privilege, conflict) is recorded in `action_history` with `status='failed'` and a
+  `failure_reason`, then retried in a future cycle (Appendix A). It never aborts the
+  cycle or leaves a partial change (the batch DDL is atomic, §12.2).
 
 - **Everything reversible.** Section 12.3; `action_history` carries `revert_kind` /
-  `revert_value` for every change. A `pgfc_govern.revert(action_id)` /
-  `revert_all()` function replays them.
+  `revert_value` for every applied change. `pgfc_govern.revert(action_id)` /
+  `revert_all()` replay only `status='applied'` rows.
 
-- **Fail safe.** `tick()` wraps work so that any error closes the tick_log row with
-  `error` set and leaves settings untouched; a crashed tick never half-applies.
+- **Fail safe.** `control_tick()` wraps work so any error closes the tick_log row
+  with `error` set and leaves settings untouched; a crashed cycle never
+  half-applies.
 
 ---
 
 ## 17. Decision Logging & Auditability
 
-Every tick writes, per relation considered, a `decision_log` row capturing the six
-elements the vision requires: **observation, previous state, desired state,
+Every control cycle writes, per relation considered, a `decision_log` row capturing
+the six elements the vision requires: **observation, previous state, desired state,
 decision, action, outcome.** Mapping:
 
 - observation → `observation` jsonb (raw values used)
 - previous/derived state → `prev_state` jsonb
 - desired state → `desired_state` jsonb (target setpoint)
-- decision → `decision` + `proposed_value`
-- action → `action_history` (if applied)
+- decision → `decision` + `proposed_value` (incl. `suppressed:*`, `escalate:io_limited`)
+- action → `action_history` (applied *or* failed, with `status`/`failure_reason`)
 - outcome → filled later by `verify()` (linked via `decision_id`)
 
 Because advisory-only mode still writes the full chain, the audit trail is complete
@@ -1019,24 +1195,43 @@ have done" before granting actuation.
 
 ---
 
-## 18. Scheduling
+## 18. Scheduling (multi-rate)
 
-`pg_cron` calls `pgfc_govern.tick()` on a fixed cadence:
+`pg_cron` drives the two loops on **separate cadences** (Appendix A: "observation
+cadence significantly faster than actuation cadence"):
 
 ```sql
-SELECT cron.schedule('pgfc_tick', '*/2 * * * *', $$SELECT pgfc_govern.tick()$$);
+-- Fast loop: observe + estimate, every 1 minute
+SELECT cron.schedule('pgfc_observe', '* * * * *',
+                     $$SELECT pgfc_govern.observe_tick()$$);
+
+-- Control loop: plan + apply + verify, every 5 minutes
+SELECT cron.schedule('pgfc_control', '*/5 * * * *',
+                     $$SELECT pgfc_govern.control_tick()$$);
 ```
 
-- Recommended cadence: **2 minutes** (within the vision's 1–5 min). Observation is
-  cheap; the per-actuator rate limit and deadband mean a fast tick does *not* mean
-  fast actuation — a setting changes at most once per `min_interval` and only when
-  its target actually moved.
+The cadence ladder (matches Appendix A):
 
-- `tick()` must be cheap and non-overlapping. Take a session advisory lock at the
-  top of `tick()` so a long run never overlaps the next cron firing.
+| Stage | Cadence | Acts? |
+|---|---|---|
+| Observation, estimation, classification | 1 min | no |
+| Planning (decisions logged) | 5 min | no |
+| Actuation (`apply()`) | ≤ 1 per relation per hour | rarely |
 
-- `observe()` may be scheduled more frequently than the full `tick()` later, to get
-  finer rate estimates without more actuation. Not needed for MVP.
+- **Decoupled by design.** `control_tick()` reads the latest `relation_estimate`
+  rather than collecting its own snapshot, so observing 60×/hour while acting ≤1×/hour
+  per relation is the normal state — exactly "Observe frequently, Act rarely."
+
+- **Non-overlapping.** Each loop takes a session advisory lock at entry so a slow run
+  never overlaps the next cron firing; a missed control cycle is harmless (the next
+  one re-reads current state).
+
+- **Snapshot retention (consequence of 1-min cadence).** Observation now writes
+  `relations × 1440/day` sample rows. Phase 0 must ship a retention job — e.g. a
+  daily `pg_cron` task that deletes `pgfc_observe.snapshots` older than a configurable
+  window (default 14 days; cascades to `relation_samples`), optionally downsampling
+  older data — so the observe tables stay bounded. Do not let the mandated cadence
+  silently grow an unbounded table.
 
 ---
 
@@ -1047,30 +1242,35 @@ Sequenced so risk rises only after the prior layer is trustworthy.
 ### Phase 0 — `pgfc_observe` (read-only telemetry)
 
 - `snapshots`, `relation_samples`, `observe()`, `relation_health`,
-  `maintenance_debt`.
-- pg_cron schedule for `observe()` alone.
+  `maintenance_debt`, **and the retention job** (§18).
+- pg_cron schedule for `observe()` at 1-min cadence + daily retention.
 - **Exit:** snapshots accumulate correctly on PG 15–18; debt views match
-  hand-computed values; zero writes outside `pgfc_observe`. Independently useful as
-  a monitoring tool (this validates the two-extension split — Section 2).
+  hand-computed values; retention keeps the tables bounded; zero writes outside
+  `pgfc_observe`. Independently useful as a monitoring tool (this validates the
+  two-extension split — Section 2).
 
 ### Phase 1 — `pgfc_govern` advisory (decide, never act)
 
-- All govern tables; `classify()`, `estimate()`, `plan()`, `verify()`, `tick()`.
+- All govern tables; `classify()`, `estimate()`, `observe_tick()`, `plan()`,
+  `verify()`, `control_tick()` — both loops on their cadences (§14, §18).
 - `apply()` exists but is gated off by `advisory_only = true` (default).
 - `governor_status` view.
 - **Exit:** decision_log shows sensible, stable proposals on real workloads; no
-  classification flapping; no `apply()` ever fires.
+  classification flapping; the multi-rate split runs cleanly; no `apply()` ever
+  fires.
 
 ### Phase 2 — Active vacuum/analyze control
 
 - Enable `apply()` for the four threshold/scale actuators behind
-  `advisory_only = false`.
-- Full safety system: rate limit, actuator deadband, regime guard, freeze override,
+  `advisory_only = false`, with **batched DDL + 100ms locks** (§12.2).
+- Full safety system: two-level rate limit, actuator deadband, sustained-deviation,
+  regime guard, freeze override (bypasses rate limits), failure recording,
   reversibility, `revert()`.
 - **Exit:** on a soak workload, controlled relations converge to their target dead
-  fractions without oscillation; I/O-limited tables are flagged `escalate:io_limited`
-  rather than chased; every change is logged and reversible; freeze debt never
-  worsens under control.
+  fractions without oscillation; **actuator activity is rare** (most cycles apply
+  nothing); I/O-limited tables are flagged `escalate:io_limited` rather than chased;
+  failed applies are recorded and retried, never blocking; every change is logged
+  and reversible; freeze debt never worsens under control.
 
 ### Phase 3 — I/O budget & cost actuators
 
@@ -1092,27 +1292,38 @@ pgTAP, run via `./test.sh` on PG 15/16/17/18 (matches `CLAUDE.md`).
 - **`pgfc_observe/tests/`:** `observe()` populates one snapshot + N samples;
   reloptions captured verbatim; debt views match hand-computed thresholds; version
   guards (e.g. `total_autovacuum_time` NULL on <18, populated on 18); excludes
-  catalog/own schemas.
+  catalog/own schemas; **retention** deletes snapshots past the window and cascades
+  to `relation_samples`.
 
 - **`pgfc_govern/tests/`:** classification rules + hysteresis (no flap over N
-  ticks); `estimate()` formulas on synthetic snapshot pairs (known deltas →
+  cycles); `estimate()` formulas on synthetic snapshot pairs (known deltas →
   expected EWMA); **feedforward move** — `sf_target = clamp(r − base/reltuples, …)`
   computed correctly for large vs small tables; deadband holds when
-  `|sf_target − old_sf| ≤ tol_sf`; max-step + range clamp; rate limit suppresses a
-  second change inside `min_interval` (`suppressed:rate_limited`); **regime guard**
-  emits `escalate:io_limited` only after K cycles of `vacuum_debt_ratio > 1` despite
+  `|sf_target − old_sf| ≤ tol_sf`; **sustained-deviation** holds a change until the
+  target stays past the band for `n_sustain` cycles, and a direction reversal is
+  suppressed (no `0.02→0.03→0.02` flap); max-step + range clamp; **per-relation rate
+  limit** suppresses a second change inside `min_interval` and **global cap**
+  suppresses the (N+1)th change in one cycle (both `suppressed:rate_limited`);
+  **freeze emergency bypasses both rate limits**; **regime guard** emits
+  `escalate:io_limited` only after K cycles of `vacuum_debt_ratio > 1` despite
   `autovacuum_count` incrementing (and never before one observed cycle); rollback
   baseline (explicit→SET, inherited→RESET); freeze override forces cleanest target;
   partitioned parent never actuated; matview uses `ALTER MATERIALIZED VIEW`;
   advisory_only never writes a reloption.
 
-- **Integration — keeping-up regime:** seed a table, run several `tick()`s with
-  `advisory_only=false`, assert the scale factor reaches `sf_target` in step-limited
-  moves and then *holds* (deadband), and that the overdue indicator
-  `vacuum_debt_ratio` stays bounded (no runaway). The realized dead fraction is
-  logged for inspection but **not asserted as the success criterion** — it is a
-  biased peak-hold (§7.2); convergence is judged by the actuator reaching target and
-  the indicator staying healthy.
+- **Batching & failure (`pgfc_govern/tests/`):** when both vacuum and analyze levers
+  move in one cycle, exactly **one** `ALTER TABLE` is issued with both params (assert
+  one `batch_id`, shared `applied_at`); a simulated lock contention yields
+  `status='failed'`, `failure_reason='lock_timeout'`, **no reloption changed**, and a
+  retry on the next cycle; `revert()` ignores `status='failed'` rows.
+
+- **Integration — keeping-up regime:** seed a table, run several `control_tick()`s
+  with `advisory_only=false`, assert the scale factor reaches `sf_target` in
+  step-limited moves and then *holds* (deadband), that most cycles apply nothing
+  (Act Rarely), and that the overdue indicator `vacuum_debt_ratio` stays bounded (no
+  runaway). The realized dead fraction is logged for inspection but **not asserted as
+  the success criterion** — it is a biased peak-hold (§7.2); convergence is judged by
+  the actuator reaching target and the indicator staying healthy.
 
 - **Integration — falling-behind regime:** drive churn faster than autovacuum can
   keep up (low `cost_limit` / heavy write load); assert the governor stops lowering
@@ -1127,10 +1338,10 @@ pgTAP, run via `./test.sh` on PG 15/16/17/18 (matches `CLAUDE.md`).
 
 ## 21. Open Questions
 
-- **Effective-threshold helper placement:** observe-side (so `maintenance_debt`
-  shows it) vs govern-side (so it tracks policy). Current plan: a stable SQL helper
-  in `pgfc_observe` returning effective thresholds; govern reuses it. Revisit if it
-  forces non-additive observe changes.
+- **Effective-threshold helper:** *resolved* — `pgfc_observe.effective_reloption()`
+  + the `maintenance_debt` CTE (§6.2) compute it observe-side; govern reuses the
+  function. (Left here only as a pointer; it is a Phase 0 deliverable, not an open
+  question.) Revisit only if it ever forces a non-additive observe change.
 
 - **Gain (`Kp`) and time constant (`τ`) defaults:** start at `Kp=0.5` (the
   near-unity loop gain tolerates it), `τ=1h`; Phase 2 soak data should tune them.
