@@ -30,7 +30,7 @@ section:
   many ticks later. The control law must tolerate this delay or it will oscillate
   (Section 11).
 
-- **The thing we regulate is the dead-tuple _fraction at trigger_ — not the raw
+- **The thing we regulate is the dead-tuple *fraction at trigger* — not the raw
   count, and deliberately not a "debt ratio."** Autovacuum fires when
   `dead_tuples > threshold + scale_factor * reltuples`, so the dead-tuple fraction
   *at the moment it fires* is `threshold/reltuples + scale_factor ≈ scale_factor`
@@ -63,7 +63,7 @@ section:
   limits and a catalog-mutation budget (§16), catalog self-monitoring (§5, §15), and
   saturation/inhibitor diagnosis (§11.3).
 
-- **The governor controls maintenance _progress_, not autovacuum (Appendix C).**
+- **The governor controls maintenance *progress*, not autovacuum (Appendix C).**
   "Vacuum ran" does not imply "cleanup happened" — vacuum can only remove tuples
   older than the cluster's xmin horizon, and an external inhibitor (a long-running
   transaction, a replication slot, a prepared transaction, hot-standby feedback) can
@@ -581,7 +581,7 @@ the keeping-up regime is controlled by *feedforward*, not measure-and-converge: 
 know what a given `sf` produces, so the control law computes and sets it (§11). The
 analyze loop treats `mod_fraction` vs `autovacuum_analyze_scale_factor` identically.
 
-**Diagnostic estimator (logged, _not_ a control input).** We still record the
+**Diagnostic estimator (logged, *not* a control input).** We still record the
 realized dead fraction at trigger so `verify()` and operators can see what actually
 happened:
 
@@ -1018,11 +1018,11 @@ inhibited              YES                     ≈ 0 (vacuums run, dead     → 
 ```
 
 So: **`autovacuum_count` delta separates config from saturation; effectiveness
-separates `io_limited` from inhibited; the xmin horizon (§5.3a) attributes _which_
+separates `io_limited` from inhibited; the xmin horizon (§5.3a) attributes *which*
 inhibitor.** All require ≥ K observed vacuum cycles, so no cause is declared on a
 table the governor has not yet watched through a cycle.
 
-**A pinned, non-advancing horizon is a _necessary_ condition for `inhibited` — low
+**A pinned, non-advancing horizon is a *necessary* condition for `inhibited` — low
 effectiveness alone is not enough.** This is the dangerous cell: a fast-churning
 `queue` table re-dirties between 1-min observations and reads as effectiveness ≈ 0
 *even though vacuum worked* (the §7.4 sampling-bias trap), while its horizon is
@@ -1238,7 +1238,7 @@ Reverting is **not** "set it back to the number it had." It is:
   which would freeze a now-stale default into the table.
 
 `baseline_explicit` / `baseline_value` are captured from `pg_class.reloptions` in
-`actuator_state` **the first time the governor _successfully_ changes** each
+`actuator_state` **the first time the governor *successfully* changes** each
 (relation, actuator), and never overwritten afterward. A failed `ALTER TABLE`
 touched nothing, so it must not record a baseline (and its `action_history` row has
 `revert_kind = NULL`). This makes "every action reversible" (vision Safety System)
@@ -1706,9 +1706,9 @@ pgTAP, run via `./test.sh` on PG 15/16/17/18 (matches `CLAUDE.md`).
 
 - **Saturation classification (`pgfc_govern/tests/`, Appendix C):** the three-way
   discriminator (§11.3) — (a) debt high with `autovacuum_count` *not* incrementing →
-  `config` (normal control, lowers threshold); (b) incrementing with `cleanup_per_run
-  > 0` but debt refilling → `io_limited`; (c) incrementing with effectiveness ≈ 0 and
-  a pinned `oldest_xmin` → `inhibited`. Effectiveness is judged over K cycles, never
+  `config` (normal control, lowers threshold); (b) incrementing with
+  `cleanup_per_run > 0` but debt refilling → `io_limited`; (c) incrementing with
+  effectiveness ≈ 0 and a pinned `oldest_xmin` → `inhibited`. Effectiveness is judged over K cycles, never
   one; no cause is declared before K observed cycles.
 
 - **Inhibitor diagnosis & freeze interaction (`pgfc_govern/tests/`):** with an
@@ -1735,7 +1735,7 @@ pgTAP, run via `./test.sh` on PG 15/16/17/18 (matches `CLAUDE.md`).
 ## 21. Open Questions
 
 - **Effective-threshold helper:** *resolved* — `pgfc_observe.effective_reloption()`
-  + the `maintenance_debt` CTE (§6.2) compute it observe-side; govern reuses the
+  and the `maintenance_debt` CTE (§6.2) compute it observe-side; govern reuses the
   function. (Left here only as a pointer; it is a Phase 0 deliverable, not an open
   question.) Revisit only if it ever forces a non-additive observe change.
 
