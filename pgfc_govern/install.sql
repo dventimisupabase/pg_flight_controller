@@ -68,6 +68,40 @@ INSERT INTO pgfc_govern.policy (policy_name, description)
 VALUES ('default', 'Default advisory policy (plans, never applies)')
 ON CONFLICT (policy_name) DO NOTHING;
 
+-- Policy history: human-owned desired-state changes over time (Appendix D, class 5).
+-- Retained indefinitely (pruned last, explicitly) so past governor behavior can be
+-- explained. The trigger below is created AFTER the seed INSERT, so the auto-seeded
+-- 'default' policy is intentionally not logged — only real human changes are.
+CREATE TABLE IF NOT EXISTS pgfc_govern.policy_history (
+    history_id   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    policy_name  text NOT NULL,
+    operation    text NOT NULL CHECK (operation IN ('insert','update','delete')),
+    old_row      jsonb,            -- prior row (NULL on insert)
+    new_row      jsonb,            -- new row  (NULL on delete)
+    changed_by   text NOT NULL DEFAULT current_user,
+    changed_at   timestamptz NOT NULL DEFAULT now()
+);
+COMMENT ON TABLE pgfc_govern.policy_history IS
+  'Append-only audit of policy changes (insert/update/delete); retained indefinitely.';
+
+CREATE OR REPLACE FUNCTION pgfc_govern._log_policy_change()
+RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    INSERT INTO pgfc_govern.policy_history (policy_name, operation, old_row, new_row)
+    VALUES (coalesce(NEW.policy_name, OLD.policy_name),
+            lower(TG_OP),
+            CASE WHEN TG_OP <> 'INSERT' THEN to_jsonb(OLD) END,
+            CASE WHEN TG_OP <> 'DELETE' THEN to_jsonb(NEW) END);
+    RETURN NULL;   -- AFTER trigger: return value ignored
+END;
+$fn$;
+COMMENT ON FUNCTION pgfc_govern._log_policy_change() IS
+  'AFTER row trigger: records every policy insert/update/delete into policy_history.';
+
+CREATE OR REPLACE TRIGGER policy_history_trg
+    AFTER INSERT OR UPDATE OR DELETE ON pgfc_govern.policy
+    FOR EACH ROW EXECUTE FUNCTION pgfc_govern._log_policy_change();
+
 -- Classification: which desired-state template a relation gets (hysteresis fields).
 CREATE TABLE IF NOT EXISTS pgfc_govern.relation_class (
     relid            oid PRIMARY KEY,
@@ -883,3 +917,60 @@ SELECT diagnostic_id, detected_at, severity, relid, inhibitor_class, recommendat
 FROM pgfc_govern.diagnostics
 WHERE resolved_at IS NULL
 ORDER BY (severity = 'critical') DESC, detected_at DESC;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Retention  (Appendix D; design "Observation storage and self-maintenance", S1)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Prune the append-only audit tables by time cutoff. These tables are low-volume
+-- (≤ ~1 action/relation/hour, one tick/cycle), so a simple DELETE cutoff is adequate
+-- here; the high-volume observe tables use partition rotation instead (later S2+).
+-- policy_history is NOT pruned — it is retained indefinitely (Appendix D, pruned last).
+--
+-- Ordering respects the action_history -> decision_log FK: actions prune first, and a
+-- decision is kept while any retained action still references it (so a retained action
+-- never loses its decision). Diagnostics prune only when resolved — an old UNRESOLVED
+-- finding is a live alert (surfaced by active_diagnostics) and must not age out.
+--
+-- Schedule daily with pg_cron, e.g.:
+--   SELECT cron.schedule('pgfc_govern_retain', '17 3 * * *',
+--                        $$ SELECT pgfc_govern.retain() $$);
+CREATE OR REPLACE FUNCTION pgfc_govern.retain(
+    keep_decisions   interval DEFAULT '180 days',
+    keep_actions     interval DEFAULT '180 days',
+    keep_ticks       interval DEFAULT '180 days',
+    keep_diagnostics interval DEFAULT '365 days')
+RETURNS TABLE(relation text, deleted bigint)
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    -- 1. Actions first (child of decision_log).
+    RETURN QUERY
+    WITH d AS (DELETE FROM pgfc_govern.action_history
+               WHERE applied_at < now() - keep_actions RETURNING 1)
+    SELECT 'action_history'::text, count(*) FROM d;
+
+    -- 2. Decisions, but keep any still referenced by a (retained) action.
+    RETURN QUERY
+    WITH d AS (DELETE FROM pgfc_govern.decision_log dl
+               WHERE dl.created_at < now() - keep_decisions
+                 AND NOT EXISTS (SELECT 1 FROM pgfc_govern.action_history ah
+                                 WHERE ah.decision_id = dl.decision_id)
+               RETURNING 1)
+    SELECT 'decision_log'::text, count(*) FROM d;
+
+    -- 3. Tick orchestration log.
+    RETURN QUERY
+    WITH d AS (DELETE FROM pgfc_govern.tick_log
+               WHERE started_at < now() - keep_ticks RETURNING 1)
+    SELECT 'tick_log'::text, count(*) FROM d;
+
+    -- 4. Diagnostics — resolved only; unresolved findings are live and never aged out.
+    RETURN QUERY
+    WITH d AS (DELETE FROM pgfc_govern.diagnostics
+               WHERE resolved_at IS NOT NULL
+                 AND detected_at < now() - keep_diagnostics RETURNING 1)
+    SELECT 'diagnostics'::text, count(*) FROM d;
+END;
+$fn$;
+COMMENT ON FUNCTION pgfc_govern.retain(interval, interval, interval, interval) IS
+  'Prune audit tables by time cutoff (decisions/actions 180d, ticks 180d, resolved diagnostics 365d); policy_history is never pruned. Returns per-table delete counts.';

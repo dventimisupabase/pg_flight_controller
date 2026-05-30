@@ -50,7 +50,9 @@ Functions: `observe_tick()` (observe + `classify` + `estimate`) and `control_tic
 (`plan` + `apply`-if-not-advisory + `verify`), driven by pg_cron in production.
 Core steps: `classify()`, `estimate()`, `plan()`, `apply()`, `verify()`, plus the
 `removability`-aware diagnosis. Views: `governor_status`, `catalog_health`,
-`active_diagnostics`.
+`active_diagnostics`. `retain()` prunes the append-only audit tables by time cutoff,
+and `policy_history` records policy changes (kept indefinitely) — schedule `retain()`
+daily with pg_cron alongside the loops.
 
 ### Deliberately deferred (so scope is explicit, not accidental)
 

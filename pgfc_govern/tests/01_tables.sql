@@ -1,6 +1,6 @@
--- Govern schema: the eight tables, the enum wiring, key defaults, and the seed policy.
+-- Govern schema: the nine tables, the enum wiring, key defaults, and the seed policy.
 BEGIN;
-SELECT plan(17);
+SELECT plan(18);
 
 SELECT has_table('pgfc_govern', 'policy', 'policy table exists');
 SELECT has_table('pgfc_govern', 'relation_class', 'relation_class table exists');
@@ -10,6 +10,7 @@ SELECT has_table('pgfc_govern', 'decision_log', 'decision_log table exists');
 SELECT has_table('pgfc_govern', 'action_history', 'action_history table exists');
 SELECT has_table('pgfc_govern', 'tick_log', 'tick_log table exists');
 SELECT has_table('pgfc_govern', 'diagnostics', 'diagnostics table exists');
+SELECT has_table('pgfc_govern', 'policy_history', 'policy_history table exists');
 
 SELECT col_type_is('pgfc_govern', 'relation_class', 'kind', 'pgfc_govern.relation_kind',
                    'relation_class.kind uses the relation_kind enum');
