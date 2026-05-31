@@ -249,17 +249,29 @@ One-row whole-governor self-health (S6): total bytes + dead tuples across both s
 
 ## Functions
 
+### `pgfc_govern._class_target(p_kind text) → double precision`
+
+Base (pre-aggressiveness) target dead-tuple fraction for a workload class, read from the registry (Phase 1.6 P2).
+
 ### `pgfc_govern._findings(p_snapshot_id bigint) → TABLE(relid oid, inhibitor_class text, severity text, recommendation text, evidence jsonb)`
 
 ### `pgfc_govern._log_policy_change() → trigger`
 
 AFTER row trigger: records every policy insert/update/delete into policy_history.
 
+### `pgfc_govern._param(p_name text) → text`
+
+Read a governed parameter's value from the registry (Phase 1.6 P2); the control logic single-sources its constants through this.
+
 ### `pgfc_govern._parameter_registry() → TABLE(parameter_name text, category text, default_value text, unit text, rationale text, source text, owner text, override_allowed boolean, config_ref text)`
 
-Canonical provenance registry of pgfc_govern governed constants (Phase 1.6 P1). Documents the as-built control-logic values; single-sourcing + drift gate land in P2/P3.
+Canonical registry of pgfc_govern governed constants; the control logic reads its values from here through the registry accessor functions (Phase 1.6 P2, single-sourced). The CI drift gate that makes divergence impossible lands in P3.
 
 ### `pgfc_govern._reconcile_diagnostics(p_snapshot_id bigint) → void`
+
+### `pgfc_govern._sf_grid() → double precision[]`
+
+Scale-factor quantization grid, read from the registry (Phase 1.6 P2).
 
 ### `pgfc_govern.apply(p_tick_id bigint, p_relid oid) → boolean`
 

@@ -114,6 +114,18 @@ section in the same pull request as your change (this is a convention, not a CI 
   (many honestly marked "MVP estimate — not yet benchmarked"); later increments make the
   control logic read from the registry and add a CI drift gate.
 
+- **Parameter governance Phase 1.6 — P2 (single-sourced control constants).** The
+  `pgfc_govern` control logic now reads its constants **from** the registry instead of inline
+  literals, via three accessors — `_param(name)`, `_sf_grid()`, and `_class_target(kind)`.
+  `classify()`, `estimate()`, `plan()`, `snap_sf()`, `_findings()`, `governor_status`, and
+  `apply()` (its `lock_timeout`, via `set_config`) were refactored to use them (including the
+  `COALESCE` policy fallbacks for `aggressiveness`, `manage_user_owned`, `advisory_only`, and
+  `n_sustain`), removing the duplicated class targets and freeze threshold previously copied
+  across three call sites. Behaviour is
+  identical — guarded by the existing estimate/classify/plan/loop/integration suites, which
+  pin concrete outcomes. The registry/code tie is now real but not yet *enforced*; the
+  "registry up to date" CI gate that makes divergence impossible lands in P3.
+
 ### Changed
 
 - **`docs/` is now the self-contained, as-built spec.** The hand-written guides no
