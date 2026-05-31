@@ -1,7 +1,7 @@
 -- Orchestrators + views + the Phase 1 guarantee: advisory_only never actuates,
 -- and apply() really does actuate once advisory_only is turned off.
 BEGIN;
-SELECT plan(13);
+SELECT plan(14);
 
 SELECT has_view('pgfc_govern', 'governor_status', 'governor_status view exists');
 SELECT has_view('pgfc_govern', 'catalog_health', 'catalog_health view exists');
@@ -30,6 +30,10 @@ SELECT is(pgfc_observe.effective_reloption(
 SELECT is((SELECT decision FROM pgfc_govern.decision_log
             WHERE relid = 'public.loop_t'::regclass ORDER BY decision_id DESC LIMIT 1),
           'adjust', 'plan still proposed an adjust (only apply is gated)');
+
+-- control_tick() self-checks its health first (Phase 1.7 F2): evaluate_health() ran.
+SELECT isnt((SELECT evaluated_at FROM pgfc_govern.governor_state), NULL,
+            'control_tick() evaluated the governor health state (evaluated_at set)');
 
 -- Flip to active control and run again: now apply() actuates.
 UPDATE pgfc_govern.policy SET advisory_only = false WHERE policy_name = 'default';

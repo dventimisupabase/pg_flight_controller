@@ -78,6 +78,18 @@ When control saturates, the cause + a recommendation, not more DDL.
 | `recommendation` | `text` |  |
 | `resolved_at` | `timestamp with time zone` |  |
 
+### pgfc_govern.governor_state
+
+Single-row governor health state (Phase 1.7 F2): the current self-protection state computed by evaluate_health(). Advisory in F2; the apply() authority gate consults it in F4.
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `singleton` | `boolean` |  |
+| `state` | `pgfc_govern.governor_health_state` |  |
+| `since` | `timestamp with time zone` |  |
+| `reason` | `text` |  |
+| `evaluated_at` | `timestamp with time zone` |  |
+
 ### pgfc_govern.policy
 
 Operator-expressed outcomes. advisory_only=true means plan but never apply.
@@ -149,6 +161,19 @@ Append-only audit of policy changes (insert/update/delete); retained indefinitel
 | `saturation_candidate` | `text` |  |
 | `saturation_streak` | `integer` |  |
 | `estimated_at` | `timestamp with time zone` |  |
+
+### pgfc_govern.state_transitions
+
+Append-only audit of governor health-state transitions (Phase 1.7 F2): from/to state, reason, and the metrics snapshot that triggered it. Pruned by retain().
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `transition_id` | `bigint` |  |
+| `from_state` | `pgfc_govern.governor_health_state` |  |
+| `to_state` | `pgfc_govern.governor_health_state` |  |
+| `reason` | `text` |  |
+| `triggering_condition` | `jsonb` |  |
+| `transitioned_at` | `timestamp with time zone` |  |
 
 ### pgfc_govern.storage_config
 
@@ -321,6 +346,10 @@ Graceful-degrade prune order (S6): shed storage raw→fine→coarse rollups→di
 
 Derive hidden state (rates, effectiveness, saturation) into relation_estimate.
 
+### `pgfc_govern.evaluate_health() → pgfc_govern.governor_health_state`
+
+Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds; write governor_state and record a state_transitions row on change. Advisory — does not gate actuation (that is the F4 authority gate). Returns the computed state.
+
 ### `pgfc_govern.ewma(prior double precision, sample double precision, alpha double precision) → double precision`
 
 ### `pgfc_govern.observe_tick() → bigint`
@@ -329,9 +358,9 @@ Derive hidden state (rates, effectiveness, saturation) into relation_estimate.
 
 Advisory: write decision_log per relation (vacuum objective) + reconcile diagnostics.
 
-### `pgfc_govern.retain(keep_decisions interval, keep_actions interval, keep_ticks interval, keep_diagnostics interval) → TABLE(relation text, deleted bigint)`
+### `pgfc_govern.retain(keep_decisions interval, keep_actions interval, keep_ticks interval, keep_diagnostics interval, keep_transitions interval) → TABLE(relation text, deleted bigint)`
 
-Prune audit tables by time cutoff (decisions/actions 180d, ticks 180d, resolved diagnostics 365d); policy_history is never pruned. Returns per-table delete counts.
+Prune audit tables by time cutoff (decisions/actions 180d, ticks 180d, resolved diagnostics 365d, state transitions 180d); policy_history is never pruned. Returns per-table delete counts.
 
 ### `pgfc_govern.snap_sf(x double precision) → double precision`
 
@@ -348,6 +377,10 @@ Parameter validation (Phase 1.6 P4): grades the live operator configuration agai
 Close the control loop on past actions (Phase 1: no-op; expanded in Phase 2).
 
 ## Types
+
+### `pgfc_govern.governor_health_state`
+
+Enum values: 'normal', 'degraded', 'diagnostic', 'emergency', 'disabled'
 
 ### `pgfc_govern.relation_kind`
 

@@ -80,6 +80,40 @@ SELECT applied_actions_last_hour, failed_actions_last_hour, lock_timeouts_last_h
 FROM pgfc_govern.governor_metrics;
 ```
 
+## Health state
+
+Each control cycle the governor evaluates its own health (Phase 1.7 F2) from those
+metrics and records it as a single state. The states, in order of increasing caution:
+
+- **`normal`** — full operation.
+- **`degraded`** — mild trouble (telemetry going stale, a few failed actions, or over the
+  storage budget); observe/estimate/diagnose continue, actuation is limited.
+- **`diagnostic`** — repeated failures or a lock-timeout storm; no actuation except
+  permitted safety actions.
+- **`emergency`** — the governor is effectively flying blind (observation badly stale);
+  minimal observation and health reporting only.
+- **`disabled`** — nothing acts; history is preserved. Reserved for the operator-forced
+  override (a later increment).
+
+A fresh governor with no observations is `normal`, not `emergency` — absence of data at
+boot is not ill health. In F2 the state is **advisory**: it is computed, recorded, and
+surfaced, but does not yet gate actuation (that authority gate is a later increment). The
+automatic evaluator only reaches `emergency` via stale observation today; more triggers
+(oscillation, load) arrive with later increments.
+
+Read the current state and the transition history:
+
+<!-- doctest -->
+
+```sql
+SELECT state, since, reason FROM pgfc_govern.governor_state;
+
+SELECT transitioned_at, from_state, to_state, reason
+FROM pgfc_govern.state_transitions
+ORDER BY transition_id DESC
+LIMIT 20;
+```
+
 ## Diagnostics
 
 When more aggressiveness can't help, the governor records a finding instead of

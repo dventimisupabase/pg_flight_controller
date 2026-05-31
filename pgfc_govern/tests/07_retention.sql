@@ -4,7 +4,7 @@
 -- and must NOT be pruned by retain() (indefinite). retain() must respect the
 -- action_history -> decision_log FK (never orphan a retained action's decision).
 BEGIN;
-SELECT plan(14);
+SELECT plan(16);
 
 -- ── policy_history capture (trigger) ────────────────────────────────────────
 SELECT has_table('pgfc_govern', 'policy_history', 'policy_history table exists');
@@ -64,6 +64,11 @@ VALUES (1, '{}', now() - interval '400 days', now() - interval '399 days'),  -- 
        (2, '{}', now() - interval '400 days', NULL),                          -- old, unresolved
        (3, '{}', now(), NULL);                                                -- recent
 
+-- Health-state transitions (Phase 1.7 F2): one old (prunable), one recent (kept).
+INSERT INTO pgfc_govern.state_transitions (from_state, to_state, transitioned_at)
+VALUES ('normal', 'degraded', now() - interval '200 days'),
+       ('normal', 'degraded', now());
+
 SELECT pgfc_govern.retain();
 
 -- decision_log: old unreferenced gone; recent kept; FK-guarded old kept.
@@ -90,6 +95,14 @@ SELECT is((SELECT count(*) FROM pgfc_govern.diagnostics
           0::bigint, 'old resolved diagnostic is pruned');
 SELECT is((SELECT count(*) FROM pgfc_govern.diagnostics WHERE relid = 2),
           1::bigint, 'old UNRESOLVED diagnostic is kept (active finding, never aged out)');
+
+-- state_transitions: old pruned; recent kept.
+SELECT is((SELECT count(*) FROM pgfc_govern.state_transitions
+           WHERE transitioned_at < now() - interval '1 day'),
+          0::bigint, 'old state_transition is pruned');
+SELECT is((SELECT count(*) FROM pgfc_govern.state_transitions
+           WHERE transitioned_at >= now() - interval '1 day'),
+          1::bigint, 'recent state_transition is kept');
 
 SELECT * FROM finish();
 ROLLBACK;

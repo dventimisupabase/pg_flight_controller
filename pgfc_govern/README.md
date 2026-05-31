@@ -64,6 +64,13 @@ shedding storage in a fixed order — raw → fine rollups → coarse rollups �
 → actions — stopping once under budget; policy is never pruned, and with no cap
 configured `degrade()` is a no-op.
 
+Self-protection (Phase 1.7): `governor_metrics` (F1) is the one-row substrate
+`evaluate_health()` (F2) reads to compute a health state
+(`normal → degraded → diagnostic → emergency → disabled`) against born-governed
+thresholds, writing the single-row `governor_state` and the `state_transitions` audit
+each `control_tick()`. Advisory for now — the state is recorded and surfaced but does not
+yet gate actuation (the `apply()` authority gate consults it in a later increment).
+
 ### Deliberately deferred (so scope is explicit, not accidental)
 
 - **Threshold lever and the analyze objective.** `plan()` moves the vacuum
