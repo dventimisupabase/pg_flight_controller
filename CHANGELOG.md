@@ -313,5 +313,11 @@ section in the same pull request as your change (this is a convention, not a CI 
 
 ### Notes
 
-- No tagged releases yet; the project is pre-1.0 and active control (Phase 2) is in
-  progress. Active control is **experimental** in the current code.
+- **Phase 1.7 (governor self-protection, appendix F) is complete** — F1–F7 all landed.
+  The safety net (health states, circuit breakers, authority limiting, load shedding,
+  self-monitoring, failure taxonomy, oscillation detection) is built, and active control
+  is now the **supported** `advisory_only = false` path under it — no longer experimental,
+  and with no separate "Phase 2". The broader actuator roadmap (the small-table threshold
+  lever, the analyze objective, cost/IO-budget actuators, and the catalog-bloat braking
+  loop) remains future work beyond Phase 1.7.
+- No tagged releases yet; the project is pre-1.0.
