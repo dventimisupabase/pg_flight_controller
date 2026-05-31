@@ -319,7 +319,7 @@ AFTER row trigger: records every policy insert/update/delete into policy_history
 
 ### `pgfc_govern._oscillating_relations() → TABLE(relid oid, relname text, reversals bigint, n_changes bigint, first_at timestamp with time zone, last_at timestamp with time zone, recent_values text[])`
 
-Control-oscillation detector (Phase 1.7 F5): relations whose applied scale-factor flaps — at least oscillation_min_reversals direction reversals within oscillation_window. Read from action_history (applied only). The governor_metrics oscillating_relations count and the evaluate_health() oscillation signal both read it; _reconcile_oscillation() raises the operator-visible finding.
+Control-oscillation detector (Phase 1.7 F5): relations whose applied scale-factor flaps — at least oscillation_min_reversals direction reversals within oscillation_window. Read from action_history (applied only). The governor_metrics oscillating_relations count and the evaluate_health() oscillation signal both read it; the plan() reconciler raises the operator-visible finding.
 
 ### `pgfc_govern._param(p_name text) → text`
 

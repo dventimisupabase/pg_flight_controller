@@ -1765,7 +1765,7 @@ HAVING count(*) FILTER (WHERE r.d <> 0 AND r.prev_d <> 0 AND r.d <> r.prev_d)
        >= pgfc_govern._param('oscillation_min_reversals')::bigint;
 $fn$;
 COMMENT ON FUNCTION pgfc_govern._oscillating_relations() IS
-  'Control-oscillation detector (Phase 1.7 F5): relations whose applied scale-factor flaps — at least oscillation_min_reversals direction reversals within oscillation_window. Read from action_history (applied only). The governor_metrics oscillating_relations count and the evaluate_health() oscillation signal both read it; _reconcile_oscillation() raises the operator-visible finding.';
+  'Control-oscillation detector (Phase 1.7 F5): relations whose applied scale-factor flaps — at least oscillation_min_reversals direction reversals within oscillation_window. Read from action_history (applied only). The governor_metrics oscillating_relations count and the evaluate_health() oscillation signal both read it; the plan() reconciler raises the operator-visible finding.';
 
 -- Open/resolve the operator-visible oscillation diagnostic (appendix F: "operator
 -- visibility"). One unresolved control_oscillation row per flapping relation; resolved when
