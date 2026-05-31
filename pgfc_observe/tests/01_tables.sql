@@ -27,7 +27,7 @@ SELECT col_type_is('pgfc_observe', 'snapshots', 'collected_day', 'integer',
 SELECT has_column('pgfc_observe', 'relation_samples', 'collected_day',
                   'relation_samples has collected_day partition key');
 
--- representative columns from each Appendix-driven group
+-- representative columns from each observable group
 SELECT has_column('pgfc_observe', 'snapshots', 'pg_class_n_dead_tup',
                   'snapshots has catalog-health column (App B)');
 SELECT has_column('pgfc_observe', 'snapshots', 'oldest_xmin_age',

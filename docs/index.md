@@ -23,12 +23,8 @@ cannot drift from the code:
 - [`pgfc_observe`](reference/pgfc_observe.md) — telemetry tables, views, functions.
 - [`pgfc_govern`](reference/pgfc_govern.md) — control-loop tables, views, functions.
 
-## Design
-
-- [Technical design](../out/technical-design.md) — the architecture and the
-  reasoning behind it (the "why"), including the [control law](../out/technical-design.md#control-law),
-  [saturation diagnosis](../out/technical-design.md#saturation-diagnosis), and the
-  [safety system](../out/technical-design.md#safety-system).
+The [Concepts](guide/concepts.md) guide covers the architecture and the reasoning
+behind it — the control law, saturation diagnosis, and the safety system.
 
 ## How these docs stay accurate
 

@@ -233,5 +233,5 @@ UPDATE pgfc_govern.policy SET advisory_only = false WHERE policy_name = 'default
 
 From the next `control_tick()`, approved `adjust` decisions are applied as batched
 `ALTER TABLE` changes — each recorded in `action_history` and reversible. Everything
-the governor changed can be rolled back; see the
-[safety system](../../out/technical-design.md#safety-system) for the guarantees.
+the governor changed can be rolled back; see [Safety first](concepts.md#safety-first)
+for the guarantees.

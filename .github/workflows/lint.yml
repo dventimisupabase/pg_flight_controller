@@ -14,8 +14,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      # Maintained docs only. in/ holds authored source inputs (vision + appendices),
-      # not project docs, so it is excluded from linting.
+      # Maintained docs only. in/ holds authored source inputs, not project docs,
+      # so it is excluded from linting.
       - name: Run markdownlint
         uses: DavidAnson/markdownlint-cli2-action@v16
         with:

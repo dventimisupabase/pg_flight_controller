@@ -8,7 +8,8 @@ than escalating) when an external inhibitor blocks progress.
 
 Depends on **pgfc_observe** (install it first).
 
-This is **Phase 1** of the design in [`out/technical-design.md`](../out/technical-design.md).
+This is **Phase 1** of the governor: advisory by default. For the concepts and the
+full guide set, see [`docs/`](../docs/index.md).
 
 ## Advisory by default
 
