@@ -31,10 +31,10 @@ next finer level, **→** is a cross-link (a see-also or a consumer). The finest
 per-object documentation — is the generated [reference](#6-components-and-code-the-leaf-level),
 linked rather than copied.
 
-> **Outline status.** Section 1 (abstract) is a skeleton; **§2 Concepts, §3 Architecture, and
-> §4 Modules are drafted**. Section 5 (subsystems) is seeded from the confirmed object taxonomy — every database
-> object has a home — but the per-subsystem prose, rationale, and "feedback wanted" are
-> still to be filled. Sections 6–9 describe conventions now and fill in as the body lands.
+> **Outline status.** Sections 1–4 are drafted. Section 5 (subsystems) is seeded from the
+> confirmed object taxonomy — every database object has a home — but the per-subsystem prose,
+> rationale, and "feedback wanted" are still to be filled. Sections 6–9 describe conventions
+> now and fill in as the body lands.
 
 ## Contents
 
@@ -54,11 +54,24 @@ linked rather than copied.
 
 ## 1. Abstract
 
-*(To write.)* One paragraph: what pg_flight_controller is — a supervisory autovacuum
-governor that treats per-table autovacuum settings as **actuator positions** and steers
-them toward policy *outcomes* — why it exists (static autovacuum config drifts out of
-appropriateness as workloads change), and how it works at a glance (observe → estimate →
-decide → act, advisory by default). Seed: the top-level README abstract.
+**pg_flight_controller** is a supervisory **autovacuum governor** for PostgreSQL. It treats
+per-table autovacuum settings not as static configuration but as **actuator positions**:
+operators express *policy* — the maintenance outcomes they want — and the governor observes
+the database, estimates each relation's hidden maintenance state, and steers autovacuum's
+setpoints toward those outcomes with small, safe, auditable changes. It never runs `VACUUM`
+itself; it moves the setpoints that decide *when* autovacuum fires.
+
+It exists because autovacuum's per-table knobs are typically set once and assumed to stay
+appropriate, while real workloads shift and the right setting drifts with them. The goal is
+not to tune autovacuum once, but to keep the database **self-stabilizing** as the workload
+changes. The design draws on control theory and state estimation — not machine learning.
+
+At a glance, two cooperating extensions — `pgfc_observe` (read-only telemetry) and
+`pgfc_govern` (the control loop) — run an **observe → estimate → decide → act** feedback
+cycle. It is **advisory by default**: out of the box it recommends and diagnoses but changes
+nothing. Active control is opt-in and runs under a self-protection net, on the principle that
+an autonomous actuator on a live production catalog must be **safe and explainable before it
+is effective**.
 
 ↳ Refine into [concepts](#2-concepts-and-principles).
 
