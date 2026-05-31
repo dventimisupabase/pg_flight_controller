@@ -169,6 +169,11 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.decision_log (
     decision       text NOT NULL,    -- hold|adjust|suppressed:<reason>|escalate:<...>
     proposed_value text,             -- quantized grid value
     policy_rule    text,             -- which class/template/rule triggered this
+    -- Adaptive-value provenance (Appendix E): the estimated benefit of an adjust — the
+    -- change in the allowed dead fraction (current scale factor − proposed). Sign is
+    -- direction: positive = tightening (kept cleaner), negative = loosening. NULL when the
+    -- decision changes nothing (hold / suppressed / escalate).
+    estimated_benefit double precision,
     applied        boolean NOT NULL DEFAULT false,
     created_at     timestamptz NOT NULL DEFAULT now()
 );
@@ -603,7 +608,7 @@ BEGIN
 
     INSERT INTO pgfc_govern.decision_log
       (tick_id, relid, actuator, observation, prev_state, desired_state,
-       decision, proposed_value, policy_rule)
+       decision, proposed_value, policy_rule, estimated_benefit)
     WITH
     base AS (
         SELECT rc.relid, rc.kind, rs.reltuples, rs.reloptions,
@@ -647,6 +652,24 @@ BEGIN
                 LEAST(GREATEST(eff_f - cur_base::float8 / GREATEST(reltuples, 1), v_sf_min), v_sf_max)
             ) AS sf_target
         FROM decided
+    ),
+    dec AS (
+        SELECT *,
+            -- precedence: freeze floor dominates saturation suppression
+            CASE
+                WHEN freeze_stress AND horizon_pinned
+                     THEN 'escalate:inhibited:' || COALESCE(oldest_xmin_owner,'unknown')
+                WHEN freeze_stress AND sf_target = cur_sf THEN 'hold'
+                WHEN freeze_stress                          THEN 'adjust'
+                WHEN saturation_cause = 'inhibited'
+                     THEN 'escalate:inhibited:' || COALESCE(oldest_xmin_owner,'unknown')
+                WHEN saturation_cause = 'io_limited'        THEN 'escalate:io_limited'
+                WHEN saturation_cause = 'config'            THEN 'suppressed:not_firing'
+                WHEN NOT v_manage AND sf_user_set           THEN 'suppressed:user_owned'
+                WHEN sf_target = cur_sf                      THEN 'hold'
+                ELSE 'adjust'
+            END AS decision
+        FROM q
     )
     SELECT
         p_tick_id, relid, 'autovacuum_vacuum_scale_factor',
@@ -657,23 +680,12 @@ BEGIN
                            'freeze_debt', freeze_debt,
                            'horizon_owner', oldest_xmin_owner),
         jsonb_build_object('f_template', f_template, 'eff_f', eff_f, 'sf_target', sf_target),
-        -- precedence: freeze floor dominates saturation suppression
-        CASE
-            WHEN freeze_stress AND horizon_pinned
-                 THEN 'escalate:inhibited:' || COALESCE(oldest_xmin_owner,'unknown')
-            WHEN freeze_stress AND sf_target = cur_sf THEN 'hold'
-            WHEN freeze_stress                          THEN 'adjust'
-            WHEN saturation_cause = 'inhibited'
-                 THEN 'escalate:inhibited:' || COALESCE(oldest_xmin_owner,'unknown')
-            WHEN saturation_cause = 'io_limited'        THEN 'escalate:io_limited'
-            WHEN saturation_cause = 'config'            THEN 'suppressed:not_firing'
-            WHEN NOT v_manage AND sf_user_set           THEN 'suppressed:user_owned'
-            WHEN sf_target = cur_sf                      THEN 'hold'
-            ELSE 'adjust'
-        END,
+        decision,
         sf_target::text,
-        'class=' || kind::text || ' f*=' || f_template
-    FROM q;
+        'class=' || kind::text || ' f*=' || f_template,
+        -- estimated benefit: the tightening this adjust applies (NULL when nothing changes)
+        CASE WHEN decision = 'adjust' THEN cur_sf - sf_target END
+    FROM dec;
     GET DIAGNOSTICS n = ROW_COUNT;
 
     PERFORM pgfc_govern._reconcile_diagnostics(p_snapshot_id);
@@ -1400,6 +1412,7 @@ WITH bodies AS (
           '_audit_control_literals',  -- this auditor (its allowlist/regex are literals)
           'degrade', 'retain',        -- operator retention orchestration (documented, not enforced)
           'storage_budget',           -- reporting
+          'validate_parameters',      -- reviewability/reporting surface
           '_log_policy_change')       -- audit-trigger plumbing
     UNION ALL
     SELECT 'governor_status',
@@ -1427,8 +1440,87 @@ COMMENT ON FUNCTION pgfc_govern._audit_control_literals() IS
   'Drift gate (Phase 1.6 P3): returns unregistered numeric/interval literals in the decision/actuation path. A pgTAP test asserts it is empty; non-empty means a control value escaped the registry.';
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Parameter validation  (Phase 1.6 — parameter governance, P4)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- The reviewability surface (Appendix E): grade the LIVE operator configuration against
+-- the safety bounds the registry encodes, so a hazardous setting is visible without
+-- reading source. Returns one row per checked parameter, status OK | WARNING | CRITICAL
+-- (the pg_flight_recorder validate_config() pattern). Checks are structural (> 0, = 0,
+-- IS NULL) — it asserts hard safety properties, not tuning opinions — so it carries no
+-- magic numbers of its own; it is a reporting surface and is excluded from the P3 gate.
+CREATE OR REPLACE FUNCTION pgfc_govern.validate_parameters()
+RETURNS TABLE(parameter text, status text, message text)
+LANGUAGE sql STABLE AS $fn$
+WITH pol AS (
+    SELECT * FROM pgfc_govern.policy WHERE enabled ORDER BY policy_name LIMIT 1
+), cfg AS (
+    SELECT budget_bytes FROM pgfc_govern.storage_config
+)
+-- No enabled policy at all: the governor is inert. Surfaced standalone (not FROM pol, so
+-- it still reports when pol is empty) — without it, an unconfigured governor would show no
+-- findings at all.
+SELECT 'enabled_policy',
+       CASE WHEN EXISTS (SELECT 1 FROM pgfc_govern.policy WHERE enabled) THEN 'OK' ELSE 'WARNING' END,
+       CASE WHEN EXISTS (SELECT 1 FROM pgfc_govern.policy WHERE enabled)
+            THEN 'an enabled policy drives the loop'
+            ELSE 'no enabled policy — the governor plans and applies nothing' END
+UNION ALL
+-- aggressiveness scales every class target (target = template / aggressiveness), so a
+-- non-positive value is a divide-by-zero / sign inversion: hard CRITICAL.
+SELECT 'aggressiveness',
+       CASE WHEN p.aggressiveness IS NULL OR p.aggressiveness <= 0 THEN 'CRITICAL' ELSE 'OK' END,
+       format('aggressiveness = %s; must be > 0 (targets are class_template / aggressiveness, clamped to [%s, %s])',
+              p.aggressiveness, pgfc_govern._param('sf_min'), pgfc_govern._param('sf_max'))
+FROM pol p
+UNION ALL
+SELECT 'daily_mutation_budget',
+       CASE WHEN p.daily_mutation_budget < 0 THEN 'CRITICAL'
+            WHEN p.daily_mutation_budget = 0 THEN 'WARNING' ELSE 'OK' END,
+       format('daily_mutation_budget = %s (0 means the governor can never apply a change)', p.daily_mutation_budget)
+FROM pol p
+UNION ALL
+SELECT 'global_max_changes_per_cycle',
+       CASE WHEN p.global_max_changes_per_cycle < 0 THEN 'CRITICAL'
+            WHEN p.global_max_changes_per_cycle = 0 THEN 'WARNING' ELSE 'OK' END,
+       format('global_max_changes_per_cycle = %s (0 means no change is ever applied per cycle)', p.global_max_changes_per_cycle)
+FROM pol p
+UNION ALL
+SELECT 'min_interval',
+       CASE WHEN extract(epoch FROM p.min_interval) < 0 THEN 'CRITICAL'
+            WHEN extract(epoch FROM p.min_interval) = 0 THEN 'WARNING' ELSE 'OK' END,
+       format('min_interval = %s (0 removes the per-relation rate limit)', p.min_interval)
+FROM pol p
+UNION ALL
+SELECT 'n_sustain',
+       CASE WHEN p.n_sustain < 1 THEN 'WARNING' ELSE 'OK' END,
+       format('n_sustain = %s (below 1 disables classification hysteresis — risks flapping)', p.n_sustain)
+FROM pol p
+UNION ALL
+SELECT 'manage_user_owned',
+       CASE WHEN p.manage_user_owned THEN 'WARNING' ELSE 'OK' END,
+       format('manage_user_owned = %s (true lets the governor overwrite user/other-system reloptions)', p.manage_user_owned)
+FROM pol p
+UNION ALL
+SELECT 'advisory_only',
+       CASE WHEN p.advisory_only THEN 'OK' ELSE 'WARNING' END,
+       format('advisory_only = %s (false enables active control — experimental in this release)', p.advisory_only)
+FROM pol p
+UNION ALL
+SELECT 'storage_budget_bytes',
+       CASE WHEN c.budget_bytes IS NOT NULL AND c.budget_bytes < 0 THEN 'CRITICAL' ELSE 'OK' END,
+       format('budget_bytes = %s (NULL = no storage cap, degrade() disabled)', c.budget_bytes)
+FROM cfg c
+ORDER BY 1;
+$fn$;
+COMMENT ON FUNCTION pgfc_govern.validate_parameters() IS
+  'Parameter validation (Phase 1.6 P4): grades the live operator configuration against the registry''s safety bounds (OK/WARNING/CRITICAL). The reviewability surface; checks hard safety properties only.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Additive upgrades
 -- ─────────────────────────────────────────────────────────────────────────────
+-- P4: adaptive-value provenance — the estimated benefit of an adjust on decision_log.
+ALTER TABLE pgfc_govern.decision_log ADD COLUMN IF NOT EXISTS estimated_benefit double precision;
+
 -- S6: static autovacuum reloptions on the governor's own audit/state tables. Unlike
 -- the partition-rotated observe tables, these are mutated in place (UPDATE-heavy state
 -- tables; DELETE-pruned audit tables by retain()/degrade()), so they DO accrue dead

@@ -239,6 +239,23 @@ control values are honestly marked `MVP estimate — not yet benchmarked` in the
 `source`: that is the validation backlog, made visible on purpose. (An observe-only
 install reads `pgfc_observe._parameter_registry()` directly.)
 
+To check that your *live* configuration is safe — without reading source —
+`validate_parameters()` grades each operator-set value against the registry's safety
+bounds:
+
+<!-- doctest -->
+
+```sql
+SELECT parameter, status, message
+FROM pgfc_govern.validate_parameters()
+WHERE status <> 'OK';
+```
+
+`status` is `OK`, `WARNING`, or `CRITICAL`. It checks hard safety properties, not tuning
+opinions: e.g. `aggressiveness <= 0` is `CRITICAL` (every class target is
+`template / aggressiveness`), while `advisory_only = false`, a zero mutation budget, or
+`n_sustain` below 1 are `WARNING`s. An empty result means nothing needs attention.
+
 ## Enabling active control
 
 > **Phase status.** Active control is **experimental** in this release. `apply()`
