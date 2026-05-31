@@ -49,9 +49,9 @@ add a Sequences section to the reference, bring `batch_seq` into scope.)
 
 ## Status
 
-- [x] **PR 1 — metadata + reference injection + exhaustiveness gate (atomic).** See
-  [steps](#pr-1--metadata--reference-injection--exhaustiveness-gate).
-- [ ] **PR 2 — bottom-up index + staleness gate + RFC wiring.** See
+- [x] **PR 1 — metadata + reference injection + exhaustiveness gate (atomic).** Merged
+  (#55). See [steps](#pr-1--metadata--reference-injection--exhaustiveness-gate).
+- [x] **PR 2 — bottom-up index + staleness gate + RFC wiring.** See
   [steps](#pr-2--bottom-up-index--staleness-gate--rfc-wiring).
 
 Update this section and the per-PR checkboxes as each lands. Record merged PR numbers here.
@@ -82,18 +82,22 @@ generated reference and break the "Reference up to date" gate.
 
 ## PR 2 — bottom-up index + staleness gate + RFC wiring
 
-- [ ] A `pg_temp` generator (model on [`scripts/gen_reference.sql`](../../scripts/gen_reference.sql))
-  emitting `docs/reference/subsystem-map.md`: grouped **by subsystem**, listing each member
-  object (the siblings); and/or a flat **object → subsystem** index. Each object links to the
-  reference; each subsystem heading links **up** to its RFC §5 anchor
-  (e.g. `README.md#g1-control-loop-ooda`). Deterministic ordering (ORDER BY everywhere).
-- [ ] A wrapper (extend [`scripts/gen-reference.sh`](../../scripts/gen-reference.sh) or a
-  sibling script) that writes the file in Docker on the pinned PG version.
-- [ ] CI **staleness gate** for the index (regenerate, fail on diff) — mirror the existing
-  "Reference up to date" job in `.github/workflows/docs.yml`.
-- [ ] Wire RFC §6 to link `subsystem-map.md` and §8 to document the tag convention + the two
-  gates (point §8 at this plan or inline the convention).
-- [ ] **Exit:** all CI green, including the new index-staleness gate; the RFC's §6/§8
+- [x] A `pg_temp` generator ([`scripts/gen_subsystem_map.sql`](../../scripts/gen_subsystem_map.sql),
+  modelled on [`scripts/gen_reference.sql`](../../scripts/gen_reference.sql)) emitting
+  `docs/reference/subsystem-map.md`: grouped **by subsystem**, listing each member object
+  (the siblings). Each object links **down** to its reference entry (anchors reconstruct the
+  exact reference headings, slugified with check-links.py's algorithm); each subsystem
+  heading links **up** to its RFC §5 anchor. Deterministic ordering (ORDER BY everywhere).
+  The flat object → subsystem index was dropped as redundant (the grouped view already gives
+  home + siblings).
+- [x] A sibling wrapper ([`scripts/gen-subsystem-map.sh`](../../scripts/gen-subsystem-map.sh))
+  that writes the file in Docker on the pinned PG version.
+- [x] CI **staleness gate** (`Subsystem map up to date`) for the index (regenerate, fail on
+  diff) in `.github/workflows/docs.yml` — mirrors the existing "Reference up to date" job.
+  No new pgTAP: PR 2 touches no `install.sql`, and the map is purely catalog-derived.
+- [x] Wired RFC §6 to link `subsystem-map.md` (dropped "to build") and §8 to document the
+  tag convention + both gates (exhaustiveness + staleness), pointing at this plan.
+- [x] **Exit:** all CI green, including the new index-staleness gate; the RFC's §6/§8
   describe and link the generated bottom-up navigation.
 
 ## Scope boundary

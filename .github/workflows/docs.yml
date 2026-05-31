@@ -29,6 +29,28 @@ jobs:
           fi
           echo "docs/reference is up to date with the installed schema."
 
+  subsystem-map-up-to-date:
+    name: Subsystem map up to date
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Regenerate the subsystem map
+        run: ./scripts/gen-subsystem-map.sh
+
+      - name: Fail if the subsystem map drifted from the schema
+        run: |
+          if ! git diff --quiet -- docs/reference/subsystem-map.md; then
+            echo "::error::docs/reference/subsystem-map.md is stale. Run scripts/gen-subsystem-map.sh and commit the result."
+            git --no-pager diff -- docs/reference/subsystem-map.md
+            exit 1
+          fi
+          echo "docs/reference/subsystem-map.md is up to date with the installed schema."
+
   doctests:
     name: Doctests
     runs-on: ubuntu-latest
