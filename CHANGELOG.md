@@ -220,6 +220,24 @@ section in the same pull request as your change (this is a convention, not a CI 
   decision/actuation path stays clean under the P3 drift gate. `advisory_only` stays `true`
   by default — flipping it to live operation is F7.
 
+- **Governor self-protection Phase 1.7 — F5 (control-oscillation detection).** The governor
+  now detects when it is fighting itself. A new `_oscillating_relations()` detector reads
+  `action_history` (applied changes only) and, per relation, counts **direction reversals**
+  in the applied scale-factor sequence within a born-governed window — flapping is a *safety*
+  failure (appendix F), not a tuning question. Two registry parameters: `oscillation_window`
+  (default 1 day) and `oscillation_min_reversals` (default 2 — a full up-down-up flap).
+  `governor_metrics` gains an `oscillating_relations` count, and `evaluate_health()` gains an
+  oscillation signal that trips **`diagnostic`** — so the F4 authority gate suspends actuation
+  **cluster-wide**, preferring inaction to a self-amplifying control loop. `plan()` now also
+  runs `_reconcile_oscillation()`, which raises one **`critical`** `control_oscillation`
+  finding per flapping relation in `active_diagnostics` (appendix F "operator visibility") and
+  auto-resolves it once the flap ages out — recovery is automatic, since the diagnostic
+  suspension means no new changes are recorded. The existing saturation reconciler is scoped
+  **not** to touch the `control_oscillation` class, so the finding is one stable alert, not a
+  per-cycle churn. All thresholds flow through the registry, so the new control functions stay
+  clean under the P3 drift gate (which scans them automatically). The `diagnostics` table now
+  carries governor-scope findings alongside per-relation saturation causes.
+
 ### Changed
 
 - **`docs/` is now the self-contained, as-built spec.** The hand-written guides no
