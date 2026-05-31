@@ -294,6 +294,7 @@ DECLARE
     v_effa    double precision := pgfc_govern._param('ewma_effa')::double precision;  -- effectiveness/peak EWMA weight
     v_k       integer          := pgfc_govern._param('saturation_persistence_k')::integer;  -- cycles a cause must persist
     v_eff_low double precision := pgfc_govern._param('eff_low')::double precision;    -- effectiveness below = ineffective
+    v_av_window interval        := pgfc_govern._param('av_running_window')::interval;  -- "autovacuum recently ran" window
     n      integer;
 BEGIN
     INSERT INTO pgfc_govern.relation_estimate AS re (
@@ -399,7 +400,7 @@ BEGIN
     sat AS (   -- third pass: saturation discriminator + streak (needs effectiveness)
         SELECT *,
             (last_autovacuum IS NOT NULL
-             AND last_autovacuum > collected_at - interval '1 hour')   AS av_running,
+             AND last_autovacuum > collected_at - v_av_window)         AS av_running,
             (COALESCE(vacuum_debt_ratio, 0) > 1)                       AS debt_high,
             (COALESCE(effectiveness, 1) < v_eff_low)                   AS eff_low,
             (oldest_xmin_owner IS NOT NULL AND oldest_xmin_owner <> 'none') AS horizon_pinned
@@ -1275,6 +1276,9 @@ VALUES
   ('eff_low', 'empirical_default', '0.5', 'fraction',
    'Cleanup-effectiveness below which a vacuum that ran is treated as ineffective (saturation discriminator).',
    'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('av_running_window', 'empirical_default', '1 hour', 'interval',
+   'How recently autovacuum must have run for a relation to count as "autovacuum is running" (the config vs io_limited saturation discriminator).',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
   ('target_queue', 'empirical_default', '0.05', 'fraction',
    'Target dead-tuple fraction for the queue class (before aggressiveness scaling).',
    'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
@@ -1350,6 +1354,77 @@ CREATE OR REPLACE VIEW pgfc_govern.parameter_registry AS
     FROM pgfc_govern._parameter_registry() r;
 COMMENT ON VIEW pgfc_govern.parameter_registry IS
   'Unified, operator-facing parameter registry (Phase 1.6 P1): every governed constant across both schemas with category and provenance.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Drift gate  (Phase 1.6 — parameter governance, P3)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Makes the single-sourcing ENFORCED, not merely real: scans the BODIES of the
+-- decision/actuation path and returns any numeric or interval literal that is not a
+-- structural constant — i.e. an unregistered control value. A pgTAP test asserts this
+-- returns zero rows, so it rides the all-versions test gate; operators can also call it
+-- to audit. Bodies are pulled by function NAME from the catalog (pg_proc.prosrc /
+-- pg_get_viewdef), not by line position, so the check cannot rot as the file changes.
+-- Intervals/quantities are scanned as a first-class category (most control windows are
+-- intervals; stripping strings would blind the gate to exactly the literal it exists to
+-- catch). A quoted string that BEGINS with a digit is a quantity ('1 hour', '100ms',
+-- '180 days'); prose strings ('... (Phase 3).') are not, so they don't false-positive.
+-- Bare code numerics are scanned only after all string literals are removed.
+--
+-- SCOPE — what this enforces vs what is documented-only:
+--   ENFORCED: every pgfc_govern function by default (fail-closed — see the exclusion set
+--     in the query), plus governor_status's target computation. So the control path
+--     (estimate, classify, plan, snap_sf, _findings, _reconcile_diagnostics, apply,
+--     observe_tick, control_tick, verify) and any control function added later are scanned
+--     automatically; every governed value there must come through the accessors.
+--   DOCUMENTED but NOT gate-enforced (excluded; may still drift from the registry — a
+--     later call): retain()/degrade() (operator retention orchestration; their signature
+--     DEFAULTs aren't in prosrc anyway), the policy table-column DEFAULTs, and
+--     catalog_health's reporting-window intervals — operator-policy / reporting, not
+--     values the governor steers with.
+-- Allowlist is intentionally tiny ({0,1,0.0,1.0}); a new entry needs a one-line reason.
+CREATE OR REPLACE FUNCTION pgfc_govern._audit_control_literals()
+RETURNS TABLE(object_name text, literal text)
+LANGUAGE sql STABLE AS $fn$
+WITH bodies AS (
+    SELECT p.proname::text AS object_name,
+           regexp_replace(p.prosrc, '--.*', '', 'gn') AS body   -- strip line comments
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'pgfc_govern'
+      AND p.prokind = 'f'
+      -- FAIL-CLOSED: scan every govern function by default, so a NEW control function
+      -- (Phase 2 actuators, the bloat brake, circuit breakers, …) is enforced
+      -- automatically — born governed — without anyone remembering to list it. The
+      -- exclusion set is small and explicit:
+      AND p.proname NOT IN (
+          '_parameter_registry',      -- the registry itself (its literals ARE the data)
+          '_audit_control_literals',  -- this auditor (its allowlist/regex are literals)
+          'degrade', 'retain',        -- operator retention orchestration (documented, not enforced)
+          'storage_budget',           -- reporting
+          '_log_policy_change')       -- audit-trigger plumbing
+    UNION ALL
+    SELECT 'governor_status',
+           regexp_replace(pg_get_viewdef('pgfc_govern.governor_status'::regclass),
+                          '--.*', '', 'gn')
+),
+quoted AS (   -- quoted strings that begin with a digit = quantity/interval literals
+    SELECT b.object_name, m[1] AS literal
+    FROM bodies b,
+         regexp_matches(b.body, '(''[0-9][^'']*'')', 'g') AS m
+),
+bare AS (      -- bare code numerics, after removing ALL string literals (so prose digits
+               -- like "(Phase 3)" cannot false-positive)
+    SELECT s.object_name, m[1] AS literal
+    FROM (SELECT object_name, regexp_replace(body, '''[^'']*''', '', 'g') AS body
+          FROM bodies) s,
+         regexp_matches(s.body, '(\y[0-9]+\.?[0-9]*\y)', 'g') AS m
+)
+SELECT object_name, literal
+FROM (SELECT * FROM quoted UNION ALL SELECT * FROM bare) u
+WHERE literal NOT IN ('0', '1', '0.0', '1.0')   -- structural-only allowlist
+ORDER BY object_name, literal;
+$fn$;
+COMMENT ON FUNCTION pgfc_govern._audit_control_literals() IS
+  'Drift gate (Phase 1.6 P3): returns unregistered numeric/interval literals in the decision/actuation path. A pgTAP test asserts it is empty; non-empty means a control value escaped the registry.';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Additive upgrades
