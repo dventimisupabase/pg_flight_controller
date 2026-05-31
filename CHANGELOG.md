@@ -126,6 +126,24 @@ section in the same pull request as your change (this is a convention, not a CI 
   pin concrete outcomes. The registry/code tie is now real but not yet *enforced*; the
   "registry up to date" CI gate that makes divergence impossible lands in P3.
 
+- **Parameter governance Phase 1.6 — P3 (drift gate).** The single-sourcing is now
+  **enforced**. A new `pgfc_govern._audit_control_literals()` returns any numeric or interval
+  literal that is not a structural constant (`0`/`1`/`0.0`/`1.0`) in the governor's control
+  functions, and a pgTAP test asserts it is empty — so an inline magic number fails the build
+  on every PostgreSQL version. It is **fail-closed**: it scans *every* `pgfc_govern` function
+  by default (minus a small, documented exclusion set — the registry itself, this auditor,
+  the operator-retention `retain`/`degrade`, reporting `storage_budget`, and the
+  `_log_policy_change` trigger) plus `governor_status`, so a control function added in a later
+  phase is enforced automatically — born governed — without anyone remembering to list it.
+  Function bodies are pulled by name from the catalog (`pg_proc.prosrc` / `pg_get_viewdef`),
+  not by line position, so the check cannot rot; intervals/quantities are scanned first-class
+  (a quoted string beginning with a digit), while prose like "(Phase 3)" does not
+  false-positive. Building it red-first surfaced one straggler P2 missed — the `interval
+  '1 hour'` "autovacuum recently ran" window in `estimate()` — now registered as
+  `av_running_window` and read via `_param`. **Not gate-enforced** (documented in the registry
+  but may still drift): the excluded functions' `retain()`/`degrade()` signature defaults, the
+  `policy` table-column defaults, and `catalog_health`'s reporting windows.
+
 ### Changed
 
 - **`docs/` is now the self-contained, as-built spec.** The hand-written guides no

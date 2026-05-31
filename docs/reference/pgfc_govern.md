@@ -249,6 +249,10 @@ One-row whole-governor self-health (S6): total bytes + dead tuples across both s
 
 ## Functions
 
+### `pgfc_govern._audit_control_literals() → TABLE(object_name text, literal text)`
+
+Drift gate (Phase 1.6 P3): returns unregistered numeric/interval literals in the decision/actuation path. A pgTAP test asserts it is empty; non-empty means a control value escaped the registry.
+
 ### `pgfc_govern._class_target(p_kind text) → double precision`
 
 Base (pre-aggressiveness) target dead-tuple fraction for a workload class, read from the registry (Phase 1.6 P2).
