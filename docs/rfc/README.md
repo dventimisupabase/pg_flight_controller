@@ -31,10 +31,10 @@ next finer level, **→** is a cross-link (a see-also or a consumer). The finest
 per-object documentation — is the generated [reference](#6-components-and-code-the-leaf-level),
 linked rather than copied.
 
-> **Outline status.** Sections 1–4 are skeletons to be written. Section 5 (subsystems) is
-> seeded from the confirmed object taxonomy — every database object has a home — but the
-> per-subsystem prose, rationale, and "feedback wanted" are still to be filled. Sections
-> 6–9 describe conventions now and fill in as the body lands.
+> **Outline status.** Sections 1, 2, and 4 are skeletons; **§3 Architecture is drafted**.
+> Section 5 (subsystems) is seeded from the confirmed object taxonomy — every database
+> object has a home — but the per-subsystem prose, rationale, and "feedback wanted" are
+> still to be filled. Sections 6–9 describe conventions now and fill in as the body lands.
 
 ## Contents
 
@@ -79,17 +79,122 @@ the full as-built explanation rather than restating it.
 
 ## 3. Architecture
 
-*(Outline.)* The shape of the system:
+pg_flight_controller is an **outer control loop wrapped around PostgreSQL's autovacuum**.
+It never runs `VACUUM` itself; it moves the per-table setpoints that decide *when*
+autovacuum fires, holding each table near a policy-defined outcome. The architecture falls
+out of one commitment: an autonomous actuator on a live production catalog must be **safe
+and explainable before it is effective**. So the system is split so that *seeing* is
+separate from *acting*, *acting* is off by default, and *acting* is gated by the governor's
+assessment of its own health.
 
-- **Two modules**, split by role: `pgfc_observe` (Observe + Orient, read-only) and
-  `pgfc_govern` (Decide + Act). The boundary — govern reads observe cross-schema and never
-  writes it.
-- The **two cadences**: a fast observe loop and a slower control loop, and why observing
-  often does not mean acting often.
-- **Cross-cutting patterns** worth naming once: a parameter registry, a storage /
-  self-maintenance subsystem, and a `self_health` surface appear in *both* modules
-  (mirrored — distinct objects, same role).
-- Where **active control** and the **self-protection net** sit relative to the loop.
+### 3.1 Two modules, one boundary
+
+The system is two PostgreSQL extensions, each owning a schema, split by role:
+
+- **`pgfc_observe`** (Observe + Orient) — read-only telemetry. It samples
+  autovacuum-relevant state and derives meaning, and it **writes only its own schema and
+  never changes a database setting**. It stands alone as an autovacuum-health monitor, with
+  no dependency on govern.
+- **`pgfc_govern`** (Decide + Act) — the control loop. It **reads `pgfc_observe`
+  cross-schema, read-only**, and is the *only* component that ever mutates anything (an
+  `ALTER TABLE` on a relation's autovacuum reloptions) — and only when active control is
+  enabled.
+
+The boundary is a one-way dependency: govern depends on observe; observe knows nothing of
+govern. That separation is load-bearing, not cosmetic — the risky half can be reasoned
+about, tested, and gated independently, and the safe half can be run on its own.
+(↳ [Modules](#4-modules) details each side.)
+
+### 3.2 The control loop and its two cadences
+
+The loop is the OODA cycle — **observe → orient → decide → act** — closed by a verify step.
+It runs as **two independent cadences**, not one:
+
+- **Fast loop — `observe_tick` (~1 min):** `observe()` → `classify()` → `estimate()`.
+  Read-only; refreshes the picture and the per-relation hidden-state estimates. Never
+  actuates.
+- **Control loop — `control_tick` (~5 min):** `plan()` → `apply()` (only when not advisory)
+  → `verify()`. The only path that can mutate.
+
+Decoupling the cadences is deliberate: **observing often is cheap and safe; acting often is
+neither.** Frequent sampling keeps estimates fresh and lets diagnosis converge, while
+actuation stays rare, rate-limited, and blast-radius-bounded. The two loops meet at one
+contract — the control loop plans against the **newest snapshot whose estimate phase has
+completed**, never merely the newest observed one, so it cannot act on fresh observations
+paired with stale hidden state. In production both loops are driven by `pg_cron`; the
+control loop takes an advisory lock so cycles never overlap.
+(→ [G1 Control loop](#g1-control-loop-ooda).)
+
+### 3.3 Data flow
+
+```text
+            pg_stat_* views · pg_class · xmin/freeze horizons
+                              │  (read-only)
+                              ▼
+  pgfc_observe   observe() ──▶ snapshots / relation_samples ──▶ rollups
+  (Observe+Orient)            (sparse writes; relation_last_state cache)
+                              │
+                              │  cross-schema, read-only
+                              ▼
+  pgfc_govern    classify ─▶ estimate ─▶ plan ─▶ [self-protection gate] ─▶ apply ─▶ verify
+  (Decide+Act)    (class)    (hidden     (decision_log)                    (ALTER TABLE;
+                              state)                                        action_history)
+                              │                                                  │
+                              ├─▶ diagnostics  (diagnose, don't escalate)        │
+                              └──────────────── audit + retention ◀──────────────┘
+```
+
+The catalog and statistics views are the only inputs. Observation lands in partitioned,
+sparsely-written telemetry (with rollups for long-range history); govern reads that
+telemetry to classify each relation, estimate its hidden maintenance state, decide a
+setpoint, and — under active control — apply it, recording every action for explanation and
+rollback.
+
+### 3.4 Advisory by default; active control under the self-protection net
+
+Two architectural facts set the risk posture:
+
+- **Advisory by default.** With the default policy the whole loop runs and writes a complete
+  decision and diagnostic trail, but `apply()` never fires — nothing changes. The resting
+  state is *recommend and diagnose*. Going live is the single supported `advisory_only =
+  false` flip.
+- **Self-protection gates the Act stage.** Between Decide and Act sits the governor's
+  assessment of its **own** health: `evaluate_health()` derives a health state from
+  self-monitoring metrics, and `apply()` consults it as an authority gate — refusing or
+  limiting actuation when the governor is degraded, when circuit breakers trip, when it
+  detects itself oscillating, or under database stress (load shedding). A three-tier
+  mutation budget caps blast radius. The principle: *the governor must govern itself before
+  it governs PostgreSQL.* (→ [G4 Self-protection](#g4-self-protection-f1-f7); the apply path
+  is the subject of fortification [Phase 1](../fortification/01-security-correctness-apply.md).)
+
+### 3.5 Cross-cutting patterns
+
+Three concerns recur in **both** modules — distinct objects, same shape — worth naming once
+here rather than rediscovering per subsystem:
+
+- **Parameter registry.** Tunable thresholds are *born governed*: declared in a typed
+  registry with defaults and provenance, not scattered as literals. Govern adds a **drift
+  gate** that scans the control path for inline numeric literals, so a new knob cannot slip
+  in untyped. (→ [O5](#o5-parameter-registry), [G3](#g3-parameter-governance).)
+- **Storage and self-maintenance.** Each module bounds its **own** footprint — observe by
+  partition rotation and rollups, govern by time-cutoff audit pruning and graceful degrade —
+  and reports through a `self_health` view and a `storage_budget`. The governor must not
+  become its own maintenance burden. (→ [O2](#o2-storage-and-retention),
+  [O4](#o4-self-monitoring-and-budget), [G6](#g6-storage-retention-and-self-maintenance);
+  open question
+  [FMEA-001](../fortification/02-failure-theory.md#fmea-001--partition-recycling-uses-createdrop-not-a-fixed-truncate-ring).)
+- **Self-health surface.** Both modules expose a `self_health` view, for the same reason: an
+  autonomous component should make its own condition observable.
+
+### 3.6 Safety invariants as architectural constraints
+
+Cutting across every subsystem are six invariants the system *holds* rather than re-decides
+per change: never wait on locks; never disable autovacuum; never reduce freeze safety; never
+exceed mutation budgets; never escalate without evidence; every action must be explainable.
+They are not a subsystem — they are constraints the Act stage and the loop are built to
+satisfy, and they are the backbone of the fortification review's traceability.
+(→ [Concepts](#2-concepts-and-principles) for what each means; enforced across
+[G1](#g1-control-loop-ooda) and [G4](#g4-self-protection-f1-f7).)
 
 ↑ [Concepts](#2-concepts-and-principles) · ↳ [Modules](#4-modules)
 
