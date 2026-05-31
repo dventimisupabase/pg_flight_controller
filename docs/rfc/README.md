@@ -677,10 +677,12 @@ source, linked so it cannot drift:
 - Source: [`pgfc_observe/install.sql`](../../pgfc_observe/install.sql),
   [`pgfc_govern/install.sql`](../../pgfc_govern/install.sql).
 
-**Bottom-up navigation (to build):** each object's reference entry will carry its **home
-subsystem** (an up-link) and its **siblings/consumers**, generated from a subsystem tag in
-the object's metadata — so "crawl up from any function" stays honest under the same
-staleness gate as the reference. See [§8](#8-how-this-rfc-is-maintained).
+**Bottom-up navigation:** the [subsystem map](../reference/subsystem-map.md) lets you crawl
+up from any object to its **home subsystem** (an up-link to [§5](#5-subsystems)) and across
+to its **siblings** (the other members of that subsystem). It is generated from a subsystem
+tag in each object's `COMMENT ON`, under the same staleness gate as the reference, so it
+cannot drift. Consumer / cross-edges are not catalog-derivable and stay hand-authored in
+[§5](#5-subsystems); see [§8](#8-how-this-rfc-is-maintained) for the tag convention and gates.
 
 ## 7. Open questions / feedback wanted
 
@@ -698,9 +700,14 @@ The locked methodology decisions:
 - **Single authored document, generated leaves.** This file is the narrative spine
   (sections 1–5); the per-object leaf level links to the generated reference and code
   rather than duplicating them.
-- **Bottom-up navigation is generated.** Subsystem membership is recorded in object
-  metadata; the up/sibling/consumer links are generated and CI-gated for staleness, like
-  the reference.
+- **Bottom-up navigation is generated.** Subsystem membership is recorded in each object's
+  `COMMENT ON` as a trailing `[subsystem:<ID>]` marker (`<ID>` is `O1`-`O5` or `G1`-`G7`).
+  Two CI gates keep this honest: an **exhaustiveness** gate (pgTAP) fails if any in-scope
+  object lacks exactly one valid marker, and a **staleness** gate
+  (`Subsystem map up to date`) regenerates the [subsystem map](../reference/subsystem-map.md)
+  and fails on any diff. The up-link and siblings are generated from the marker; consumer
+  edges remain hand-authored in [§5](#5-subsystems). The full convention and build history
+  are in the [navigation tooling plan](navigation-tooling-plan.md).
 - **Home:** `docs/rfc/` in-repo; a GitHub Discussion is the intended line-by-line
   commenting surface for reviewers.
 
