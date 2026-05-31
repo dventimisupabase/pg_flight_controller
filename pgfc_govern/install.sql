@@ -36,6 +36,23 @@ EXCEPTION WHEN duplicate_object THEN
     NULL;
 END $$;
 
+-- Governor health states (Phase 1.7 F2 — self-protection). Declared in order of
+-- INCREASING caution, so the enum's native ordering means "worst state wins": the
+-- evaluator takes the most cautious state any signal demands, and an operator can only
+-- force MORE caution, never less (F3). Capabilities per state (enforced by the apply()
+-- authority gate in F4, not here): normal = full; degraded = observe/estimate/diagnose +
+-- limited actuation; diagnostic = those, no actuation except permitted safety actions;
+-- emergency = minimal observation + health reporting, no actuation; disabled = nothing
+-- (history preserved). The automatic evaluator ranges normal→emergency; disabled is
+-- operator-forced only (F3).
+DO $$
+BEGIN
+    CREATE TYPE pgfc_govern.governor_health_state AS ENUM
+        ('normal','degraded','diagnostic','emergency','disabled');
+EXCEPTION WHEN duplicate_object THEN
+    NULL;
+END $$;
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Tables
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -228,6 +245,38 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.diagnostics (
 );
 COMMENT ON TABLE pgfc_govern.diagnostics IS
   'When control saturates, the cause + a recommendation, not more DDL.';
+
+-- Governor health state (Phase 1.7 F2). The current self-protection state, computed by
+-- evaluate_health() from the governor_metrics substrate. Enforced singleton (constant-true
+-- PK), mirroring storage_config. The operator-forced override (F3) is an additive column
+-- added later. Seeded once at install; never reset on re-install.
+CREATE TABLE IF NOT EXISTS pgfc_govern.governor_state (
+    singleton    boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    state        pgfc_govern.governor_health_state NOT NULL DEFAULT 'normal',
+    since        timestamptz NOT NULL DEFAULT now(),   -- when the current state was entered
+    reason       text,                                 -- human-readable cause of the state
+    evaluated_at timestamptz                           -- last evaluate_health() run (NULL = never)
+);
+COMMENT ON TABLE pgfc_govern.governor_state IS
+  'Single-row governor health state (Phase 1.7 F2): the current self-protection state computed by evaluate_health(). Advisory in F2; the apply() authority gate consults it in F4.';
+
+INSERT INTO pgfc_govern.governor_state (singleton, reason)
+VALUES (true, 'initialized at install')
+ON CONFLICT (singleton) DO NOTHING;
+
+-- Append-only audit of every health-state change (Phase 1.7 F2). Pruned by retain() like
+-- the other audit tables. triggering_condition captures the metrics snapshot that drove
+-- the transition, so a past escalation can be explained without the metrics being retained.
+CREATE TABLE IF NOT EXISTS pgfc_govern.state_transitions (
+    transition_id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    from_state           pgfc_govern.governor_health_state,   -- NULL only if ever pre-seed
+    to_state             pgfc_govern.governor_health_state NOT NULL,
+    reason               text,
+    triggering_condition jsonb,                               -- governor_metrics at transition
+    transitioned_at      timestamptz NOT NULL DEFAULT now()
+);
+COMMENT ON TABLE pgfc_govern.state_transitions IS
+  'Append-only audit of governor health-state transitions (Phase 1.7 F2): from/to state, reason, and the metrics snapshot that triggered it. Pruned by retain().';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- estimate(): derive hidden state from observe snapshots into relation_estimate
@@ -898,6 +947,12 @@ DECLARE
     v_tick bigint; v_snap bigint; v_adv boolean; v_applied integer := 0; r record;
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('pgfc_govern.control_tick'));  -- no overlap
+
+    -- Govern itself before it governs PostgreSQL: refresh the health state from the
+    -- self-monitoring substrate first (Phase 1.7 F2). Advisory in F2 — recorded, not yet
+    -- gating actuation (the apply() authority gate consults governor_state in F4).
+    PERFORM pgfc_govern.evaluate_health();
+
     SELECT advisory_only INTO v_adv FROM pgfc_govern.policy
       WHERE enabled ORDER BY policy_name LIMIT 1;
     v_adv := COALESCE(v_adv, pgfc_govern._param('advisory_only')::boolean);
@@ -995,11 +1050,15 @@ ORDER BY (severity = 'critical') DESC, detected_at DESC;
 -- Schedule daily with pg_cron, e.g.:
 --   SELECT cron.schedule('pgfc_govern_retain', '17 3 * * *',
 --                        $$ SELECT pgfc_govern.retain() $$);
+-- Drop the prior 4-arg signature so the added keep_transitions arg REPLACES rather than
+-- overloads (two all-defaulted overloads would make retain() ambiguous). Idempotent.
+DROP FUNCTION IF EXISTS pgfc_govern.retain(interval, interval, interval, interval);
 CREATE OR REPLACE FUNCTION pgfc_govern.retain(
     keep_decisions   interval DEFAULT '180 days',
     keep_actions     interval DEFAULT '180 days',
     keep_ticks       interval DEFAULT '180 days',
-    keep_diagnostics interval DEFAULT '365 days')
+    keep_diagnostics interval DEFAULT '365 days',
+    keep_transitions interval DEFAULT '180 days')
 RETURNS TABLE(relation text, deleted bigint)
 LANGUAGE plpgsql AS $fn$
 BEGIN
@@ -1030,10 +1089,16 @@ BEGIN
                WHERE resolved_at IS NOT NULL
                  AND detected_at < now() - keep_diagnostics RETURNING 1)
     SELECT 'diagnostics'::text, count(*) FROM d;
+
+    -- 5. Health-state transition audit (Phase 1.7 F2) — pure audit, prune by cutoff.
+    RETURN QUERY
+    WITH d AS (DELETE FROM pgfc_govern.state_transitions
+               WHERE transitioned_at < now() - keep_transitions RETURNING 1)
+    SELECT 'state_transitions'::text, count(*) FROM d;
 END;
 $fn$;
-COMMENT ON FUNCTION pgfc_govern.retain(interval, interval, interval, interval) IS
-  'Prune audit tables by time cutoff (decisions/actions 180d, ticks 180d, resolved diagnostics 365d); policy_history is never pruned. Returns per-table delete counts.';
+COMMENT ON FUNCTION pgfc_govern.retain(interval, interval, interval, interval, interval) IS
+  'Prune audit tables by time cutoff (decisions/actions 180d, ticks 180d, resolved diagnostics 365d, state transitions 180d); policy_history is never pruned. Returns per-table delete counts.';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Storage budget + self-health + graceful degrade  (Phase 1.5 S6)
@@ -1340,6 +1405,27 @@ VALUES
   ('keep_diagnostics_days', 'operator_policy', '365', 'days',
    'Default retention for resolved diagnostics.',
    'MVP estimate — not yet benchmarked', 'operator', true, 'retain() argument'),
+  ('keep_transitions_days', 'operator_policy', '180', 'days',
+   'Default retention for the health-state transition audit (Phase 1.7 F2).',
+   'MVP estimate — not yet benchmarked', 'operator', true, 'retain() argument'),
+  -- Governor health-state thresholds (Phase 1.7 F2 — self-protection). The transition
+  -- bounds the evaluator compares the governor_metrics substrate against; born governed
+  -- so the state machine has no inline magic numbers (the payoff of sequencing 1.6 first).
+  ('health_lag_degraded_secs', 'empirical_default', '600', 'seconds',
+   'Observation lag (newest snapshot age) above which the governor is degraded — telemetry is going stale.',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('health_lag_emergency_secs', 'empirical_default', '3600', 'seconds',
+   'Observation lag above which the governor is in emergency — it is effectively flying blind.',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('health_failed_degraded', 'empirical_default', '3', 'failed actions/hour',
+   'Failed actuation attempts in the last hour above which the governor is degraded.',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('health_failed_diagnostic', 'empirical_default', '10', 'failed actions/hour',
+   'Failed actuation attempts in the last hour above which the governor enters diagnostic.',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('health_lock_timeouts_diagnostic', 'empirical_default', '10', 'lock timeouts/hour',
+   'Lock-timeout failures in the last hour above which the governor enters diagnostic (cannot acquire locks to act).',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
   -- Implementation convenience
   ('govern_av_threshold', 'implementation_convenience', '200', 'rows',
    'Static autovacuum threshold on the govern audit/state tables (scale_factor 0).',
@@ -1594,3 +1680,79 @@ SELECT
     (SELECT min(applied_at) FROM pgfc_govern.action_history)                AS oldest_action_at;
 COMMENT ON VIEW pgfc_govern.governor_metrics IS
   'One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-state evaluator: applied/failed/lock-timeout action counts over 1h/1d windows, observation lag (newest snapshot age), loop durations + tick errors (tick_log), the self-health storage footprint, and the oldest retained audit row (retention backlog). Always returns one row; counts are 0 and freshness signals NULL when nothing has happened yet.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Health-state machine  (Phase 1.7 F2 — governor self-protection)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Compute the current health state from the F1 governor_metrics substrate against the
+-- born-governed transition thresholds, write the singleton governor_state, and record a
+-- state_transitions row ONLY when the state actually changes. Advisory in F2: it does not
+-- gate actuation (the apply() authority gate consults governor_state in F4).
+--
+-- Each signal contributes a candidate (state, reason); the WORST state wins via the enum's
+-- native ordering (ORDER BY state DESC). A signal that is within bounds contributes a
+-- 'normal' candidate with a NULL reason, so the baseline "all within bounds" reason is
+-- chosen only when nothing is elevated (reason-IS-NULL sorts last). Absence of data is NOT
+-- ill health: NULL observation_lag (no snapshots yet — boot) yields normal, not emergency.
+-- All thresholds come through _param() — no inline magic numbers — so this control function
+-- stays clean under the P3 drift gate. The automatic range is normal→emergency; 'disabled'
+-- is operator-forced only (F3).
+CREATE OR REPLACE FUNCTION pgfc_govern.evaluate_health()
+RETURNS pgfc_govern.governor_health_state
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    m          record;
+    v_lag      numeric;
+    v_current  pgfc_govern.governor_health_state;
+    v_computed pgfc_govern.governor_health_state;
+    v_reason   text;
+BEGIN
+    SELECT * INTO m FROM pgfc_govern.governor_metrics;     -- guaranteed one row (F1)
+    v_lag := EXTRACT(EPOCH FROM m.observation_lag);        -- NULL when nothing observed yet
+
+    SELECT c.state, c.reason INTO v_computed, v_reason
+    FROM (VALUES
+        -- baseline: healthiest, always present, only wins when nothing is elevated
+        ('normal'::pgfc_govern.governor_health_state,
+         'all self-monitoring signals within bounds'::text),
+        -- stale observation: the governor is losing sight of the database
+        (CASE WHEN v_lag > pgfc_govern._param('health_lag_emergency_secs')::numeric THEN 'emergency'
+              WHEN v_lag > pgfc_govern._param('health_lag_degraded_secs')::numeric  THEN 'degraded'
+              ELSE 'normal' END::pgfc_govern.governor_health_state,
+         CASE WHEN v_lag > pgfc_govern._param('health_lag_degraded_secs')::numeric
+              THEN format('observation lag %ss — telemetry is stale', round(v_lag)) END),
+        -- repeated actuation failures: a circuit-breaker precursor
+        (CASE WHEN m.failed_actions_last_hour > pgfc_govern._param('health_failed_diagnostic')::bigint THEN 'diagnostic'
+              WHEN m.failed_actions_last_hour > pgfc_govern._param('health_failed_degraded')::bigint   THEN 'degraded'
+              ELSE 'normal' END::pgfc_govern.governor_health_state,
+         CASE WHEN m.failed_actions_last_hour > pgfc_govern._param('health_failed_degraded')::bigint
+              THEN format('%s failed actions in the last hour', m.failed_actions_last_hour) END),
+        -- lock-timeout storm: cannot acquire locks to act
+        (CASE WHEN m.lock_timeouts_last_hour > pgfc_govern._param('health_lock_timeouts_diagnostic')::bigint
+              THEN 'diagnostic' ELSE 'normal' END::pgfc_govern.governor_health_state,
+         CASE WHEN m.lock_timeouts_last_hour > pgfc_govern._param('health_lock_timeouts_diagnostic')::bigint
+              THEN format('%s lock timeouts in the last hour', m.lock_timeouts_last_hour) END),
+        -- storage pressure: the governor is over its own footprint budget
+        (CASE WHEN m.over_budget THEN 'degraded' ELSE 'normal' END::pgfc_govern.governor_health_state,
+         CASE WHEN m.over_budget THEN 'governor storage footprint over budget' END)
+    ) AS c(state, reason)
+    ORDER BY c.state DESC, (c.reason IS NULL)              -- worst state; non-null reason wins ties
+    LIMIT 1;
+
+    SELECT state INTO v_current FROM pgfc_govern.governor_state;
+
+    IF v_computed IS DISTINCT FROM v_current THEN
+        INSERT INTO pgfc_govern.state_transitions (from_state, to_state, reason, triggering_condition)
+        VALUES (v_current, v_computed, v_reason, to_jsonb(m));
+        UPDATE pgfc_govern.governor_state
+           SET state = v_computed, since = now(), reason = v_reason, evaluated_at = now();
+    ELSE
+        UPDATE pgfc_govern.governor_state
+           SET reason = v_reason, evaluated_at = now();    -- refresh reason/timestamp, no transition
+    END IF;
+
+    RETURN v_computed;
+END
+$fn$;
+COMMENT ON FUNCTION pgfc_govern.evaluate_health() IS
+  'Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds; write governor_state and record a state_transitions row on change. Advisory — does not gate actuation (that is the F4 authority gate). Returns the computed state.';

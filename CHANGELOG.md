@@ -169,6 +169,23 @@ section in the same pull request as your change (this is a convention, not a CI 
   The action-count columns deliberately overlap the operator-facing `catalog_health`; the
   reporting-window literals are the same out-of-scope convention (not in the drift gate).
 
+- **Governor self-protection Phase 1.7 — F2 (health-state machine).** The governor now
+  computes its own health state. New `governor_health_state` enum
+  (`normal → degraded → diagnostic → emergency → disabled`, ordered by increasing caution),
+  a single-row `governor_state` table (the current state), and an append-only
+  `state_transitions` audit. `evaluate_health()` derives the state from the F1
+  `governor_metrics` substrate against **born-governed** registry thresholds
+  (`health_lag_degraded_secs`/`_emergency_secs`, `health_failed_degraded`/`_diagnostic`,
+  `health_lock_timeouts_diagnostic`), takes the **worst** state any signal demands, and
+  records a transition **only when the state changes**. Signals: stale observation lag →
+  degraded/emergency, failed actions/hour → degraded/diagnostic, lock-timeout storm →
+  diagnostic, over-budget storage → degraded. Wired into `control_tick()` as the first
+  self-check step. **Advisory in F2** — the state is recorded and surfaced but does not yet
+  gate actuation (the `apply()` authority gate consults it in F4); `disabled` is reserved
+  for the operator-forced override (F3). Absence of data is not ill health: a fresh
+  governor with no observations evaluates to `normal`, not `emergency`. `retain()` gains a
+  `keep_transitions` window (default 180 d) and prunes `state_transitions`.
+
 ### Changed
 
 - **`docs/` is now the self-contained, as-built spec.** The hand-written guides no
