@@ -40,7 +40,7 @@ RETURNS integer LANGUAGE sql STABLE AS $$
     SELECT floor(extract(epoch FROM ts) / 86400)::integer
 $$;
 COMMENT ON FUNCTION pgfc_observe._epoch_day(timestamptz) IS
-  'Whole UTC days since 1970-01-01 — the int4 daily RANGE partition key.';
+  'Whole UTC days since 1970-01-01 — the int4 daily RANGE partition key. [subsystem:O2]';
 
 -- Epoch month = whole calendar months since 1970-01 UTC, as a single monotonic int4
 -- (year*12 + month-1, rebased to 1970). The coarse rollup tiers (1h, 1d) are partitioned
@@ -54,7 +54,7 @@ RETURNS integer LANGUAGE sql STABLE AS $$
          + (extract(month FROM (ts AT TIME ZONE 'UTC'))::int - 1)
 $$;
 COMMENT ON FUNCTION pgfc_observe._epoch_month(timestamptz) IS
-  'Whole UTC calendar months since 1970-01 — the int4 monthly RANGE partition key for coarse rollups.';
+  'Whole UTC calendar months since 1970-01 — the int4 monthly RANGE partition key for coarse rollups. [subsystem:O2]';
 
 -- Inverse of _epoch_month: the UTC instant at the start of epoch-month k. Used to decode a
 -- monthly partition''s int key back to its [start, end) range and to name the partition.
@@ -63,7 +63,7 @@ RETURNS timestamptz LANGUAGE sql STABLE AS $$
     SELECT make_timestamptz(1970 + (k / 12), (k % 12) + 1, 1, 0, 0, 0, 'UTC')
 $$;
 COMMENT ON FUNCTION pgfc_observe._month_start(integer) IS
-  'UTC instant at the start of epoch-month k (inverse of _epoch_month).';
+  'UTC instant at the start of epoch-month k (inverse of _epoch_month). [subsystem:O2]';
 
 -- Static autovacuum reloptions for the partitioned telemetry tables (S6). The
 -- governor maintains its own schema with EXPLICIT, STATIC settings — it must not
@@ -83,7 +83,7 @@ RETURNS text IMMUTABLE LANGUAGE sql AS $$
          || 'autovacuum_vacuum_insert_scale_factor=0, autovacuum_vacuum_insert_threshold=1000'
 $$;
 COMMENT ON FUNCTION pgfc_observe._telemetry_reloptions() IS
-  'Static autovacuum reloptions string applied to every telemetry/rollup partition (S6).';
+  'Static autovacuum reloptions string applied to every telemetry/rollup partition (S6). [subsystem:O2]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Destructive recreate  (Phase 1.5 S2 — one-time; see header)
@@ -157,7 +157,7 @@ CREATE TABLE IF NOT EXISTS pgfc_observe.snapshots (
     PRIMARY KEY (collected_day, snapshot_id)
 ) PARTITION BY RANGE (collected_day);
 COMMENT ON TABLE pgfc_observe.snapshots IS
-  'Header row per observe() run: timestamp + cluster/GUC + cluster load signals (client_backends/max_connections — the F6 load-shedding stress input) + pg_class health + xmin horizons. Daily RANGE partitioned on collected_day.';
+  'Header row per observe() run: timestamp + cluster/GUC + cluster load signals (client_backends/max_connections — the F6 load-shedding stress input) + pg_class health + xmin horizons. Daily RANGE partitioned on collected_day. [subsystem:O2]';
 
 -- One row per relation per snapshot. Additive-only: new columns are nullable;
 -- existing columns are never dropped or renamed.
@@ -208,7 +208,7 @@ CREATE TABLE IF NOT EXISTS pgfc_observe.relation_samples (
     PRIMARY KEY (collected_day, snapshot_id, relid)
 ) PARTITION BY RANGE (collected_day);
 COMMENT ON TABLE pgfc_observe.relation_samples IS
-  'Per-relation observed state for one snapshot. reloptions is the governor rollback baseline. Daily RANGE partitioned on collected_day.';
+  'Per-relation observed state for one snapshot. reloptions is the governor rollback baseline. Daily RANGE partitioned on collected_day. [subsystem:O2]';
 
 CREATE INDEX IF NOT EXISTS relation_samples_relid_idx
     ON pgfc_observe.relation_samples (relid, snapshot_id DESC);
@@ -265,7 +265,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS pgfc_observe.relation_last_state (
         autovacuum_vacuum_scale_factor   = 0.0, autovacuum_vacuum_threshold   = 50,
         autovacuum_analyze_scale_factor  = 0.0, autovacuum_analyze_threshold  = 50);
 COMMENT ON TABLE pgfc_observe.relation_last_state IS
-  'UNLOGGED last-observed state per relation: the change-signature cache for sparse logging (S3). Rebuilt from the catalogs after a crash.';
+  'UNLOGGED last-observed state per relation: the change-signature cache for sparse logging (S3). Rebuilt from the catalogs after a crash. [subsystem:O1]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Collection policy — cardinality filters  (Phase 1.5 S5)
@@ -287,7 +287,7 @@ CREATE TABLE IF NOT EXISTS pgfc_observe.collection_policy (
     excluded_schemas          name[]  NOT NULL DEFAULT '{}'
 );
 COMMENT ON TABLE pgfc_observe.collection_policy IS
-  'Single-row cardinality filter config for observe() (S5): which relations are sampled. System schemas are always excluded.';
+  'Single-row cardinality filter config for observe() (S5): which relations are sampled. System schemas are always excluded. [subsystem:O1]';
 COMMENT ON COLUMN pgfc_observe.collection_policy.exclude_temp IS
   'Exclude temporary tables (relpersistence = ''t''). Default true.';
 COMMENT ON COLUMN pgfc_observe.collection_policy.include_extension_owned IS
@@ -353,7 +353,7 @@ CREATE TABLE IF NOT EXISTS pgfc_observe.rollup_1m (
     PRIMARY KEY (bucket_part, bucket_start, relid)
 ) PARTITION BY RANGE (bucket_part);
 COMMENT ON TABLE pgfc_observe.rollup_1m IS
-  'Per-relation 1-minute aggregate of raw samples (S4). Daily RANGE partitioned; ~7-day retention. Averages are sample-count-weighted; counters are end-of-bucket cumulative.';
+  'Per-relation 1-minute aggregate of raw samples (S4). Daily RANGE partitioned; ~7-day retention. Averages are sample-count-weighted; counters are end-of-bucket cumulative. [subsystem:O2]';
 
 -- One row per relation per 1-hour bucket. Monthly RANGE partitioned (~90-day window).
 CREATE TABLE IF NOT EXISTS pgfc_observe.rollup_1h (
@@ -385,7 +385,7 @@ CREATE TABLE IF NOT EXISTS pgfc_observe.rollup_1h (
     PRIMARY KEY (bucket_part, bucket_start, relid)
 ) PARTITION BY RANGE (bucket_part);
 COMMENT ON TABLE pgfc_observe.rollup_1h IS
-  'Per-relation 1-hour aggregate of the 1m tier (S4). Monthly RANGE partitioned; ~90-day retention.';
+  'Per-relation 1-hour aggregate of the 1m tier (S4). Monthly RANGE partitioned; ~90-day retention. [subsystem:O2]';
 
 -- One row per relation per 1-day bucket. Monthly RANGE partitioned (~365-day window).
 CREATE TABLE IF NOT EXISTS pgfc_observe.rollup_1d (
@@ -417,7 +417,7 @@ CREATE TABLE IF NOT EXISTS pgfc_observe.rollup_1d (
     PRIMARY KEY (bucket_part, bucket_start, relid)
 ) PARTITION BY RANGE (bucket_part);
 COMMENT ON TABLE pgfc_observe.rollup_1d IS
-  'Per-relation 1-day aggregate of the 1h tier (S4). Monthly RANGE partitioned; ~365-day retention.';
+  'Per-relation 1-day aggregate of the 1h tier (S4). Monthly RANGE partitioned; ~365-day retention. [subsystem:O2]';
 
 -- BRIN on the partition key (bloat-free range scans on the parent; see the raw tables for
 -- the rationale) and a btree on (relid, bucket_start DESC) backing per-relation trend
@@ -445,7 +445,7 @@ RETURNS text LANGUAGE sql IMMUTABLE AS $$
     WHERE option_name = opt
 $$;
 COMMENT ON FUNCTION pgfc_observe.effective_reloption(text[], text) IS
-  'Value of storage parameter opt in reloptions, or NULL if not explicitly set.';
+  'Value of storage parameter opt in reloptions, or NULL if not explicitly set. [subsystem:O3]';
 
 -- The single observable that explains why vacuum may reclaim nothing: the oldest
 -- xmin data horizon and the oldest catalog horizon, each with the age and owning
@@ -492,7 +492,7 @@ SELECT (SELECT a FROM oldest),
        COALESCE((SELECT slot_name FROM cat), 'none');
 $fn$;
 COMMENT ON FUNCTION pgfc_observe.removability_horizons() IS
-  'Oldest xmin data/catalog removability horizons with attributed owner class.';
+  'Oldest xmin data/catalog removability horizons with attributed owner class. [subsystem:O3]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Partition management  (Phase 1.5 S2)
@@ -529,7 +529,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_observe._ensure_partition(integer) IS
-  'Create the daily partition for p_day (default today) on both telemetry tables if missing; O(1) and race-safe.';
+  'Create the daily partition for p_day (default today) on both telemetry tables if missing; O(1) and race-safe. [subsystem:O2]';
 
 -- One row per existing child partition of the telemetry tables, with its day, decoded
 -- UTC range, estimated row count (pg_class.reltuples), and on-disk size. Backs the GC
@@ -560,7 +560,7 @@ LANGUAGE sql STABLE AS $fn$
     ORDER BY parent, day;
 $fn$;
 COMMENT ON FUNCTION pgfc_observe._partition_inventory() IS
-  'Child partitions of the telemetry tables with day, decoded range, est. rows, and size.';
+  'Child partitions of the telemetry tables with day, decoded range, est. rows, and size. [subsystem:O2]';
 
 -- Generic single-partition ensure used by the rollup job (S4): create the partition of
 -- p_parent covering int key p_key if missing. p_span ('day'|'month') only selects the
@@ -586,7 +586,7 @@ EXCEPTION WHEN duplicate_table THEN NULL;   -- concurrent run created it first
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_observe._ensure_part(text, integer, text) IS
-  'Create the [p_key, p_key+1) RANGE partition of p_parent if missing (p_span day|month names it). Idempotent/race-safe; used by rollup() (S4).';
+  'Create the [p_key, p_key+1) RANGE partition of p_parent if missing (p_span day|month names it). Idempotent/race-safe; used by rollup() (S4). [subsystem:O2]';
 
 -- One row per existing child partition of the three rollup tables, with its int key, span,
 -- decoded UTC range, est. rows, and size. Backs rollup_retain() and operator inspection.
@@ -620,7 +620,7 @@ LANGUAGE sql STABLE AS $fn$
     ORDER BY parent, part_key;
 $fn$;
 COMMENT ON FUNCTION pgfc_observe._rollup_inventory() IS
-  'Child partitions of the rollup tables with int key, span, decoded range, est. rows, and size.';
+  'Child partitions of the rollup tables with int key, span, decoded range, est. rows, and size. [subsystem:O2]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- observe(): collect one snapshot (header + per-relation samples)
@@ -857,7 +857,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_observe.observe() IS
-  'Collect one snapshot: header (always) + per-relation samples for relations that pass collection_policy (S5) and whose observed state changed (sparse change-logging, S3).';
+  'Collect one snapshot: header (always) + per-relation samples for relations that pass collection_policy (S5) and whose observed state changed (sparse change-logging, S3). [subsystem:O1]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Reader reconciliation  (Phase 1.5 S3)
@@ -909,7 +909,7 @@ LANGUAGE sql STABLE AS $fn$
     ORDER BY rs.relid, rs.snapshot_id DESC
 $fn$;
 COMMENT ON FUNCTION pgfc_observe.current_relation_state(bigint) IS
-  'Dense current state per relation as-of a snapshot, reconstructed from sparse storage with live-computed freeze ages (S3).';
+  'Dense current state per relation as-of a snapshot, reconstructed from sparse storage with live-computed freeze ages (S3). [subsystem:O3]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Rollups  (Phase 1.5 S4)
@@ -1027,7 +1027,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_observe.rollup(interval) IS
-  'Cascade raw samples into the 1m/1h/1d rollup tiers (S4). Idempotent (per-PK upsert); run at least once per raw-retention window. Returns rows upserted.';
+  'Cascade raw samples into the 1m/1h/1d rollup tiers (S4). Idempotent (per-PK upsert); run at least once per raw-retention window. Returns rows upserted. [subsystem:O2]';
 
 -- Coarsen one rollup tier into the next (1m→1h, 1h→1d). Aggregates p_src into p_dst on
 -- UTC-aligned p_unit buckets, sample-count-weighting the averages and max-ing the rest, and
@@ -1111,7 +1111,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_observe._rollup_coarsen(text, text, text, interval) IS
-  'Aggregate one rollup tier into the next coarser one on UTC p_unit buckets (sample-count-weighted avgs); upsert into p_dst. Helper for rollup() (S4).';
+  'Aggregate one rollup tier into the next coarser one on UTC p_unit buckets (sample-count-weighted avgs); upsert into p_dst. Helper for rollup() (S4). [subsystem:O2]';
 
 -- Carry-forward reader: the latest known bucket per relation as-of p_as_of in tier p_tier
 -- ('1m'|'1h'|'1d'). Mirrors current_relation_state() over the rollup tiers — sparse
@@ -1157,7 +1157,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_observe.current_rollup(text, timestamptz) IS
-  'Carry-forward latest rollup bucket per relation as-of p_as_of in tier 1m|1h|1d (S4): answers long-range queries after raw rotates away.';
+  'Carry-forward latest rollup bucket per relation as-of p_as_of in tier 1m|1h|1d (S4): answers long-range queries after raw rotates away. [subsystem:O2]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Views (latest sample per relation; human-readable debt)
@@ -1172,6 +1172,8 @@ SELECT rs.relid, rs.schemaname, rs.relname,
        sn.collected_at
 FROM pgfc_observe.current_relation_state() rs
 JOIN pgfc_observe.snapshots sn USING (snapshot_id);
+COMMENT ON VIEW pgfc_observe.relation_health IS
+  'Dense current per-relation health (S3): dead/live tuples, freeze ages, and last-autovacuum from current_relation_state(), stamped with each snapshot''s collected_at. [subsystem:O3]';
 
 -- Target-space quantities (dead/stale fractions) and overdue indicators, using the
 -- effective threshold = explicit reloption (this relation) ?? global default. The
@@ -1210,6 +1212,8 @@ SELECT relid, schemaname, relname,
        (n_mod_since_analyze::float8 / NULLIF(analyze_threshold, 0)) AS analyze_debt_ratio,
        relfrozenxid_age::float8 / NULLIF(def_freeze_max_age, 0)     AS freeze_debt
 FROM eff;
+COMMENT ON VIEW pgfc_observe.maintenance_debt IS
+  'Per-relation autovacuum debt (S3): dead- and stale-tuple fractions plus overdue ratios, measured against the effective threshold (explicit reloption, else the global default) from the latest snapshot. [subsystem:O3]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Storage budget + self-health  (Phase 1.5 S6)
@@ -1246,7 +1250,7 @@ LANGUAGE sql STABLE AS $fn$
     ORDER BY top.relname;
 $fn$;
 COMMENT ON FUNCTION pgfc_observe.storage_budget() IS
-  'Per-logical-relation on-disk bytes + dead tuples for the pgfc_observe schema (S6); child partitions folded into their parent.';
+  'Per-logical-relation on-disk bytes + dead tuples for the pgfc_observe schema (S6); child partitions folded into their parent. [subsystem:O4]';
 
 -- Single-row self-maintenance summary: is the storage model holding? total footprint,
 -- aggregate dead tuples (should be ~0 — rotation, not DELETE), and partition counts /
@@ -1259,7 +1263,7 @@ SELECT
     (SELECT count(*)        FROM pgfc_observe._rollup_inventory())             AS rollup_partitions,
     (SELECT min(range_start) FROM pgfc_observe._partition_inventory())         AS oldest_raw_partition;
 COMMENT ON VIEW pgfc_observe.self_health IS
-  'One-row self-maintenance summary for pgfc_observe (S6): total bytes, aggregate dead tuples, partition counts, oldest raw partition.';
+  'One-row self-maintenance summary for pgfc_observe (S6): total bytes, aggregate dead tuples, partition counts, oldest raw partition. [subsystem:O4]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Parameter registry  (Phase 1.6 — parameter governance, P1)
@@ -1331,7 +1335,7 @@ VALUES
    'MVP estimate — not yet benchmarked', 'operator', true, 'collection_policy.min_partition_size_bytes')
 $fn$;
 COMMENT ON FUNCTION pgfc_observe._parameter_registry() IS
-  'Provenance registry of pgfc_observe governed constants (Phase 1.6) — an inspection/documentation surface. observe has no control-logic literals to single-source; pgfc_govern.parameter_registry unions this into the operator-facing view.';
+  'Provenance registry of pgfc_observe governed constants (Phase 1.6) — an inspection/documentation surface. observe has no control-logic literals to single-source; pgfc_govern.parameter_registry unions this into the operator-facing view. [subsystem:O5]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Retention — two-tier partition GC  (Phase 1.5 S2)
@@ -1372,7 +1376,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_observe.retain(interval) IS
-  'Tier-1 GC: TRUNCATE telemetry partitions older than keep (default 3 days). Returns partitions truncated.';
+  'Tier-1 GC: TRUNCATE telemetry partitions older than keep (default 3 days). Returns partitions truncated. [subsystem:O2]';
 
 -- Tier 2: DROP partitions older than `keep` that are already empty (so a DROP never
 -- destroys live data — a not-yet-truncated old partition is left for retain()).
@@ -1398,7 +1402,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_observe.drop_empty_partitions(interval) IS
-  'Tier-2 GC: DROP empty telemetry partitions older than keep (default 30 days). Returns partitions dropped.';
+  'Tier-2 GC: DROP empty telemetry partitions older than keep (default 30 days). Returns partitions dropped. [subsystem:O2]';
 
 -- Rollup retention (S4): cascading per-tier windows — the finer the tier, the shorter it
 -- lives (1m 7 d, 1h 90 d, 1d 365 d; all overridable). Whole-partition DROP, never row-by-row
@@ -1431,7 +1435,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_observe.rollup_retain(interval, interval, interval) IS
-  'Cascading rollup GC (S4): DROP rollup partitions past their per-tier window (1m 7d / 1h 90d / 1d 365d). Returns partitions dropped.';
+  'Cascading rollup GC (S4): DROP rollup partitions past their per-tier window (1m 7d / 1h 90d / 1d 365d). Returns partitions dropped. [subsystem:O2]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Bootstrap: ensure the current day's partition exists so a fresh install accepts

@@ -35,6 +35,8 @@ BEGIN
 EXCEPTION WHEN duplicate_object THEN
     NULL;
 END $$;
+COMMENT ON TYPE pgfc_govern.relation_kind IS
+  'Workload-class template a relation is assigned to by classify(); selects its desired dead-tuple target. [subsystem:G1]';
 
 -- Governor health states (Phase 1.7 F2 — self-protection). Declared in order of
 -- INCREASING caution, so the enum's native ordering means "worst state wins": the
@@ -52,6 +54,8 @@ BEGIN
 EXCEPTION WHEN duplicate_object THEN
     NULL;
 END $$;
+COMMENT ON TYPE pgfc_govern.governor_health_state IS
+  'Governor self-protection states (Phase 1.7 F2) declared in increasing-caution order, so the enum''s native ordering makes the most cautious state win. [subsystem:G4]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Tables
@@ -76,7 +80,7 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.policy (
     advisory_only      boolean NOT NULL DEFAULT true            -- dry-run gate
 );
 COMMENT ON TABLE pgfc_govern.policy IS
-  'Operator-expressed outcomes. advisory_only=true means plan but never apply.';
+  'Operator-expressed outcomes. advisory_only=true means plan but never apply. [subsystem:G2]';
 COMMENT ON COLUMN pgfc_govern.policy.manage_user_owned IS
   'false: never overwrite a reloption set by a user/other system first; true: take ownership.';
 
@@ -99,7 +103,7 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.policy_history (
     changed_at   timestamptz NOT NULL DEFAULT now()
 );
 COMMENT ON TABLE pgfc_govern.policy_history IS
-  'Append-only audit of policy changes (insert/update/delete); retained indefinitely.';
+  'Append-only audit of policy changes (insert/update/delete); retained indefinitely. [subsystem:G2]';
 
 CREATE OR REPLACE FUNCTION pgfc_govern._log_policy_change()
 RETURNS trigger LANGUAGE plpgsql AS $fn$
@@ -113,7 +117,7 @@ BEGIN
 END;
 $fn$;
 COMMENT ON FUNCTION pgfc_govern._log_policy_change() IS
-  'AFTER row trigger: records every policy insert/update/delete into policy_history.';
+  'AFTER row trigger: records every policy insert/update/delete into policy_history. [subsystem:G2]';
 
 CREATE OR REPLACE TRIGGER policy_history_trg
     AFTER INSERT OR UPDATE OR DELETE ON pgfc_govern.policy
@@ -130,6 +134,8 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.relation_class (
     candidate_streak integer NOT NULL DEFAULT 0,
     classified_at    timestamptz NOT NULL DEFAULT now()
 );
+COMMENT ON TABLE pgfc_govern.relation_class IS
+  'Per-relation workload classification with hysteresis (candidate/streak): the desired-state template feeding plan(). [subsystem:G1]';
 
 -- Derived hidden state (output of estimate()), one row per relation (latest).
 CREATE TABLE IF NOT EXISTS pgfc_govern.relation_estimate (
@@ -159,6 +165,8 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.relation_estimate (
     saturation_streak   integer NOT NULL DEFAULT 0,
     estimated_at        timestamptz NOT NULL DEFAULT now()
 );
+COMMENT ON TABLE pgfc_govern.relation_estimate IS
+  'Latest derived hidden state per relation from estimate(): rates, effectiveness, and saturation diagnosis (one row per relation). [subsystem:G1]';
 
 -- Actuator state: current governor-set value + rollback baseline, per (relation, actuator).
 CREATE TABLE IF NOT EXISTS pgfc_govern.actuator_state (
@@ -171,6 +179,8 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.actuator_state (
     av_count_at_apply  bigint,           -- autovacuum_count when applied (cycle counting)
     PRIMARY KEY (relid, actuator)
 );
+COMMENT ON TABLE pgfc_govern.actuator_state IS
+  'Current governor-set value and rollback baseline per (relation, actuator); baseline_explicit drives SET-vs-RESET on revert. [subsystem:G1]';
 COMMENT ON COLUMN pgfc_govern.actuator_state.baseline_explicit IS
   'Rollback semantics: true => revert with SET to baseline_value; false => RESET.';
 
@@ -194,6 +204,8 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.decision_log (
     applied        boolean NOT NULL DEFAULT false,
     created_at     timestamptz NOT NULL DEFAULT now()
 );
+COMMENT ON TABLE pgfc_govern.decision_log IS
+  'Audit of every control decision (applied or not): observation, prior/desired state, the decision, and proposed value. [subsystem:G1]';
 
 -- Audit: attempted catalog mutations (applied AND failed); revert source of truth.
 CREATE TABLE IF NOT EXISTS pgfc_govern.action_history (
@@ -223,7 +235,7 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.action_history (
     reverted_at    timestamptz
 );
 COMMENT ON TABLE pgfc_govern.action_history IS
-  'Every actuator attempt (applied or failed). revert() replays only status=applied. failed rows carry failure_reason + the F6 failure_class (taxonomy category).';
+  'Every actuator attempt (applied or failed). revert() replays only status=applied. failed rows carry failure_reason + the F6 failure_class (taxonomy category). [subsystem:G1]';
 
 -- Per control-cycle orchestration log.
 CREATE TABLE IF NOT EXISTS pgfc_govern.tick_log (
@@ -236,6 +248,8 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.tick_log (
     n_applied      integer,
     error          text
 );
+COMMENT ON TABLE pgfc_govern.tick_log IS
+  'Per control-cycle orchestration log: snapshot, timing, relation/decision/applied counts, and any error. [subsystem:G1]';
 
 -- Diagnostic findings: saturation root-cause + actionable recommendation.
 CREATE TABLE IF NOT EXISTS pgfc_govern.diagnostics (
@@ -250,7 +264,7 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.diagnostics (
     resolved_at     timestamptz
 );
 COMMENT ON TABLE pgfc_govern.diagnostics IS
-  'Per-relation findings + a recommendation, not more DDL: maintenance-inhibitor / saturation causes, and governor-scope findings such as control oscillation (Phase 1.7 F5).';
+  'Per-relation findings + a recommendation, not more DDL: maintenance-inhibitor / saturation causes, and governor-scope findings such as control oscillation (Phase 1.7 F5). [subsystem:G5]';
 
 -- Governor health state (Phase 1.7 F2). The current self-protection state, computed by
 -- evaluate_health() from the governor_metrics substrate. Enforced singleton (constant-true
@@ -271,7 +285,7 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.governor_state (
     forced_at       timestamptz                           -- when it was placed
 );
 COMMENT ON TABLE pgfc_govern.governor_state IS
-  'Single-row governor health state (Phase 1.7 F2): the current self-protection state computed by evaluate_health(). The operator_forced/forced_* columns hold the F3 human override — a caution floor (force more caution, never less). Advisory; the apply() authority gate consults it in F4.';
+  'Single-row governor health state (Phase 1.7 F2): the current self-protection state computed by evaluate_health(). The operator_forced/forced_* columns hold the F3 human override — a caution floor (force more caution, never less). Advisory; the apply() authority gate consults it in F4. [subsystem:G4]';
 COMMENT ON COLUMN pgfc_govern.governor_state.operator_forced IS
   'Operator-forced health state (Phase 1.7 F3); NULL = fully automatic. evaluate_health() takes the WORST of this and the auto-computed state, so the operator can force more caution but never less. Set via force_state()/disable()/suspend_actuation(); cleared via clear_forced_state().';
 
@@ -291,7 +305,7 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.state_transitions (
     transitioned_at      timestamptz NOT NULL DEFAULT now()
 );
 COMMENT ON TABLE pgfc_govern.state_transitions IS
-  'Append-only audit of governor health-state transitions (Phase 1.7 F2): from/to state, reason, and the metrics snapshot that triggered it. Pruned by retain().';
+  'Append-only audit of governor health-state transitions (Phase 1.7 F2): from/to state, reason, and the metrics snapshot that triggered it. Pruned by retain(). [subsystem:G4]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- estimate(): derive hidden state from observe snapshots into relation_estimate
@@ -309,6 +323,8 @@ RETURNS double precision IMMUTABLE LANGUAGE sql AS $$
         ELSE alpha * sample + (1 - alpha) * prior
     END
 $$;
+COMMENT ON FUNCTION pgfc_govern.ewma(double precision, double precision, double precision) IS
+  'Exponentially-weighted moving average (alpha*sample + (1-alpha)*prior); NULL-safe, seeds on the first sample. [subsystem:G1]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Parameter accessors  (Phase 1.6 — parameter governance, P2)
@@ -333,7 +349,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern._param(text) IS
-  'Read a governed parameter''s value from the registry (Phase 1.6 P2); the control logic single-sources its constants through this.';
+  'Read a governed parameter''s value from the registry (Phase 1.6 P2); the control logic single-sources its constants through this. [subsystem:G3]';
 
 CREATE OR REPLACE FUNCTION pgfc_govern._sf_grid()
 RETURNS double precision[] IMMUTABLE LANGUAGE plpgsql AS $fn$
@@ -342,7 +358,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern._sf_grid() IS
-  'Scale-factor quantization grid, read from the registry (Phase 1.6 P2).';
+  'Scale-factor quantization grid, read from the registry (Phase 1.6 P2). [subsystem:G1]';
 
 CREATE OR REPLACE FUNCTION pgfc_govern._class_target(p_kind text)
 RETURNS double precision IMMUTABLE LANGUAGE plpgsql AS $fn$
@@ -351,7 +367,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern._class_target(text) IS
-  'Base (pre-aggressiveness) target dead-tuple fraction for a workload class, read from the registry (Phase 1.6 P2).';
+  'Base (pre-aggressiveness) target dead-tuple fraction for a workload class, read from the registry (Phase 1.6 P2). [subsystem:G1]';
 
 -- Update relation_estimate for every relation in snapshot p_snapshot_id. Reads
 -- indicators from pgfc_observe.maintenance_debt (no re-derivation of thresholds) and
@@ -525,7 +541,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.estimate(bigint) IS
-  'Derive hidden state (rates, effectiveness, saturation) into relation_estimate.';
+  'Derive hidden state (rates, effectiveness, saturation) into relation_estimate. [subsystem:G1]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- classify(): assign each relation a workload class (with a signal floor + hysteresis)
@@ -638,7 +654,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.classify(bigint) IS
-  'Assign each relation a workload class with a signal floor and N-cycle hysteresis.';
+  'Assign each relation a workload class with a signal floor and N-cycle hysteresis. [subsystem:G1]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- plan(): decide per-relation setpoints (advisory) + reconcile diagnostics
@@ -654,6 +670,8 @@ RETURNS double precision IMMUTABLE LANGUAGE sql AS $$
     SELECT g FROM unnest(pgfc_govern._sf_grid()) AS grid(g)
     ORDER BY abs(g - x) LIMIT 1
 $$;
+COMMENT ON FUNCTION pgfc_govern.snap_sf(double precision) IS
+  'Snap a scale factor to the nearest value on the bounded quantization grid (_sf_grid). [subsystem:G1]';
 
 CREATE OR REPLACE FUNCTION pgfc_govern.plan(p_tick_id bigint, p_snapshot_id bigint)
 RETURNS integer LANGUAGE plpgsql AS $fn$
@@ -758,7 +776,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.plan(bigint, bigint) IS
-  'Advisory: write decision_log per relation (vacuum objective) + reconcile diagnostics (saturation + Phase 1.7 F5 control oscillation).';
+  'Advisory: write decision_log per relation (vacuum objective) + reconcile diagnostics (saturation + Phase 1.7 F5 control oscillation). [subsystem:G1]';
 
 -- Findings worthy of a diagnostic for the relations in a snapshot: (relid, class,
 -- severity, recommendation, evidence). Set-returning so it composes into the
@@ -804,6 +822,8 @@ LANGUAGE sql STABLE AS $fn$
            OR ((re.freeze_debt > pgfc_govern._param('freeze_thr')::double precision OR COALESCE(re.mxid_freeze_debt,0) > pgfc_govern._param('freeze_thr')::double precision)
                AND sn.oldest_xmin_owner <> 'none'));
 $fn$;
+COMMENT ON FUNCTION pgfc_govern._findings(bigint) IS
+  'Set-returning: candidate diagnostic findings for a snapshot''s relations (saturation cause / freeze-pinned horizon) with severity, recommendation, and evidence. [subsystem:G5]';
 
 -- Open a diagnostic per (relid, class) that lacks an unresolved one this cycle, and
 -- resolve open findings whose condition has cleared. Keeps active_diagnostics from
@@ -834,6 +854,8 @@ BEGIN
         WHERE f.relid = d.relid AND f.inhibitor_class IS NOT DISTINCT FROM d.inhibitor_class);
 END
 $fn$;
+COMMENT ON FUNCTION pgfc_govern._reconcile_diagnostics(bigint) IS
+  'Open a diagnostic per (relid, class) lacking an unresolved one this cycle, and resolve findings whose condition cleared (control_oscillation diagnostics excluded — owned by the oscillation reconciler). [subsystem:G5]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- apply(): actuate one relation's approved change (Phase 1: present but only ever
@@ -871,7 +893,7 @@ RETURNS text LANGUAGE sql IMMUTABLE AS $fn$
     END;
 $fn$;
 COMMENT ON FUNCTION pgfc_govern._failure_class(text) IS
-  'Failure taxonomy (Phase 1.7 F6): map a recorded failure_reason to its appendix-F category (observation/decision/actuation/resource/safety). Single source of the mapping; apply() stamps action_history.failure_class through it. IMMUTABLE pure lookup; NULL for an unknown reason.';
+  'Failure taxonomy (Phase 1.7 F6): map a recorded failure_reason to its appendix-F category (observation/decision/actuation/resource/safety). Single source of the mapping; apply() stamps action_history.failure_class through it. IMMUTABLE pure lookup; NULL for an unknown reason. [subsystem:G4]';
 
 CREATE OR REPLACE FUNCTION pgfc_govern.apply(p_tick_id bigint, p_relid oid)
 RETURNS boolean LANGUAGE plpgsql AS $fn$
@@ -1016,7 +1038,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.apply(bigint, oid) IS
-  'Actuate one relation''s approved scale-factor change. Gated by advisory_only (the dry-run switch), then by the Phase 1.7 F4 self-protection layer: the governor health-state authority gate (refuses when diagnostic/emergency/disabled) and the three-tier Invariant-4 mutation budget (per-relation min_interval, per-cycle and per-day cluster caps). A refused attempt returns false silently — never recorded as a failed action.';
+  'Actuate one relation''s approved scale-factor change. Gated by advisory_only (the dry-run switch), then by the Phase 1.7 F4 self-protection layer: the governor health-state authority gate (refuses when diagnostic/emergency/disabled) and the three-tier Invariant-4 mutation budget (per-relation min_interval, per-cycle and per-day cluster caps). A refused attempt returns false silently — never recorded as a failed action. [subsystem:G1]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- verify(): close the loop on past actions. Phase 1 has nothing applied to verify;
@@ -1027,7 +1049,7 @@ RETURNS integer LANGUAGE sql AS $fn$
     SELECT 0;   -- Phase 2: attribute outcomes of earlier applied actions
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.verify(bigint) IS
-  'Close the control loop on past actions (Phase 1: no-op; expanded in Phase 2).';
+  'Close the control loop on past actions (Phase 1: no-op; expanded in Phase 2). [subsystem:G1]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Orchestrators (driven by pg_cron in production; see README)
@@ -1044,6 +1066,8 @@ BEGIN
     RETURN v_snap;
 END
 $fn$;
+COMMENT ON FUNCTION pgfc_govern.observe_tick() IS
+  'Fast loop (~1 min): observe + classify + estimate; never actuates. Returns the new snapshot id. [subsystem:G1]';
 
 -- Control loop (~5 min): plan + (apply, only if not advisory_only) + verify.
 CREATE OR REPLACE FUNCTION pgfc_govern.control_tick()
@@ -1095,7 +1119,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.control_tick() IS
-  'One control cycle: plan, apply (only if not advisory_only), verify.';
+  'One control cycle: plan, apply (only if not advisory_only), verify. [subsystem:G1]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Views
@@ -1124,6 +1148,8 @@ LEFT JOIN LATERAL (
 ) d ON true
 LEFT JOIN pgfc_govern.actuator_state a
        ON a.relid = rc.relid AND a.actuator = 'autovacuum_vacuum_scale_factor';
+COMMENT ON VIEW pgfc_govern.governor_status IS
+  'Per-relation operator view: workload class, target vs observed dead fraction, debt/saturation, last decision, and current scale factor. [subsystem:G7]';
 
 -- Catalog-mutation health: the governor's own DDL footprint + live pg_class state.
 CREATE OR REPLACE VIEW pgfc_govern.catalog_health AS
@@ -1139,6 +1165,8 @@ SELECT
     sn.pg_class_size_bytes, sn.pg_class_n_dead_tup, sn.pg_class_n_live_tup,
     sn.pg_class_last_autovacuum, sn.collected_at
 FROM pgfc_observe.snapshots sn ORDER BY sn.snapshot_id DESC LIMIT 1;
+COMMENT ON VIEW pgfc_govern.catalog_health IS
+  'Catalog-mutation health: the governor''s own DDL footprint (applied/failed counts over 1h/1d) plus the latest snapshot''s live pg_class state. [subsystem:G7]';
 
 -- Unresolved maintenance-inhibitor / saturation findings, critical first.
 CREATE OR REPLACE VIEW pgfc_govern.active_diagnostics AS
@@ -1146,6 +1174,8 @@ SELECT diagnostic_id, detected_at, severity, relid, inhibitor_class, recommendat
 FROM pgfc_govern.diagnostics
 WHERE resolved_at IS NULL
 ORDER BY (severity = 'critical') DESC, detected_at DESC;
+COMMENT ON VIEW pgfc_govern.active_diagnostics IS
+  'Unresolved maintenance-inhibitor / saturation findings, critical first. [subsystem:G5]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Retention  (Phase 1.5 S1)
@@ -1212,7 +1242,7 @@ BEGIN
 END;
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.retain(interval, interval, interval, interval, interval) IS
-  'Prune audit tables by time cutoff (decisions/actions 180d, ticks 180d, resolved diagnostics 365d, state transitions 180d); policy_history is never pruned. Returns per-table delete counts.';
+  'Prune audit tables by time cutoff (decisions/actions 180d, ticks 180d, resolved diagnostics 365d, state transitions 180d); policy_history is never pruned. Returns per-table delete counts. [subsystem:G6]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Storage budget + self-health + graceful degrade  (Phase 1.5 S6)
@@ -1233,7 +1263,7 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.storage_config (
     budget_bytes bigint CHECK (budget_bytes IS NULL OR budget_bytes >= 0)
 );
 COMMENT ON TABLE pgfc_govern.storage_config IS
-  'Single-row storage config (S6): budget_bytes is the total-bytes cap over both schemas that degrade() enforces. NULL = no cap (degrade is a no-op).';
+  'Single-row storage config (S6): budget_bytes is the total-bytes cap over both schemas that degrade() enforces. NULL = no cap (degrade is a no-op). [subsystem:G6]';
 COMMENT ON COLUMN pgfc_govern.storage_config.budget_bytes IS
   'Total on-disk cap across pgfc_observe + pgfc_govern. NULL disables degrade().';
 
@@ -1266,7 +1296,7 @@ LANGUAGE sql STABLE AS $fn$
     ORDER BY 1, 2;
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.storage_budget() IS
-  'Whole-governor storage report (S6): per-relation bytes + dead tuples across pgfc_observe and pgfc_govern, tagged by schema.';
+  'Whole-governor storage report (S6): per-relation bytes + dead tuples across pgfc_observe and pgfc_govern, tagged by schema. [subsystem:G6]';
 
 -- One-row whole-governor self-health: footprint vs configured budget. over_budget is
 -- the signal an operator (or a scheduled job) acts on by calling degrade().
@@ -1283,7 +1313,7 @@ SELECT b.total_bytes, b.total_dead_tuples, c.budget_bytes,
        (c.budget_bytes IS NOT NULL AND b.total_bytes > c.budget_bytes)    AS over_budget
 FROM b CROSS JOIN c;
 COMMENT ON VIEW pgfc_govern.self_health IS
-  'One-row whole-governor self-health (S6): total bytes + dead tuples across both schemas vs the configured budget; over_budget flags when degrade() should run.';
+  'One-row whole-governor self-health (S6): total bytes + dead tuples across both schemas vs the configured budget; over_budget flags when degrade() should run. [subsystem:G6]';
 
 -- Graceful-degrade prune order. When the governor's own footprint exceeds the budget,
 -- shed storage in a FIXED order from most to least disposable —
@@ -1377,7 +1407,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.degrade(bigint, interval, interval, interval, interval, interval) IS
-  'Graceful-degrade prune order (S6): shed storage raw→fine→coarse rollups→diagnostics→actions until under budget; policy is never pruned. No-op when no budget is configured. Returns the ordered prune log.';
+  'Graceful-degrade prune order (S6): shed storage raw→fine→coarse rollups→diagnostics→actions until under budget; policy is never pruned. No-op when no budget is configured. Returns the ordered prune log. [subsystem:G6]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Parameter registry  (Phase 1.6 — parameter governance, P1)
@@ -1566,7 +1596,7 @@ VALUES
    'governor state estimation / control logic', 'governor', false, 'decision_log / action_history')
 $fn$;
 COMMENT ON FUNCTION pgfc_govern._parameter_registry() IS
-  'Canonical registry of pgfc_govern governed constants; the control logic reads its values from here through the registry accessor functions (Phase 1.6 P2, single-sourced). The CI drift gate that makes divergence impossible lands in P3.';
+  'Canonical registry of pgfc_govern governed constants; the control logic reads its values from here through the registry accessor functions (Phase 1.6 P2, single-sourced). The CI drift gate that makes divergence impossible lands in P3. [subsystem:G3]';
 
 -- Operator-facing unified view: every governed parameter across BOTH schemas, tagged by
 -- schema. Lives in pgfc_govern (the dependent layer) so pgfc_observe stays standalone —
@@ -1581,7 +1611,7 @@ CREATE OR REPLACE VIEW pgfc_govern.parameter_registry AS
     SELECT 'pgfc_govern'::text, r.*
     FROM pgfc_govern._parameter_registry() r;
 COMMENT ON VIEW pgfc_govern.parameter_registry IS
-  'Unified, operator-facing parameter registry (Phase 1.6 P1): every governed constant across both schemas with category and provenance.';
+  'Unified, operator-facing parameter registry (Phase 1.6 P1): every governed constant across both schemas with category and provenance. [subsystem:G3]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Drift gate  (Phase 1.6 — parameter governance, P3)
@@ -1654,7 +1684,7 @@ WHERE literal NOT IN ('0', '1', '0.0', '1.0')   -- structural-only allowlist
 ORDER BY object_name, literal;
 $fn$;
 COMMENT ON FUNCTION pgfc_govern._audit_control_literals() IS
-  'Drift gate (Phase 1.6 P3): returns unregistered numeric/interval literals in the decision/actuation path. A pgTAP test asserts it is empty; non-empty means a control value escaped the registry.';
+  'Drift gate (Phase 1.6 P3): returns unregistered numeric/interval literals in the decision/actuation path. A pgTAP test asserts it is empty; non-empty means a control value escaped the registry. [subsystem:G3]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Parameter validation  (Phase 1.6 — parameter governance, P4)
@@ -1730,7 +1760,7 @@ FROM cfg c
 ORDER BY 1;
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.validate_parameters() IS
-  'Parameter validation (Phase 1.6 P4): grades the live operator configuration against the registry''s safety bounds (OK/WARNING/CRITICAL). The reviewability surface; checks hard safety properties only.';
+  'Parameter validation (Phase 1.6 P4): grades the live operator configuration against the registry''s safety bounds (OK/WARNING/CRITICAL). The reviewability surface; checks hard safety properties only. [subsystem:G3]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Additive upgrades
@@ -1834,7 +1864,7 @@ HAVING count(*) FILTER (WHERE r.d <> 0 AND r.prev_d <> 0 AND r.d <> r.prev_d)
        >= pgfc_govern._param('oscillation_min_reversals')::bigint;
 $fn$;
 COMMENT ON FUNCTION pgfc_govern._oscillating_relations() IS
-  'Control-oscillation detector (Phase 1.7 F5): relations whose applied scale-factor flaps — at least oscillation_min_reversals direction reversals within oscillation_window. Read from action_history (applied only). The governor_metrics oscillating_relations count and the evaluate_health() oscillation signal both read it; the plan() reconciler raises the operator-visible finding.';
+  'Control-oscillation detector (Phase 1.7 F5): relations whose applied scale-factor flaps — at least oscillation_min_reversals direction reversals within oscillation_window. Read from action_history (applied only). The governor_metrics oscillating_relations count and the evaluate_health() oscillation signal both read it; the plan() reconciler raises the operator-visible finding. [subsystem:G4]';
 
 -- Open/resolve the operator-visible oscillation diagnostic (appendix F: "operator
 -- visibility"). One unresolved control_oscillation row per flapping relation; resolved when
@@ -1872,7 +1902,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern._reconcile_oscillation() IS
-  'Open/resolve the control_oscillation diagnostic (Phase 1.7 F5, appendix F "operator visibility"): one unresolved critical finding per flapping relation, auto-resolved when it stops flapping. Called from plan(); the saturation reconciler is scoped not to touch this class.';
+  'Open/resolve the control_oscillation diagnostic (Phase 1.7 F5, appendix F "operator visibility"): one unresolved critical finding per flapping relation, auto-resolved when it stops flapping. Called from plan(); the saturation reconciler is scoped not to touch this class. [subsystem:G4]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Self-monitoring  (Phase 1.7 F1 — governor self-protection)
@@ -1942,7 +1972,7 @@ SELECT
     (SELECT round(100 * s.client_backends::numeric / NULLIF(s.max_connections, 0))
        FROM pgfc_observe.snapshots s ORDER BY s.snapshot_id DESC LIMIT 1)    AS connection_pressure_pct;
 COMMENT ON VIEW pgfc_govern.governor_metrics IS
-  'One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-state evaluator: applied/failed/lock-timeout action counts over 1h/1d windows, observation lag (newest snapshot age), loop durations + tick errors (tick_log), the self-health storage footprint, the oldest retained audit row (retention backlog), the count of oscillating relations (Phase 1.7 F5), and the connection pressure from the newest snapshot (Phase 1.7 F6 load-shedding input). Always returns one row; counts are 0 and freshness signals NULL when nothing has happened yet.';
+  'One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-state evaluator: applied/failed/lock-timeout action counts over 1h/1d windows, observation lag (newest snapshot age), loop durations + tick errors (tick_log), the self-health storage footprint, the oldest retained audit row (retention backlog), the count of oscillating relations (Phase 1.7 F5), and the connection pressure from the newest snapshot (Phase 1.7 F6 load-shedding input). Always returns one row; counts are 0 and freshness signals NULL when nothing has happened yet. [subsystem:G4]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Failure taxonomy — unified operator surface  (Phase 1.7 F6 — self-protection)
@@ -2006,7 +2036,7 @@ LATERAL (VALUES
 ) AS cat(failure_class, condition_present, detail)
 LEFT JOIN recorded r ON r.failure_class = cat.failure_class;
 COMMENT ON VIEW pgfc_govern.failure_taxonomy IS
-  'Unified failure-classification surface (Phase 1.7 F6, appendix F): one row per category (observation/decision/actuation/resource/safety) with condition_present (the live signal, from the same substrate the health-state machine reads) and recorded_failures_last_day (action_history rows stamped with that failure_class — actuation only, today). The governor''s whole failure picture in five rows.';
+  'Unified failure-classification surface (Phase 1.7 F6, appendix F): one row per category (observation/decision/actuation/resource/safety) with condition_present (the live signal, from the same substrate the health-state machine reads) and recorded_failures_last_day (action_history rows stamped with that failure_class — actuation only, today). The governor''s whole failure picture in five rows. [subsystem:G4]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Health-state machine  (Phase 1.7 F2 — governor self-protection)
@@ -2142,7 +2172,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.evaluate_health() IS
-  'Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds (failed actions, lock timeouts, observation lag, storage footprint, the F4 daily-mutation-budget circuit breaker — degraded-level only — the F5 control-oscillation signal — diagnostic — and the F6 connection-pressure load-shedding signal — diagnostic), then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. The state it writes is the input to the F4 apply() authority gate. Returns the effective state.';
+  'Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds (failed actions, lock timeouts, observation lag, storage footprint, the F4 daily-mutation-budget circuit breaker — degraded-level only — the F5 control-oscillation signal — diagnostic — and the F6 connection-pressure load-shedding signal — diagnostic), then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. The state it writes is the input to the F4 apply() authority gate. Returns the effective state. [subsystem:G4]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Human-override surface  (Phase 1.7 F3 — governor self-protection)
@@ -2182,7 +2212,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.force_state(pgfc_govern.governor_health_state, text) IS
-  'Operator override (Phase 1.7 F3): force the governor into a more-cautious state (a caution floor honored by evaluate_health''s worst-of rule); rejects normal. Audited as a state transition; recorded in operator_forced/forced_by/forced_at. Returns the effective state. Released by clear_forced_state().';
+  'Operator override (Phase 1.7 F3): force the governor into a more-cautious state (a caution floor honored by evaluate_health''s worst-of rule); rejects normal. Audited as a state transition; recorded in operator_forced/forced_by/forced_at. Returns the effective state. Released by clear_forced_state(). [subsystem:G4]';
 
 -- Release any operator-forced hold and return the governor to fully automatic control.
 -- Idempotent — clearing when no hold is set is a no-op that simply re-evaluates.
@@ -2199,7 +2229,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.clear_forced_state(text) IS
-  'Operator override (Phase 1.7 F3): release any operator-forced hold and return to fully automatic control. The subsequent automatic transition is audited. Returns the (now automatic) effective state.';
+  'Operator override (Phase 1.7 F3): release any operator-forced hold and return to fully automatic control. The subsequent automatic transition is audited. Returns the (now automatic) effective state. [subsystem:G4]';
 
 -- Disable the governor entirely (appendix F "Disabled Mode"): all control activity ceases;
 -- history is preserved. A hard operator stop, distinct from policy.enabled (which gates a
@@ -2211,7 +2241,7 @@ LANGUAGE sql AS $fn$
     SELECT pgfc_govern.force_state('disabled', p_reason);
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.disable(text) IS
-  'Operator override (Phase 1.7 F3): force the disabled state (all control ceases, history preserved). Distinct from policy.enabled — this forces the health state, which the F4 authority gate honors. Released by clear_forced_state().';
+  'Operator override (Phase 1.7 F3): force the disabled state (all control ceases, history preserved). Distinct from policy.enabled — this forces the health state, which the F4 authority gate honors. Released by clear_forced_state(). [subsystem:G4]';
 
 -- Suspend actuation while keeping full observation and diagnosis (appendix F "suspend
 -- actuation" / "force diagnostic mode" — the same state: diagnostic's defining capability is
@@ -2222,4 +2252,4 @@ LANGUAGE sql AS $fn$
     SELECT pgfc_govern.force_state('diagnostic', p_reason);
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.suspend_actuation(text) IS
-  'Operator override (Phase 1.7 F3): force the diagnostic state — actuation suspended, full observation/diagnosis retained (appendix F "suspend actuation"). Released by clear_forced_state().';
+  'Operator override (Phase 1.7 F3): force the diagnostic state — actuation suspended, full observation/diagnosis retained (appendix F "suspend actuation"). Released by clear_forced_state(). [subsystem:G4]';

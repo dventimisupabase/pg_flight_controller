@@ -13,6 +13,8 @@ DECLARE
     fn  record;
     en  record;
     schemacmt text;
+    sub text;     -- parsed [subsystem:<ID>] marker, rendered as its own field
+    encmt text;   -- enum comment (captured once so the marker is stripped + parsed)
 BEGIN
     RETURN NEXT '# `' || sch || '` reference';
     RETURN NEXT '';
@@ -42,7 +44,12 @@ BEGIN
         LOOP
             RETURN NEXT '### ' || sch || '.' || rel.relname;
             RETURN NEXT '';
-            IF rel.cmt IS NOT NULL THEN RETURN NEXT rel.cmt; RETURN NEXT ''; END IF;
+            IF rel.cmt IS NOT NULL THEN
+                RETURN NEXT regexp_replace(rel.cmt, '\s*\[subsystem:[OG][0-9]\]\s*$', '');
+                RETURN NEXT '';
+            END IF;
+            sub := substring(rel.cmt FROM '\[subsystem:([OG][0-9])\]');
+            IF sub IS NOT NULL THEN RETURN NEXT '**Subsystem:** ' || sub; RETURN NEXT ''; END IF;
             RETURN NEXT '| Column | Type | Description |';
             RETURN NEXT '| --- | --- | --- |';
             FOR col IN
@@ -73,7 +80,12 @@ BEGIN
         LOOP
             RETURN NEXT '### ' || sch || '.' || rel.relname;
             RETURN NEXT '';
-            IF rel.cmt IS NOT NULL THEN RETURN NEXT rel.cmt; RETURN NEXT ''; END IF;
+            IF rel.cmt IS NOT NULL THEN
+                RETURN NEXT regexp_replace(rel.cmt, '\s*\[subsystem:[OG][0-9]\]\s*$', '');
+                RETURN NEXT '';
+            END IF;
+            sub := substring(rel.cmt FROM '\[subsystem:([OG][0-9])\]');
+            IF sub IS NOT NULL THEN RETURN NEXT '**Subsystem:** ' || sub; RETURN NEXT ''; END IF;
             RETURN NEXT '| Column | Type |';
             RETURN NEXT '| --- | --- |';
             FOR col IN
@@ -105,7 +117,12 @@ BEGIN
             RETURN NEXT '### `' || sch || '.' || fn.proname
                      || '(' || fn.args || ') → ' || fn.res || '`';
             RETURN NEXT '';
-            IF fn.cmt IS NOT NULL THEN RETURN NEXT fn.cmt; RETURN NEXT ''; END IF;
+            IF fn.cmt IS NOT NULL THEN
+                RETURN NEXT regexp_replace(fn.cmt, '\s*\[subsystem:[OG][0-9]\]\s*$', '');
+                RETURN NEXT '';
+            END IF;
+            sub := substring(fn.cmt FROM '\[subsystem:([OG][0-9])\]');
+            IF sub IS NOT NULL THEN RETURN NEXT '**Subsystem:** ' || sub; RETURN NEXT ''; END IF;
         END LOOP;
     END IF;
 
@@ -125,9 +142,13 @@ BEGIN
         LOOP
             RETURN NEXT '### `' || sch || '.' || en.typname || '`';
             RETURN NEXT '';
-            IF obj_description(en.oid, 'pg_type') IS NOT NULL THEN
-                RETURN NEXT obj_description(en.oid, 'pg_type'); RETURN NEXT '';
+            encmt := obj_description(en.oid, 'pg_type');
+            IF encmt IS NOT NULL THEN
+                RETURN NEXT regexp_replace(encmt, '\s*\[subsystem:[OG][0-9]\]\s*$', '');
+                RETURN NEXT '';
             END IF;
+            sub := substring(encmt FROM '\[subsystem:([OG][0-9])\]');
+            IF sub IS NOT NULL THEN RETURN NEXT '**Subsystem:** ' || sub; RETURN NEXT ''; END IF;
             RETURN NEXT 'Enum values: ' || en.labels;
             RETURN NEXT '';
         END LOOP;
