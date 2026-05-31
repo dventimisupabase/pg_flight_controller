@@ -92,11 +92,11 @@ metrics and records it as a single state. The states, in order of increasing cau
   permitted safety actions.
 - **`emergency`** — the governor is effectively flying blind (observation badly stale);
   minimal observation and health reporting only.
-- **`disabled`** — nothing acts; history is preserved. Reserved for the operator-forced
-  override (a later increment).
+- **`disabled`** — nothing acts; history is preserved. Reached **only** via the operator
+  override (`disable()`); the automatic evaluator never gets there.
 
 A fresh governor with no observations is `normal`, not `emergency` — absence of data at
-boot is not ill health. In F2 the state is **advisory**: it is computed, recorded, and
+boot is not ill health. The state is currently **advisory**: it is computed, recorded, and
 surfaced, but does not yet gate actuation (that authority gate is a later increment). The
 automatic evaluator only reaches `emergency` via stale observation today; more triggers
 (oscillation, load) arrive with later increments.
@@ -112,6 +112,36 @@ SELECT transitioned_at, from_state, to_state, reason
 FROM pgfc_govern.state_transitions
 ORDER BY transition_id DESC
 LIMIT 20;
+```
+
+## Human override
+
+Operators retain ultimate authority (Phase 1.7 F3). You can force the governor into a
+**more cautious** state and release the hold; every force and release is audited as a
+state transition, and `governor_state.forced_by` / `forced_at` record who placed the hold
+and when.
+
+- **`pgfc_govern.disable(reason)`** — force `disabled`: all control activity ceases,
+  history is preserved. The hardest stop. This forces the *health state*, distinct from
+  `policy.enabled` (which only gates a policy row from driving the loop).
+- **`pgfc_govern.suspend_actuation(reason)`** — force `diagnostic`: actuation is suspended
+  but observation and diagnosis continue.
+- **`pgfc_govern.force_state(state, reason)`** — force any more-cautious state
+  (`degraded` / `diagnostic` / `emergency` / `disabled`). Forcing `normal` is rejected —
+  release a hold instead.
+- **`pgfc_govern.clear_forced_state(reason)`** — release the hold and return to fully
+  automatic control.
+
+The override is a caution **floor**, never a ceiling: the effective state is the *worst*
+of the automatic state and the forced state. Forcing `degraded` while the automatic signals
+demand `diagnostic` still yields `diagnostic` — a human can force more caution, never less.
+
+<!-- doctest -->
+
+```sql
+-- stop the governor acting while you investigate, then resume:
+SELECT pgfc_govern.suspend_actuation('investigating lock contention');
+SELECT pgfc_govern.clear_forced_state('all clear');
 ```
 
 ## Diagnostics

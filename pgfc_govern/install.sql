@@ -248,17 +248,26 @@ COMMENT ON TABLE pgfc_govern.diagnostics IS
 
 -- Governor health state (Phase 1.7 F2). The current self-protection state, computed by
 -- evaluate_health() from the governor_metrics substrate. Enforced singleton (constant-true
--- PK), mirroring storage_config. The operator-forced override (F3) is an additive column
--- added later. Seeded once at install; never reset on re-install.
+-- PK), mirroring storage_config. The operator-forced override (Phase 1.7 F3) lives in the
+-- operator_forced/forced_* columns (NULL operator_forced = fully automatic); it is a
+-- caution FLOOR honored by evaluate_health() — a human can force MORE caution, never less.
+-- Seeded once at install; never reset on re-install.
 CREATE TABLE IF NOT EXISTS pgfc_govern.governor_state (
-    singleton    boolean PRIMARY KEY DEFAULT true CHECK (singleton),
-    state        pgfc_govern.governor_health_state NOT NULL DEFAULT 'normal',
-    since        timestamptz NOT NULL DEFAULT now(),   -- when the current state was entered
-    reason       text,                                 -- human-readable cause of the state
-    evaluated_at timestamptz                           -- last evaluate_health() run (NULL = never)
+    singleton       boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    state           pgfc_govern.governor_health_state NOT NULL DEFAULT 'normal',
+    since           timestamptz NOT NULL DEFAULT now(),   -- when the current state was entered
+    reason          text,                                 -- human-readable cause of the state
+    evaluated_at    timestamptz,                          -- last evaluate_health() run (NULL = never)
+    -- Operator-forced override (F3): a caution floor. NULL = automatic.
+    operator_forced pgfc_govern.governor_health_state,    -- state a human forced (NULL = none)
+    forced_reason   text,                                 -- why the operator placed the hold
+    forced_by       text,                                 -- who placed it (current_user at force time)
+    forced_at       timestamptz                           -- when it was placed
 );
 COMMENT ON TABLE pgfc_govern.governor_state IS
-  'Single-row governor health state (Phase 1.7 F2): the current self-protection state computed by evaluate_health(). Advisory in F2; the apply() authority gate consults it in F4.';
+  'Single-row governor health state (Phase 1.7 F2): the current self-protection state computed by evaluate_health(). The operator_forced/forced_* columns hold the F3 human override — a caution floor (force more caution, never less). Advisory; the apply() authority gate consults it in F4.';
+COMMENT ON COLUMN pgfc_govern.governor_state.operator_forced IS
+  'Operator-forced health state (Phase 1.7 F3); NULL = fully automatic. evaluate_health() takes the WORST of this and the auto-computed state, so the operator can force more caution but never less. Set via force_state()/disable()/suspend_actuation(); cleared via clear_forced_state().';
 
 INSERT INTO pgfc_govern.governor_state (singleton, reason)
 VALUES (true, 'initialized at install')
@@ -1607,6 +1616,14 @@ COMMENT ON FUNCTION pgfc_govern.validate_parameters() IS
 -- P4: adaptive-value provenance — the estimated benefit of an adjust on decision_log.
 ALTER TABLE pgfc_govern.decision_log ADD COLUMN IF NOT EXISTS estimated_benefit double precision;
 
+-- F3: operator-forced override columns on the (F2) governor_state singleton, for installs
+-- that already have governor_state from F2. NULL operator_forced = fully automatic.
+ALTER TABLE pgfc_govern.governor_state
+    ADD COLUMN IF NOT EXISTS operator_forced pgfc_govern.governor_health_state;
+ALTER TABLE pgfc_govern.governor_state ADD COLUMN IF NOT EXISTS forced_reason text;
+ALTER TABLE pgfc_govern.governor_state ADD COLUMN IF NOT EXISTS forced_by     text;
+ALTER TABLE pgfc_govern.governor_state ADD COLUMN IF NOT EXISTS forced_at     timestamptz;
+
 -- S6: static autovacuum reloptions on the governor's own audit/state tables. Unlike
 -- the partition-rotated observe tables, these are mutated in place (UPDATE-heavy state
 -- tables; DELETE-pruned audit tables by retain()/degrade()), so they DO accrue dead
@@ -1706,6 +1723,8 @@ DECLARE
     v_current  pgfc_govern.governor_health_state;
     v_computed pgfc_govern.governor_health_state;
     v_reason   text;
+    v_forced   pgfc_govern.governor_health_state;
+    v_freason  text;
 BEGIN
     SELECT * INTO m FROM pgfc_govern.governor_metrics;     -- guaranteed one row (F1)
     v_lag := EXTRACT(EPOCH FROM m.observation_lag);        -- NULL when nothing observed yet
@@ -1739,6 +1758,19 @@ BEGIN
     ORDER BY c.state DESC, (c.reason IS NULL)              -- worst state; non-null reason wins ties
     LIMIT 1;
 
+    -- Operator override (Phase 1.7 F3): the forced state is a caution FLOOR. Take the WORST
+    -- of the auto-computed state and any operator-forced state, so a human can force MORE
+    -- caution but never less. NULL operator_forced = fully automatic. When the hold binds
+    -- (it is at least as cautious as the automatic state), its reason is surfaced; when the
+    -- automatic state is worse, that binds instead and the hold simply stays recorded.
+    SELECT operator_forced, forced_reason INTO v_forced, v_freason
+      FROM pgfc_govern.governor_state;
+    IF v_forced IS NOT NULL AND v_forced >= v_computed THEN
+        v_reason   := format('operator-forced %s: %s', v_forced,
+                             COALESCE(v_freason, '(no reason given)'));
+        v_computed := v_forced;
+    END IF;
+
     SELECT state INTO v_current FROM pgfc_govern.governor_state;
 
     IF v_computed IS DISTINCT FROM v_current THEN
@@ -1755,4 +1787,84 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.evaluate_health() IS
-  'Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds; write governor_state and record a state_transitions row on change. Advisory — does not gate actuation (that is the F4 authority gate). Returns the computed state.';
+  'Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds, then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. Advisory — does not gate actuation (that is the F4 authority gate). Returns the effective state.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Human-override surface  (Phase 1.7 F3 — governor self-protection)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Operators retain ultimate authority (appendix F "Human Override"): they can force the
+-- governor into a MORE cautious state and release the hold. The override is a caution
+-- FLOOR, not a setpoint — evaluate_health() takes the worst of the auto-computed state and
+-- operator_forced (see above), so forcing 'degraded' while the automatic signals demand
+-- 'diagnostic' still yields 'diagnostic'. A human can therefore force more caution but never
+-- less; the way back to less caution is clear_forced_state(), not forcing 'normal'. Every
+-- force/clear runs through evaluate_health(), so the resulting change is audited as a
+-- state_transitions row exactly like an automatic transition, and forced_by/forced_at on
+-- governor_state record who placed the hold and when. These functions set state only — they
+-- do not themselves gate actuation (that is the F4 authority gate, which reads the state
+-- they set). No magic numbers: they carry no governed constants (nothing for the drift gate
+-- or the registry).
+
+-- Force the governor into a specified (more-cautious) state and hold it there until cleared.
+-- 'normal' is rejected: it is not a more-cautious target, and releasing a hold is what
+-- clear_forced_state() is for. Returns the resulting effective state (which may be even more
+-- cautious if an automatic signal is worse than the forced floor).
+CREATE OR REPLACE FUNCTION pgfc_govern.force_state(
+    p_state  pgfc_govern.governor_health_state,
+    p_reason text)
+RETURNS pgfc_govern.governor_health_state
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    IF p_state = 'normal' THEN
+        RAISE EXCEPTION 'cannot force the normal state (a force only adds caution); use clear_forced_state() to release a hold';
+    END IF;
+    UPDATE pgfc_govern.governor_state
+       SET operator_forced = p_state,
+           forced_reason   = p_reason,
+           forced_by       = current_user,
+           forced_at       = now();
+    RETURN pgfc_govern.evaluate_health();   -- recompute (worst-of) + audit the transition
+END
+$fn$;
+COMMENT ON FUNCTION pgfc_govern.force_state(pgfc_govern.governor_health_state, text) IS
+  'Operator override (Phase 1.7 F3): force the governor into a more-cautious state (a caution floor honored by evaluate_health''s worst-of rule); rejects normal. Audited as a state transition; recorded in operator_forced/forced_by/forced_at. Returns the effective state. Released by clear_forced_state().';
+
+-- Release any operator-forced hold and return the governor to fully automatic control.
+-- Idempotent — clearing when no hold is set is a no-op that simply re-evaluates.
+CREATE OR REPLACE FUNCTION pgfc_govern.clear_forced_state(p_reason text DEFAULT NULL)
+RETURNS pgfc_govern.governor_health_state
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    UPDATE pgfc_govern.governor_state
+       SET operator_forced = NULL,
+           forced_reason   = NULL,
+           forced_by       = NULL,
+           forced_at       = NULL;
+    RETURN pgfc_govern.evaluate_health();   -- recompute purely from automatic signals
+END
+$fn$;
+COMMENT ON FUNCTION pgfc_govern.clear_forced_state(text) IS
+  'Operator override (Phase 1.7 F3): release any operator-forced hold and return to fully automatic control. The subsequent automatic transition is audited. Returns the (now automatic) effective state.';
+
+-- Disable the governor entirely (appendix F "Disabled Mode"): all control activity ceases;
+-- history is preserved. A hard operator stop, distinct from policy.enabled (which gates a
+-- given policy row driving the loop) — disable() forces the health state itself to disabled,
+-- which the F4 authority gate then honors regardless of policy.
+CREATE OR REPLACE FUNCTION pgfc_govern.disable(p_reason text)
+RETURNS pgfc_govern.governor_health_state
+LANGUAGE sql AS $fn$
+    SELECT pgfc_govern.force_state('disabled', p_reason);
+$fn$;
+COMMENT ON FUNCTION pgfc_govern.disable(text) IS
+  'Operator override (Phase 1.7 F3): force the disabled state (all control ceases, history preserved). Distinct from policy.enabled — this forces the health state, which the F4 authority gate honors. Released by clear_forced_state().';
+
+-- Suspend actuation while keeping full observation and diagnosis (appendix F "suspend
+-- actuation" / "force diagnostic mode" — the same state: diagnostic's defining capability is
+-- observe/estimate/diagnose with actuation suspended).
+CREATE OR REPLACE FUNCTION pgfc_govern.suspend_actuation(p_reason text)
+RETURNS pgfc_govern.governor_health_state
+LANGUAGE sql AS $fn$
+    SELECT pgfc_govern.force_state('diagnostic', p_reason);
+$fn$;
+COMMENT ON FUNCTION pgfc_govern.suspend_actuation(text) IS
+  'Operator override (Phase 1.7 F3): force the diagnostic state — actuation suspended, full observation/diagnosis retained (appendix F "suspend actuation"). Released by clear_forced_state().';

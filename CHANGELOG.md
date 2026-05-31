@@ -186,6 +186,20 @@ section in the same pull request as your change (this is a convention, not a CI 
   governor with no observations evaluates to `normal`, not `emergency`. `retain()` gains a
   `keep_transitions` window (default 180 d) and prunes `state_transitions`.
 
+- **Governor self-protection Phase 1.7 — F3 (human-override surface).** Operators retain
+  ultimate authority (appendix F "Human Override"). The `governor_state` singleton gains
+  additive `operator_forced` / `forced_reason` / `forced_by` / `forced_at` columns, and four
+  operator functions set and release a hold: `force_state(state, reason)` (rejects `normal`),
+  `disable(reason)` → `disabled`, `suspend_actuation(reason)` → `diagnostic` (actuation off,
+  diagnosis retained), and `clear_forced_state(reason)` to return to automatic. The override
+  is a caution **floor**, not a setpoint: `evaluate_health()` now takes the **worst** of the
+  auto-computed state and `operator_forced`, so a human can force *more* caution but never
+  less — `disabled` is reachable only this way. Every force/release runs through
+  `evaluate_health()`, so it is audited as a `state_transitions` row exactly like an
+  automatic transition. F3 sets state only; it does not itself gate actuation (that is the
+  F4 authority gate, which reads the state these functions set). No new registry parameters
+  — the override carries no governed constants.
+
 ### Changed
 
 - **`docs/` is now the self-contained, as-built spec.** The hand-written guides no
