@@ -241,15 +241,59 @@ RETURNS double precision IMMUTABLE LANGUAGE sql AS $$
     END
 $$;
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Parameter accessors  (Phase 1.6 — parameter governance, P2)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- The control logic reads its governed constants THROUGH these accessors, so the
+-- registry (_parameter_registry(), defined later in this file) is the one value both the
+-- code and the operator-facing view read — no parallel literal. plpgsql so the body
+-- resolves _parameter_registry() at runtime (it is defined below); IMMUTABLE because the
+-- registry is a constant VALUES list, so constant-argument calls fold. Callers cast to
+-- the column's native type. A CI "registry up to date" gate (P3) will then make it
+-- impossible for a control literal to exist outside the registry.
+CREATE OR REPLACE FUNCTION pgfc_govern._param(p_name text)
+RETURNS text IMMUTABLE LANGUAGE plpgsql AS $fn$
+DECLARE v text;
+BEGIN
+    SELECT default_value INTO v FROM pgfc_govern._parameter_registry()
+     WHERE parameter_name = p_name;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pgfc_govern._param: unknown parameter %', p_name;
+    END IF;
+    RETURN v;
+END
+$fn$;
+COMMENT ON FUNCTION pgfc_govern._param(text) IS
+  'Read a governed parameter''s value from the registry (Phase 1.6 P2); the control logic single-sources its constants through this.';
+
+CREATE OR REPLACE FUNCTION pgfc_govern._sf_grid()
+RETURNS double precision[] IMMUTABLE LANGUAGE plpgsql AS $fn$
+BEGIN
+    RETURN pgfc_govern._param('sf_grid')::double precision[];
+END
+$fn$;
+COMMENT ON FUNCTION pgfc_govern._sf_grid() IS
+  'Scale-factor quantization grid, read from the registry (Phase 1.6 P2).';
+
+CREATE OR REPLACE FUNCTION pgfc_govern._class_target(p_kind text)
+RETURNS double precision IMMUTABLE LANGUAGE plpgsql AS $fn$
+BEGIN
+    RETURN pgfc_govern._param('target_' || p_kind)::double precision;
+END
+$fn$;
+COMMENT ON FUNCTION pgfc_govern._class_target(text) IS
+  'Base (pre-aggressiveness) target dead-tuple fraction for a workload class, read from the registry (Phase 1.6 P2).';
+
 -- Update relation_estimate for every relation in snapshot p_snapshot_id. Reads
 -- indicators from pgfc_observe.maintenance_debt (no re-derivation of thresholds) and
 -- raw samples only for cross-snapshot deltas. Returns rows written.
 CREATE OR REPLACE FUNCTION pgfc_govern.estimate(p_snapshot_id bigint)
 RETURNS integer LANGUAGE plpgsql AS $fn$
 DECLARE
-    v_tau  double precision := 3600;   -- EWMA time constant (s) for rates
-    v_effa double precision := 0.5;    -- effectiveness/peak EWMA weight
-    v_k    integer := 3;               -- observations a saturation cause must persist
+    v_tau     double precision := pgfc_govern._param('ewma_tau')::double precision;   -- rate EWMA time constant (s)
+    v_effa    double precision := pgfc_govern._param('ewma_effa')::double precision;  -- effectiveness/peak EWMA weight
+    v_k       integer          := pgfc_govern._param('saturation_persistence_k')::integer;  -- cycles a cause must persist
+    v_eff_low double precision := pgfc_govern._param('eff_low')::double precision;    -- effectiveness below = ineffective
     n      integer;
 BEGIN
     INSERT INTO pgfc_govern.relation_estimate AS re (
@@ -357,7 +401,7 @@ BEGIN
             (last_autovacuum IS NOT NULL
              AND last_autovacuum > collected_at - interval '1 hour')   AS av_running,
             (COALESCE(vacuum_debt_ratio, 0) > 1)                       AS debt_high,
-            (COALESCE(effectiveness, 1) < 0.5)                         AS eff_low,
+            (COALESCE(effectiveness, 1) < v_eff_low)                   AS eff_low,
             (oldest_xmin_owner IS NOT NULL AND oldest_xmin_owner <> 'none') AS horizon_pinned
         FROM ds
     ),
@@ -419,14 +463,18 @@ COMMENT ON FUNCTION pgfc_govern.estimate(bigint) IS
 CREATE OR REPLACE FUNCTION pgfc_govern.classify(p_snapshot_id bigint)
 RETURNS integer LANGUAGE plpgsql AS $fn$
 DECLARE
-    v_floor bigint  := 50;       -- min recent writes before classifying on fractions
-    v_large real    := 100000;   -- reltuples above which an idle relation is 'archive'
+    v_floor bigint  := pgfc_govern._param('classify_floor')::bigint;  -- min recent writes before classifying on fractions
+    v_large real    := pgfc_govern._param('classify_large')::real;    -- reltuples above which an idle relation is 'archive'
+    v_ins_frac  double precision := pgfc_govern._param('classify_append_only_ins_frac')::double precision;
+    v_del_frac  double precision := pgfc_govern._param('classify_delete_frac')::double precision;
+    v_bal_frac  double precision := pgfc_govern._param('classify_queue_balance_frac')::double precision;
+    v_aodel_frac double precision := pgfc_govern._param('classify_append_only_del_frac')::double precision;
     v_nsus  integer;
     n integer;
 BEGIN
     SELECT n_sustain INTO v_nsus FROM pgfc_govern.policy
       WHERE enabled ORDER BY policy_name LIMIT 1;
-    v_nsus := COALESCE(v_nsus, 3);
+    v_nsus := COALESCE(v_nsus, pgfc_govern._param('class_persistence_n_sustain')::integer);
 
     INSERT INTO pgfc_govern.relation_class AS rc
         (relid, schemaname, relname, kind, source, candidate, candidate_streak, classified_at)
@@ -457,13 +505,13 @@ BEGIN
         SELECT *, (din + dupd + ddel) AS total,
             CASE WHEN (din + dupd + ddel) >= v_floor THEN
                 CASE
-                    WHEN din::float8 /(din+dupd+ddel) > 0.95
-                         AND ddel::float8/(din+dupd+ddel) < 0.01 THEN 'append_only'
-                    WHEN ddel::float8/(din+dupd+ddel) > 0.30
+                    WHEN din::float8 /(din+dupd+ddel) > v_ins_frac
+                         AND ddel::float8/(din+dupd+ddel) < v_aodel_frac THEN 'append_only'
+                    WHEN ddel::float8/(din+dupd+ddel) > v_del_frac
                          AND abs(ddel::float8/(din+dupd+ddel)
-                                 - din::float8/(din+dupd+ddel)) < 0.10 THEN 'queue'
-                    WHEN ddel::float8/(din+dupd+ddel) > 0.30 THEN 'delete_heavy'
-                    WHEN dupd::float8/(din+dupd+ddel) > 0.30 THEN 'oltp'
+                                 - din::float8/(din+dupd+ddel)) < v_bal_frac THEN 'queue'
+                    WHEN ddel::float8/(din+dupd+ddel) > v_del_frac THEN 'delete_heavy'
+                    WHEN dupd::float8/(din+dupd+ddel) > v_del_frac THEN 'oltp'
                     ELSE 'mixed'
                 END
             END AS rule_kind     -- NULL when below the signal floor
@@ -530,27 +578,27 @@ COMMENT ON FUNCTION pgfc_govern.classify(bigint) IS
 -- actuation-economy gates (rate limits, sustained-deviation) are deferred to Phase 2
 -- since apply() is gated off here; plan() only writes the decision/diagnosis trail.
 
--- Snap a scale factor to the bounded grid (SF_GRID).
+-- Snap a scale factor to the bounded grid (SF_GRID, single-sourced from the registry).
 CREATE OR REPLACE FUNCTION pgfc_govern.snap_sf(x double precision)
 RETURNS double precision IMMUTABLE LANGUAGE sql AS $$
-    SELECT g FROM (VALUES (0.01),(0.02),(0.05),(0.10),(0.20),(0.30),(0.50)) AS grid(g)
+    SELECT g FROM unnest(pgfc_govern._sf_grid()) AS grid(g)
     ORDER BY abs(g - x) LIMIT 1
 $$;
 
 CREATE OR REPLACE FUNCTION pgfc_govern.plan(p_tick_id bigint, p_snapshot_id bigint)
 RETURNS integer LANGUAGE plpgsql AS $fn$
 DECLARE
-    v_sf_min     double precision := 0.01;
-    v_sf_max     double precision := 0.50;
-    v_freeze_thr double precision := 0.6;
+    v_sf_min     double precision := pgfc_govern._param('sf_min')::double precision;
+    v_sf_max     double precision := pgfc_govern._param('sf_max')::double precision;
+    v_freeze_thr double precision := pgfc_govern._param('freeze_thr')::double precision;
     v_aggr       double precision;
     v_manage     boolean;
     n integer;
 BEGIN
     SELECT aggressiveness, manage_user_owned INTO v_aggr, v_manage
       FROM pgfc_govern.policy WHERE enabled ORDER BY policy_name LIMIT 1;
-    v_aggr   := COALESCE(v_aggr, 1.0);
-    v_manage := COALESCE(v_manage, false);
+    v_aggr   := COALESCE(v_aggr, pgfc_govern._param('aggressiveness')::double precision);
+    v_manage := COALESCE(v_manage, pgfc_govern._param('manage_user_owned')::boolean);
 
     INSERT INTO pgfc_govern.decision_log
       (tick_id, relid, actuator, observation, prev_state, desired_state,
@@ -569,11 +617,7 @@ BEGIN
     ),
     tgt AS (
         SELECT *,
-            CASE kind
-                WHEN 'queue' THEN 0.05 WHEN 'delete_heavy' THEN 0.10
-                WHEN 'oltp' THEN 0.20  WHEN 'mixed' THEN 0.20
-                WHEN 'append_only' THEN 0.40 WHEN 'archive' THEN 0.50
-            END AS f_template,
+            pgfc_govern._class_target(kind::text) AS f_template,
             COALESCE(pgfc_observe.effective_reloption(reloptions,'autovacuum_vacuum_scale_factor')::float8,
                      def_vac_scale_factor) AS cur_sf,
             COALESCE(pgfc_observe.effective_reloption(reloptions,'autovacuum_vacuum_threshold')::bigint,
@@ -652,7 +696,7 @@ LANGUAGE sql STABLE AS $fn$
             ELSE sn.oldest_xmin_owner               -- inhibited / freeze-pinned: the owner
         END,
         CASE
-            WHEN (re.freeze_debt > 0.6 OR COALESCE(re.mxid_freeze_debt,0) > 0.6)
+            WHEN (re.freeze_debt > pgfc_govern._param('freeze_thr')::double precision OR COALESCE(re.mxid_freeze_debt,0) > pgfc_govern._param('freeze_thr')::double precision)
                  AND sn.oldest_xmin_owner <> 'none'        THEN 'critical'
             WHEN re.saturation_cause = 'inhibited'         THEN 'critical'
             ELSE 'warning'
@@ -679,7 +723,7 @@ LANGUAGE sql STABLE AS $fn$
     JOIN pgfc_observe.snapshots sn ON sn.snapshot_id = p_snapshot_id
     WHERE re.relid IN (SELECT relid FROM pgfc_observe.current_relation_state(p_snapshot_id))
       AND (re.saturation_cause IN ('inhibited','io_limited','config')
-           OR ((re.freeze_debt > 0.6 OR COALESCE(re.mxid_freeze_debt,0) > 0.6)
+           OR ((re.freeze_debt > pgfc_govern._param('freeze_thr')::double precision OR COALESCE(re.mxid_freeze_debt,0) > pgfc_govern._param('freeze_thr')::double precision)
                AND sn.oldest_xmin_owner <> 'none'));
 $fn$;
 
@@ -760,7 +804,9 @@ BEGIN
     v_batch := nextval('pgfc_govern.batch_seq');
 
     BEGIN
-        SET LOCAL lock_timeout = '100ms';                           -- never wait
+        -- never wait; lock_timeout single-sourced from the registry (LOCAL = this txn).
+        -- SET LOCAL takes only a literal, so set_config(..., true) is the dynamic form.
+        PERFORM set_config('lock_timeout', pgfc_govern._param('lock_timeout') || 'ms', true);
         EXECUTE format('ALTER TABLE %s SET (%I = %s)', p_relid::regclass, v_act, v_prop);
     EXCEPTION
         WHEN lock_not_available THEN
@@ -841,7 +887,7 @@ BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('pgfc_govern.control_tick'));  -- no overlap
     SELECT advisory_only INTO v_adv FROM pgfc_govern.policy
       WHERE enabled ORDER BY policy_name LIMIT 1;
-    v_adv := COALESCE(v_adv, true);
+    v_adv := COALESCE(v_adv, pgfc_govern._param('advisory_only')::boolean);
 
     SELECT max(snapshot_id) INTO v_snap FROM pgfc_observe.snapshots;
     INSERT INTO pgfc_govern.tick_log (snapshot_id) VALUES (v_snap) RETURNING tick_id INTO v_tick;
@@ -880,10 +926,10 @@ WITH pol AS (SELECT aggressiveness FROM pgfc_govern.policy
 SELECT rc.relid, rc.schemaname, rc.relname, rc.kind,
        re.f_trigger_ewma AS observed_dead_fraction,          -- diagnostic (biased)
        LEAST(GREATEST(
-           (CASE rc.kind WHEN 'queue' THEN 0.05 WHEN 'delete_heavy' THEN 0.10
-                         WHEN 'oltp' THEN 0.20 WHEN 'mixed' THEN 0.20
-                         WHEN 'append_only' THEN 0.40 WHEN 'archive' THEN 0.50 END)
-           / COALESCE(p.aggressiveness, 1.0), 0.01), 0.50)    AS target_dead_fraction,
+           pgfc_govern._class_target(rc.kind::text)
+           / COALESCE(p.aggressiveness, pgfc_govern._param('aggressiveness')::double precision),
+           pgfc_govern._param('sf_min')::double precision),
+           pgfc_govern._param('sf_max')::double precision)    AS target_dead_fraction,
        re.vacuum_debt_ratio, re.freeze_debt, re.saturation_cause,
        d.decision, d.proposed_value, d.applied, d.created_at AS last_decision_at,
        a.current_value AS current_scale_factor
@@ -1144,14 +1190,14 @@ COMMENT ON FUNCTION pgfc_govern.degrade(bigint, interval, interval, interval, in
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Parameter registry  (Phase 1.6 — parameter governance, P1)
 -- ─────────────────────────────────────────────────────────────────────────────
--- Canonical PROVENANCE registry of pgfc_govern's governed constants — the control-logic
--- values the governor steers with. Same discipline and shape as
--- pgfc_observe._parameter_registry(). In P1 these values still live as literals in
--- classify()/estimate()/plan()/snap_sf()/governor_status, and this function is a separate,
--- hand-maintained record of them. The single-sourcing increment then makes those
--- functions READ from here (the _profile_settings() pattern), and a CI gate enforces that
--- no control literal escapes the registry. Values here MUST match the live code until that
--- de-duplication lands (P2/P3).
+-- Canonical registry of pgfc_govern's governed constants — the control-logic values the
+-- governor steers with — and the single source the code now READS from: classify(),
+-- estimate(), plan(), snap_sf(), _findings(), governor_status, and apply() take their
+-- constants via the _param()/_sf_grid()/_class_target() accessors above, not inline
+-- literals (P2). What
+-- is NOT yet true: the tie is not enforced — nothing structurally prevents a future inline
+-- literal from diverging from this registry. The "registry up to date" CI gate that makes
+-- divergence impossible lands in P3.
 -- category ∈ {postgresql_derived, safety_bound, empirical_default, operator_policy,
 -- adaptive_value, implementation_convenience}; override_allowed is orthogonal to category.
 CREATE OR REPLACE FUNCTION pgfc_govern._parameter_registry()
@@ -1288,7 +1334,7 @@ VALUES
    'governor state estimation / control logic', 'governor', false, 'decision_log / action_history')
 $fn$;
 COMMENT ON FUNCTION pgfc_govern._parameter_registry() IS
-  'Canonical provenance registry of pgfc_govern governed constants (Phase 1.6 P1). Documents the as-built control-logic values; single-sourcing + drift gate land in P2/P3.';
+  'Canonical registry of pgfc_govern governed constants; the control logic reads its values from here through the registry accessor functions (Phase 1.6 P2, single-sourced). The CI drift gate that makes divergence impossible lands in P3.';
 
 -- Operator-facing unified view: every governed parameter across BOTH schemas, tagged by
 -- schema. Lives in pgfc_govern (the dependent layer) so pgfc_observe stays standalone —

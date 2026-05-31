@@ -1256,16 +1256,16 @@ COMMENT ON VIEW pgfc_observe.self_health IS
 -- The governor must not replace autovacuum folklore with folklore of its own: every
 -- governed constant has a name, meaning, unit, rationale, owner, and provenance, and is
 -- inspectable without reading source. This function is the canonical PROVENANCE registry
--- for pgfc_observe's governed constants. In P1 the control logic still defines and reads
--- its own literals — this is a separate, hand-maintained record of them. Making the code
--- READ from this function (the _profile_settings() pattern from pg_flight_recorder, which
--- makes code and registry unable to disagree) and the CI drift gate that enforces it
--- arrive in later increments (P2/P3).
+-- for pgfc_observe's governed constants — an inspection/documentation surface. pgfc_observe
+-- has no control-logic literals to single-source (those are all in pgfc_govern, which reads
+-- its constants from its registry as of P2 and gates them in P3); observe's constants are
+-- reloptions (already single-sourced via _telemetry_reloptions()), calendar math, and
+-- retention defaults that live as function arguments. So this registry documents and
+-- explains observe's constants; it is not a value the code reads back.
 -- category is one of: postgresql_derived | safety_bound | empirical_default |
 -- operator_policy | adaptive_value | implementation_convenience.
 -- override_allowed is orthogonal to category; config_ref names the override home
--- (NULL = a fixed code default). Values here MUST match the live code until the
--- single-sourcing increment removes the duplication.
+-- (NULL = a fixed code default). Values here MUST match the live code.
 CREATE OR REPLACE FUNCTION pgfc_observe._parameter_registry()
 RETURNS TABLE(
     parameter_name   text,
@@ -1320,7 +1320,7 @@ VALUES
    'MVP estimate — not yet benchmarked', 'operator', true, 'collection_policy.min_partition_size_bytes')
 $fn$;
 COMMENT ON FUNCTION pgfc_observe._parameter_registry() IS
-  'Canonical provenance registry of pgfc_observe governed constants (Phase 1.6 P1). Documents the as-built values; the control logic does not yet read from it (single-sourcing + drift gate land in P2/P3). pgfc_govern.parameter_registry unions it into the operator-facing view.';
+  'Provenance registry of pgfc_observe governed constants (Phase 1.6) — an inspection/documentation surface. observe has no control-logic literals to single-source; pgfc_govern.parameter_registry unions this into the operator-facing view.';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Retention — two-tier partition GC  (Phase 1.5 S2)
