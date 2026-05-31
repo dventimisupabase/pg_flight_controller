@@ -8,15 +8,18 @@ than escalating) when an external inhibitor blocks progress.
 
 Depends on **pgfc_observe** (install it first).
 
-This is **Phase 1** of the governor: advisory by default. For the concepts and the
-full guide set, see [`docs/`](../docs/index.md).
+The governor is **advisory by default**, with active control a single policy flip away.
+For the concepts and the full guide set, see [`docs/`](../docs/index.md).
 
 ## Advisory by default
 
 Every policy ships with `advisory_only = true`: the loop runs `classify → estimate →
 plan → verify` and writes a complete `decision_log` / `diagnostics` trail, but
-`apply()` never fires — no `ALTER TABLE`, no setting is ever changed. Active control
-(Phase 2) is a single policy flip.
+`apply()` never fires — no `ALTER TABLE`, no setting is ever changed. Active control is
+the supported `advisory_only = false` path (see
+[Enabling active control](../docs/guide/operating.md#enabling-active-control)): it actuates
+the scale-factor lever under the Phase 1.7 self-protection net — the health-state authority
+gate, the Invariant-4 mutation budget, oscillation detection, and load shedding.
 
 ## Install
 
@@ -88,20 +91,21 @@ consults it in a later increment).
   baseline capture, 100 ms non-blocking lock, failure recording) but only ever runs
   when `advisory_only = false`.
 
-### Recorded hazards to address when Phase 2 turns on active control
+### Activation hazards (addressed in Phase 1.7 F7)
 
-- **Loop ordering contract.** `control_tick()` plans against `max(snapshot_id)`, so
-  `estimate()` for that snapshot must have completed before the control loop
-  consumes it. The advisory lock serializes `control_tick()` against itself but
-  **not** against `observe_tick()`; on two independent cron schedules a control
-  cycle could read a snapshot whose estimate hasn't run yet (those relations are
-  skipped via the LEFT JOIN, not mis-planned). Make the ordering explicit before
-  actuation depends on it.
-- **`apply()` stale-window downgrade is untested.** `apply()` re-reads live
-  `pg_class.reloptions` and is the authoritative arbiter (can downgrade
-  `adjust → no_op` when a human changed the value between observe and apply), but no
-  test yet exercises the case where the live value differs from what `plan()` saw.
-  Add it when `apply()` goes live.
+Both were closed when active control went live; recorded here as the contract actuation
+now depends on.
+
+- **Loop ordering contract.** `control_tick()` plans against the newest snapshot whose
+  `estimate()` phase has completed (`max(snapshot_id)` from `relation_estimate`), not the
+  newest *observed* snapshot. The advisory lock serializes `control_tick()` against itself
+  but **not** against `observe_tick()`; selecting the estimated snapshot keeps the estimates
+  and the observed state `plan()` reads on the same snapshot even on independent cron
+  schedules, so actuation never pairs fresh observations with stale hidden state.
+- **`apply()` stale-window downgrade.** `apply()` re-reads live `pg_class.reloptions` and is
+  the authoritative arbiter: it downgrades `adjust → no-op` (silently, not a failure) when a
+  human changed the value to the proposal between observe and apply. Covered by
+  `tests/19_activation.sql`.
 
 ## Tests
 

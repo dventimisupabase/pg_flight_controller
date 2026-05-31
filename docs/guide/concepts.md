@@ -88,11 +88,12 @@ that enforce this:
 - **Ownership guard.** By default the governor will not overwrite a scale factor a
   human or another system set first (decision `suppressed:user_owned`);
   `manage_user_owned = true` opts in to taking ownership.
-- **Rate limit + budget (planned, Phase 2).** A per-relation minimum interval, a
-  per-cycle cap, and a daily cluster-wide mutation budget will bound how often it
-  acts. These policy knobs exist today but are not yet enforced; they take effect
-  with Phase 2 active control. In this release the three gates above are what hold
-  catalog churn down.
+- **Rate limit + budget.** A per-relation minimum interval, a per-cycle cap, and a
+  daily cluster-wide mutation budget bound how often the governor acts. These policy
+  knobs are enforced at the single `apply()` chokepoint (Invariant 4), so they take
+  effect the moment [active control](operating.md#enabling-active-control) is enabled.
+  Under the default advisory policy nothing is applied at all; the three gates above
+  are what hold the *planned* churn down.
 
 ## Diagnose, don't escalate
 

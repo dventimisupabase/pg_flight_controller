@@ -425,13 +425,13 @@ opinions: e.g. `aggressiveness <= 0` is `CRITICAL` (every class target is
 
 ## Enabling active control
 
-> **Phase status.** Active control is **experimental** in this release. `apply()`
-> implements the scale-factor lever with its full safety mechanics (live no-op check,
-> ownership, rollback baseline, non-blocking locks, failure recording) and, as of Phase
-> 1.7 F4, the self-protection layer — the [health-state authority gate](#health-state)
-> and the three-tier [mutation budget](#mutation-budget-invariant-4). The small-table
-> threshold lever and the analyze objective remain future work. Run advisory for a while
-> first and review the decision trail.
+Active control is the supported `advisory_only = false` path. `apply()` implements the
+scale-factor lever with its full safety mechanics (live no-op check, ownership, rollback
+baseline, non-blocking locks, failure recording) under the Phase 1.7 self-protection layer
+— the [health-state authority gate](#health-state) and the three-tier
+[mutation budget](#mutation-budget-invariant-4). Only the scale-factor lever is wired to
+actuation today; the small-table threshold lever and the analyze objective remain future
+work. Run advisory for a while first and review the decision trail.
 
 When you're satisfied with what the governor proposes, let it act by flipping one
 flag:
@@ -440,7 +440,17 @@ flag:
 UPDATE pgfc_govern.policy SET advisory_only = false WHERE policy_name = 'default';
 ```
 
-From the next `control_tick()`, approved `adjust` decisions are applied as batched
-`ALTER TABLE` changes — each recorded in `action_history` and reversible. Everything
-the governor changed can be rolled back; see [Safety first](concepts.md#safety-first)
-for the guarantees.
+From the next `control_tick()`, approved `adjust` decisions are applied as
+`ALTER TABLE` changes — each recorded in `action_history` and reversible. Two guarantees
+make this safe to turn on:
+
+- **It plans against settled state.** `control_tick()` actuates only against the newest
+  snapshot whose `estimate()` phase has completed, so it never acts on fresh observations
+  paired with the prior cycle's hidden state — even when `observe_tick()` and
+  `control_tick()` run on independent schedules.
+- **The live catalog is the arbiter.** `apply()` re-reads `pg_class.reloptions` at the
+  moment it acts; if a human changed the value to the proposal in the meantime, the adjust
+  is silently downgraded to a no-op rather than re-applied.
+
+Everything the governor changed can be rolled back; see
+[Safety first](concepts.md#safety-first) for the guarantees.

@@ -260,6 +260,26 @@ section in the same pull request as your change (this is a convention, not a CI 
   un-scanned `governor_metrics` view). New pgTAP suite `18_load_shedding.sql` (33 tests, green
   on PG 15–18).
 
+- **Governor self-protection Phase 1.7 — F7 (active-control activation).** The culmination of
+  Phase 1.7: with the safety net built and proven (F1–F6), the supported `advisory_only =
+  false` path is now first-class, not experimental. No new actuation machinery — `apply()`,
+  the F4 authority gate, and the Invariant-4 budget already existed — F7 closes the two
+  activation hazards the project recorded against turning actuation on. **Loop-ordering
+  contract:** `control_tick()` now plans against the newest snapshot whose `estimate()` phase
+  has *completed* (`max(snapshot_id)` from `relation_estimate`) rather than the newest
+  *observed* snapshot. The advisory lock serializes `control_tick()` against itself but not
+  against `observe_tick()`; on independent cron schedules the old selection could pair fresh
+  observations with the prior cycle's hidden state, so actuation could act on a half-built
+  picture. Selecting the estimated snapshot makes the ordering explicit and is literal-free
+  (clean under the P3 drift gate). **Stale-window arbiter:** `apply()`'s existing re-read of
+  live `pg_class.reloptions` — which downgrades a planned `adjust` to a *silent* no-op when a
+  human changed the value to the proposal between observe and apply — now has the test the
+  README earmarked for activation. **De-experimentalized:** `validate_parameters()` no longer
+  frames `advisory_only = false` as experimental (still a `WARNING` — it is the most
+  consequential operational state), and the operating guide documents activation as a
+  supported path with its two safety guarantees. New pgTAP suite `19_activation.sql` (9 tests,
+  green on PG 15–18).
+
 ### Changed
 
 - **`docs/` is now the self-contained, as-built spec.** The hand-written guides no
