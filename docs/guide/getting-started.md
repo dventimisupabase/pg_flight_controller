@@ -13,6 +13,10 @@ tells you what it *would* do without changing anything.
 
 ## Install
 
+These instructions track the current release,
+**[v0.1.0](https://github.com/dventimisupabase/pg_flight_controller/releases/tag/v0.1.0)**
+(both extensions at version `0.1.0`).
+
 `pgfc_govern` depends on `pgfc_observe`, so install observe first:
 
 ```sql
