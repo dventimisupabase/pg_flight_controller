@@ -2,7 +2,9 @@
 
 The mental model behind the governor — enough to operate it and to read its
 decisions. This page is self-contained; the [reference](../reference/pgfc_govern.md)
-has the exhaustive table, view, and function lists.
+has the exhaustive table, view, and function lists. It describes the
+[v0.1.0 release](https://github.com/dventimisupabase/pg_flight_controller/releases/tag/v0.1.0)
+— the governor through Phase 1.7.
 
 ## Autovacuum settings are actuator positions
 
