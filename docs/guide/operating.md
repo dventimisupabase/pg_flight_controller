@@ -67,6 +67,19 @@ SELECT mutations_last_hour, mutations_last_day, failed_last_day,
 FROM pgfc_govern.catalog_health;
 ```
 
+`governor_metrics` is the one-row self-monitoring substrate (Phase 1.7 F1) the
+health-state machine reads — action outcomes over a window, observation lag, loop
+durations, and the storage/retention footprint. It always returns one row (counts
+`0`, freshness `NULL`) so it never vanishes when the governor is unhealthy:
+
+<!-- doctest -->
+
+```sql
+SELECT applied_actions_last_hour, failed_actions_last_hour, lock_timeouts_last_hour,
+       observation_lag, last_tick_duration, storage_bytes
+FROM pgfc_govern.governor_metrics;
+```
+
 ## Diagnostics
 
 When more aggressiveness can't help, the governor records a finding instead of

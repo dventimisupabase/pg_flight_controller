@@ -157,6 +157,18 @@ section in the same pull request as your change (this is a convention, not a CI 
   function argument, so a key-value override table would have no consumer; it lands when a
   tunable without a typed home actually appears (likely Phase 1.7). This completes Phase 1.6.
 
+- **Governor self-protection Phase 1.7 — F1 (self-monitoring metrics).** New one-row
+  `pgfc_govern.governor_metrics` view: the read-only substrate the forthcoming F2
+  health-state evaluator reads. It exposes applied/failed/lock-timeout action counts over
+  1 h/1 d windows, observation lag (newest snapshot age), loop durations + tick errors
+  (`tick_log`), the self-health storage footprint, and the oldest retained audit row
+  (`oldest_action_at`, a threshold-free retention-backlog signal). It has no driving `FROM`, so it
+  **always returns exactly one row** — counts are `0` and freshness signals `NULL` when
+  nothing has happened yet — so the substrate never vanishes precisely when the governor is
+  least healthy (no snapshots landing, no ticks finishing). Read-only; no behaviour change.
+  The action-count columns deliberately overlap the operator-facing `catalog_health`; the
+  reporting-window literals are the same out-of-scope convention (not in the drift gate).
+
 ### Changed
 
 - **`docs/` is now the self-contained, as-built spec.** The hand-written guides no
