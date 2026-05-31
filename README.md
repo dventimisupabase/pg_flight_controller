@@ -10,9 +10,13 @@ The goal is not to *tune* autovacuum once. It is to keep the database
 **self-stabilizing** as workloads change. The design draws on control theory, state
 estimation, and convergence engines — not machine learning.
 
-> **Status.** `pgfc_observe` (Phase 0) and `pgfc_govern` (Phase 1, **advisory-only**)
-> are shipped and tested on PostgreSQL 15–18. Active control (Phase 2) is in progress.
-> Out of the box the governor *recommends* and *diagnoses* but changes nothing.
+> **Status.** First tagged release:
+> **[v0.1.0](https://github.com/dventimisupabase/pg_flight_controller/releases/tag/v0.1.0)**.
+> `pgfc_observe` (telemetry) and `pgfc_govern` (the control loop) ship and are tested on
+> PostgreSQL 15–18, through Phase 1.7 — **advisory by default**, with supported active
+> control under the governor self-protection net (health states, circuit breakers,
+> authority limiting, mutation budget, oscillation detection, load shedding). Out of the
+> box the governor *recommends* and *diagnoses* but changes nothing until you enable it.
 
 ## Two extensions
 
