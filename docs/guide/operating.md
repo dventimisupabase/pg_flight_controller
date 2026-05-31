@@ -1,7 +1,9 @@
 # Operating the governor
 
 Day-to-day use: express policy, read what the governor sees, act on diagnostics, and
-— when you're ready — let it change settings.
+— when you're ready — let it change settings. This guide describes the
+[v0.1.0 release](https://github.com/dventimisupabase/pg_flight_controller/releases/tag/v0.1.0)
+— the governor through Phase 1.7.
 
 ## Express policy
 
