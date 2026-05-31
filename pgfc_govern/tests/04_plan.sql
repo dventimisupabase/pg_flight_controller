@@ -1,7 +1,7 @@
 -- plan(): decision routing (advisory) and diagnostics dedup/resolve.
 -- relation_class/relation_estimate are seeded directly to exercise routing in isolation.
 BEGIN;
-SELECT plan(14);
+SELECT plan(17);
 
 -- Two snapshots: S1 horizon healthy ('none'), S2 horizon pinned.
 INSERT INTO pgfc_observe.snapshots
@@ -65,6 +65,14 @@ SELECT is((SELECT decision FROM pgfc_govern.decision_log WHERE relid=92006 ORDER
           'adjust', 'freeze floor drives toward cleanest => adjust');
 SELECT is((SELECT proposed_value FROM pgfc_govern.decision_log WHERE relid=92006 ORDER BY decision_id DESC LIMIT 1),
           '0.01', 'freeze floor target is sf_min (0.01)');
+
+-- estimated_benefit (P4): populated for an adjust (the tightening), NULL when nothing changes.
+SELECT ok((SELECT estimated_benefit FROM pgfc_govern.decision_log WHERE relid=92001 ORDER BY decision_id DESC LIMIT 1) IS NOT NULL,
+          'adjust records an estimated_benefit');
+SELECT ok((SELECT estimated_benefit FROM pgfc_govern.decision_log WHERE relid=92002 ORDER BY decision_id DESC LIMIT 1) IS NULL,
+          'hold records no estimated_benefit (NULL)');
+SELECT ok((SELECT estimated_benefit FROM pgfc_govern.decision_log WHERE relid=92004 ORDER BY decision_id DESC LIMIT 1) IS NULL,
+          'suppressed records no estimated_benefit (NULL)');
 
 -- diagnostic opened under the healthy horizon
 SELECT is((SELECT count(*) FROM pgfc_govern.diagnostics WHERE relid=92003 AND resolved_at IS NULL),

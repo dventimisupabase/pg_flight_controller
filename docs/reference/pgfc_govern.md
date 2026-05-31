@@ -59,6 +59,7 @@ Every actuator attempt (applied or failed). revert() replays only status=applied
 | `decision` | `text` |  |
 | `proposed_value` | `text` |  |
 | `policy_rule` | `text` |  |
+| `estimated_benefit` | `double precision` |  |
 | `applied` | `boolean` |  |
 | `created_at` | `timestamp with time zone` |  |
 
@@ -314,6 +315,10 @@ Prune audit tables by time cutoff (decisions/actions 180d, ticks 180d, resolved 
 ### `pgfc_govern.storage_budget() → TABLE(schema_name text, relation text, bytes bigint, dead_tuples bigint)`
 
 Whole-governor storage report (S6): per-relation bytes + dead tuples across pgfc_observe and pgfc_govern, tagged by schema.
+
+### `pgfc_govern.validate_parameters() → TABLE(parameter text, status text, message text)`
+
+Parameter validation (Phase 1.6 P4): grades the live operator configuration against the registry's safety bounds (OK/WARNING/CRITICAL). The reviewability surface; checks hard safety properties only.
 
 ### `pgfc_govern.verify(p_tick_id bigint) → integer`
 

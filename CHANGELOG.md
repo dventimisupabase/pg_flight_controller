@@ -144,6 +144,19 @@ section in the same pull request as your change (this is a convention, not a CI 
   but may still drift): the excluded functions' `retain()`/`degrade()` signature defaults, the
   `policy` table-column defaults, and `catalog_health`'s reporting windows.
 
+- **Parameter governance Phase 1.6 — P4 (validation + adaptive provenance).** New
+  `pgfc_govern.validate_parameters()` grades the live operator configuration against the
+  registry's safety bounds (`OK`/`WARNING`/`CRITICAL`) — the reviewability surface, checking
+  hard safety properties only (e.g. `aggressiveness <= 0` is `CRITICAL`; `advisory_only =
+  false` and a zero mutation budget are `WARNING`s). `decision_log` gains an
+  `estimated_benefit` column (the tightening an `adjust` applies — current scale factor minus
+  proposed; `NULL` when the decision changes nothing), closing appendix E's adaptive-value
+  change-history gap. **Scope note:** the `parameter_override` key-value table + `_get_config`
+  getter from the design were deliberately **deferred** — every overridable parameter today
+  already has a typed config home (`policy` / `storage_config` / `collection_policy`) or a
+  function argument, so a key-value override table would have no consumer; it lands when a
+  tunable without a typed home actually appears (likely Phase 1.7). This completes Phase 1.6.
+
 ### Changed
 
 - **`docs/` is now the self-contained, as-built spec.** The hand-written guides no
