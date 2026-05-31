@@ -85,21 +85,40 @@ FROM pgfc_govern.governor_metrics;
 Each control cycle the governor evaluates its own health (Phase 1.7 F2) from those
 metrics and records it as a single state. The states, in order of increasing caution:
 
-- **`normal`** — full operation.
-- **`degraded`** — mild trouble (telemetry going stale, a few failed actions, or over the
-  storage budget); observe/estimate/diagnose continue, actuation is limited.
-- **`diagnostic`** — repeated failures or a lock-timeout storm; no actuation except
-  permitted safety actions.
+- **`normal`** — full operation; actuation permitted.
+- **`degraded`** — mild trouble (telemetry going stale, a few failed actions, over the
+  storage budget, or the daily mutation budget spent); observe/estimate/diagnose continue
+  and actuation is still **permitted** — degraded is "limited," one breaker-step from
+  suspension, not suspended.
+- **`diagnostic`** — repeated failures or a lock-timeout storm; **actuation is suspended**
+  (observation and diagnosis continue).
 - **`emergency`** — the governor is effectively flying blind (observation badly stale);
-  minimal observation and health reporting only.
+  minimal observation and health reporting only, **no actuation**.
 - **`disabled`** — nothing acts; history is preserved. Reached **only** via the operator
   override (`disable()`); the automatic evaluator never gets there.
 
 A fresh governor with no observations is `normal`, not `emergency` — absence of data at
-boot is not ill health. The state is currently **advisory**: it is computed, recorded, and
-surfaced, but does not yet gate actuation (that authority gate is a later increment). The
-automatic evaluator only reaches `emergency` via stale observation today; more triggers
-(oscillation, load) arrive with later increments.
+boot is not ill health. As of Phase 1.7 F4 the state is **load-bearing, not advisory**: it
+is the authority gate `apply()` consults each cycle. When the governor is `diagnostic`,
+`emergency`, or `disabled`, `apply()` refuses ordinary actuation; `normal` and `degraded`
+permit it (subject to the mutation budget below). A withheld actuation is declined
+silently — it is never recorded as a failed action, which would otherwise feed the
+failed-action breaker and amplify itself. Refusing to *tighten* a setting never reduces
+freeze safety: the prior setting and PostgreSQL's own anti-wraparound autovacuum remain in
+place. The automatic evaluator only reaches `emergency` via stale observation today; more
+triggers (oscillation, load) arrive with later increments.
+
+### Mutation budget (Invariant 4)
+
+The governor never performs unlimited corrective actions. Three caps, all enforced in
+`apply()` and read live from the active policy:
+
+- **`min_interval`** — at most one mutation per relation per interval (default 1 hour).
+- **`global_max_changes_per_cycle`** — a cluster-wide cap on changes in one control cycle.
+- **`daily_mutation_budget`** — a cluster-wide cap on changes per rolling day. Spending it
+  also trips a `degraded`-level circuit breaker (visible in `governor_state.reason`) — a
+  signal, not a suspension: the hard cap in `apply()` already holds the line, and the
+  governor keeps acting up to the cap.
 
 Read the current state and the transition history:
 
@@ -337,10 +356,11 @@ opinions: e.g. `aggressiveness <= 0` is `CRITICAL` (every class target is
 
 > **Phase status.** Active control is **experimental** in this release. `apply()`
 > implements the scale-factor lever with its full safety mechanics (live no-op check,
-> ownership, rollback baseline, non-blocking locks, failure recording), but the
-> actuation-economy rate limits, the small-table threshold lever, and the analyze
-> objective land in Phase 2. Run advisory for a while first and review the decision
-> trail.
+> ownership, rollback baseline, non-blocking locks, failure recording) and, as of Phase
+> 1.7 F4, the self-protection layer — the [health-state authority gate](#health-state)
+> and the three-tier [mutation budget](#mutation-budget-invariant-4). The small-table
+> threshold lever and the analyze objective remain future work. Run advisory for a while
+> first and review the decision trail.
 
 When you're satisfied with what the governor proposes, let it act by flipping one
 flag:

@@ -200,6 +200,26 @@ section in the same pull request as your change (this is a convention, not a CI 
   F4 authority gate, which reads the state these functions set). No new registry parameters
   — the override carries no governed constants.
 
+- **Governor self-protection Phase 1.7 — F4 (authority gate + Invariant-4 mutation budget).**
+  The active-control gate: the health state is now **load-bearing**, not advisory. `apply()`
+  consults `governor_state` and refuses ordinary actuation when the governor is `diagnostic`,
+  `emergency`, or `disabled`; `normal` and `degraded` permit it (`degraded` is "limited" — one
+  breaker-step from suspension, not suspended). A withheld actuation returns `false`
+  **silently** — deliberately *not* recorded as `status='failed'`, which would feed the
+  failed-action breaker and create a self-amplifying suspension loop. The existing
+  failure-driven F2 transitions (failed actions, lock timeouts) thus become real circuit
+  breakers now that the state gates `apply()`. **Invariant 4** is enforced at the single
+  `apply()` chokepoint as a three-tier mutation budget — per-relation `min_interval`, per-cycle
+  `global_max_changes_per_cycle`, and per-day `daily_mutation_budget` — read live from the
+  active policy (registry default as fallback). Spending the daily budget also trips a
+  `degraded`-level circuit breaker in `evaluate_health()` (a visible signal, never a
+  suspension; the hard cap already holds the line). Refusing to *tighten* never violates
+  Invariant 3 — the prior setting and PostgreSQL's own anti-wraparound autovacuum stay in
+  place. No new tables, columns, or registry parameters: the budget reuses the existing
+  `policy` knobs and registry safety-bounds, and every new comparison is literal-free so the
+  decision/actuation path stays clean under the P3 drift gate. `advisory_only` stays `true`
+  by default — flipping it to live operation is F7.
+
 ### Changed
 
 - **`docs/` is now the self-contained, as-built spec.** The hand-written guides no

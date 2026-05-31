@@ -846,12 +846,34 @@ DECLARE
     v_base_explicit boolean;
     v_base_value    text;
     v_decid bigint;
+    -- Phase 1.7 F4 — authority gate + Invariant-4 mutation budget.
+    v_state        pgfc_govern.governor_health_state;
+    v_min_interval interval;
+    v_max_cycle    integer;
+    v_daily_budget integer;
 BEGIN
     SELECT decision_id, decision, proposed_value INTO v_decid, v_dec, v_prop
     FROM pgfc_govern.decision_log
     WHERE tick_id = p_tick_id AND relid = p_relid AND actuator = v_act
     ORDER BY decision_id DESC LIMIT 1;
     IF v_dec IS DISTINCT FROM 'adjust' THEN RETURN false; END IF;
+
+    -- Authority gate (Phase 1.7 F4): the governor governs itself before PostgreSQL. The
+    -- health state computed by evaluate_health() bounds the authority to act. normal =
+    -- full; degraded = limited (in this single-actuator MVP, "limited" collapses to
+    -- "still permitted, but one circuit-breaker step from suspension" — appendix F allows
+    -- degraded authority to "may be reduced", not "must"); diagnostic/emergency/disabled
+    -- suspend ordinary actuation entirely. Refusing here NEVER violates Invariant 3
+    -- (never reduce freeze safety): declining to TIGHTEN leaves the prior setting and
+    -- PostgreSQL's own anti-wraparound autovacuum in place — the freeze floor in plan()
+    -- is what guarantees we never propose a LOOSER setting under freeze stress, and that
+    -- is banked. A refusal returns false silently (like the other early-outs below) — it
+    -- is deliberately NOT recorded as status='failed', which would feed the failed-action
+    -- breaker and create a self-amplifying suspension loop. The state is the audit trail.
+    SELECT state INTO v_state FROM pgfc_govern.governor_state;
+    IF v_state IN ('diagnostic', 'emergency', 'disabled') THEN
+        RETURN false;
+    END IF;
 
     SELECT relname, reloptions INTO v_relname, v_live FROM pg_class WHERE oid = p_relid;
     IF v_relname IS NULL THEN RETURN false; END IF;                 -- relation vanished
@@ -863,6 +885,38 @@ BEGIN
 
     v_cur := pgfc_observe.effective_reloption(v_live, v_act);       -- live ground truth
     IF v_cur IS NOT DISTINCT FROM v_prop THEN RETURN false; END IF; -- no-op vs live
+
+    -- Invariant 4 — never exceed mutation budgets (Phase 1.7 F4). The three-tier cap from
+    -- appendix F "Authority Limiting", enforced at the single actuation chokepoint. Values
+    -- are read live from the active policy and fall back to the registry default (the same
+    -- policy-COALESCE-registry resolution control_tick() uses for advisory_only), so an
+    -- operator who tightens the budget is honored immediately. Windows/counts carry no
+    -- inline numeric literals (the per-day window is sourced from the governor_metrics
+    -- view, the per-cycle scope from the tick id) so apply() stays clean under the P3
+    -- drift gate. An over-budget attempt is refused silently, exactly like the gate above.
+    SELECT min_interval, global_max_changes_per_cycle, daily_mutation_budget
+      INTO v_min_interval, v_max_cycle, v_daily_budget
+      FROM pgfc_govern.policy WHERE enabled ORDER BY policy_name LIMIT 1;
+    v_min_interval := COALESCE(v_min_interval, pgfc_govern._param('min_interval')::interval);
+    v_max_cycle    := COALESCE(v_max_cycle, pgfc_govern._param('global_max_changes_per_cycle')::integer);
+    v_daily_budget := COALESCE(v_daily_budget, pgfc_govern._param('daily_mutation_budget')::integer);
+
+    -- per-relation rate limit: one mutation per relation per min_interval
+    IF EXISTS (SELECT 1 FROM pgfc_govern.action_history
+                WHERE relid = p_relid AND status = 'applied'
+                  AND applied_at > now() - v_min_interval) THEN
+        RETURN false;
+    END IF;
+    -- per-cycle cluster cap: bound the blast radius of any one control cycle
+    IF (SELECT count(*) FROM pgfc_govern.action_history ah
+          JOIN pgfc_govern.decision_log dl ON dl.decision_id = ah.decision_id
+         WHERE dl.tick_id = p_tick_id AND ah.status = 'applied') >= v_max_cycle THEN
+        RETURN false;
+    END IF;
+    -- per-day cluster cap: bound sustained mutation pressure on the catalog
+    IF (SELECT applied_actions_last_day FROM pgfc_govern.governor_metrics) >= v_daily_budget THEN
+        RETURN false;
+    END IF;
 
     -- baseline: capture pre-governor state on first touch, never overwrite
     SELECT baseline_explicit, baseline_value INTO v_base_explicit, v_base_value
@@ -920,7 +974,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.apply(bigint, oid) IS
-  'Actuate one relation''s approved scale-factor change (gated by advisory_only).';
+  'Actuate one relation''s approved scale-factor change. Gated by advisory_only (the dry-run switch), then by the Phase 1.7 F4 self-protection layer: the governor health-state authority gate (refuses when diagnostic/emergency/disabled) and the three-tier Invariant-4 mutation budget (per-relation min_interval, per-cycle and per-day cluster caps). A refused attempt returns false silently — never recorded as a failed action.';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- verify(): close the loop on past actions. Phase 1 has nothing applied to verify;
@@ -958,8 +1012,9 @@ BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('pgfc_govern.control_tick'));  -- no overlap
 
     -- Govern itself before it governs PostgreSQL: refresh the health state from the
-    -- self-monitoring substrate first (Phase 1.7 F2). Advisory in F2 — recorded, not yet
-    -- gating actuation (the apply() authority gate consults governor_state in F4).
+    -- self-monitoring substrate FIRST (Phase 1.7 F2), so the state apply() consults this
+    -- cycle reflects the latest self-monitoring signals. As of F4 this is load-bearing,
+    -- not advisory: the state computed here is what the apply() authority gate enforces.
     PERFORM pgfc_govern.evaluate_health();
 
     SELECT advisory_only INTO v_adv FROM pgfc_govern.policy
@@ -1725,9 +1780,17 @@ DECLARE
     v_reason   text;
     v_forced   pgfc_govern.governor_health_state;
     v_freason  text;
+    v_daily_budget integer;
 BEGIN
     SELECT * INTO m FROM pgfc_govern.governor_metrics;     -- guaranteed one row (F1)
     v_lag := EXTRACT(EPOCH FROM m.observation_lag);        -- NULL when nothing observed yet
+
+    -- Effective daily mutation budget (Phase 1.7 F4 breaker), resolved the same way apply()
+    -- does: live policy, falling back to the registry default — so the breaker tracks the
+    -- same cap the authority limiter enforces.
+    SELECT daily_mutation_budget INTO v_daily_budget
+      FROM pgfc_govern.policy WHERE enabled ORDER BY policy_name LIMIT 1;
+    v_daily_budget := COALESCE(v_daily_budget, pgfc_govern._param('daily_mutation_budget')::integer);
 
     SELECT c.state, c.reason INTO v_computed, v_reason
     FROM (VALUES
@@ -1753,7 +1816,17 @@ BEGIN
               THEN format('%s lock timeouts in the last hour', m.lock_timeouts_last_hour) END),
         -- storage pressure: the governor is over its own footprint budget
         (CASE WHEN m.over_budget THEN 'degraded' ELSE 'normal' END::pgfc_govern.governor_health_state,
-         CASE WHEN m.over_budget THEN 'governor storage footprint over budget' END)
+         CASE WHEN m.over_budget THEN 'governor storage footprint over budget' END),
+        -- mutation-budget circuit breaker (Phase 1.7 F4): the governor has spent its
+        -- per-day Invariant-4 budget. This is a degraded-level SIGNAL, never diagnostic:
+        -- hitting the budget is normal authority limiting, not ill health, and apply()'s
+        -- hard cap already refuses the over-budget mutations — so the governor stays
+        -- visible (degraded) and keeps acting up to the cap, rather than suspending itself.
+        (CASE WHEN m.applied_actions_last_day >= v_daily_budget THEN 'degraded'
+              ELSE 'normal' END::pgfc_govern.governor_health_state,
+         CASE WHEN m.applied_actions_last_day >= v_daily_budget
+              THEN format('daily mutation budget spent (%s applied in the last day)',
+                          m.applied_actions_last_day) END)
     ) AS c(state, reason)
     ORDER BY c.state DESC, (c.reason IS NULL)              -- worst state; non-null reason wins ties
     LIMIT 1;
@@ -1787,7 +1860,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.evaluate_health() IS
-  'Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds, then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. Advisory — does not gate actuation (that is the F4 authority gate). Returns the effective state.';
+  'Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds (failed actions, lock timeouts, observation lag, storage footprint, and the F4 daily-mutation-budget circuit breaker — degraded-level only), then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. The state it writes is the input to the F4 apply() authority gate. Returns the effective state.';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Human-override surface  (Phase 1.7 F3 — governor self-protection)
