@@ -200,6 +200,29 @@ Single-row storage config (S6): budget_bytes is the total-bytes cap over both sc
 | `pg_class_last_autovacuum` | `timestamp with time zone` |
 | `collected_at` | `timestamp with time zone` |
 
+### pgfc_govern.governor_metrics
+
+One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-state evaluator: applied/failed/lock-timeout action counts over 1h/1d windows, observation lag (newest snapshot age), loop durations + tick errors (tick_log), the self-health storage footprint, and the oldest retained audit row (retention backlog). Always returns one row; counts are 0 and freshness signals NULL when nothing has happened yet.
+
+| Column | Type |
+| --- | --- |
+| `applied_actions_last_hour` | `bigint` |
+| `applied_actions_last_day` | `bigint` |
+| `failed_actions_last_hour` | `bigint` |
+| `failed_actions_last_day` | `bigint` |
+| `lock_timeouts_last_hour` | `bigint` |
+| `lock_timeouts_last_day` | `bigint` |
+| `newest_snapshot_at` | `timestamp with time zone` |
+| `observation_lag` | `interval` |
+| `last_tick_started_at` | `timestamp with time zone` |
+| `last_tick_finished_at` | `timestamp with time zone` |
+| `last_tick_duration` | `interval` |
+| `max_tick_duration_last_day` | `interval` |
+| `tick_errors_last_day` | `bigint` |
+| `storage_bytes` | `numeric` |
+| `over_budget` | `boolean` |
+| `oldest_action_at` | `timestamp with time zone` |
+
 ### pgfc_govern.governor_status
 
 | Column | Type |

@@ -1543,3 +1543,54 @@ BEGIN
     END LOOP;
 END
 $reloptions$;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Self-monitoring  (Phase 1.7 F1 — governor self-protection)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- The single one-row substrate the F2 health-state evaluator will read. It has NO
+-- driving FROM, so it ALWAYS returns exactly one row — counts COALESCE to 0, and
+-- freshness signals (observation lag, last tick) are NULL when nothing has been
+-- observed/ticked yet. That property is the point: the view must not vanish
+-- precisely when the governor is least healthy (no snapshots landing, no ticks
+-- finishing). Defined here, at the file tail, because it reads self_health (S6).
+-- The reporting-window literals are the same out-of-scope convention as
+-- catalog_health (deliberately not in the drift gate; the gate scans the
+-- decision/actuation path and governor_status, not these report views). The
+-- action-count columns overlap catalog_health (the operator-facing pg_class
+-- footprint view) on purpose; this is the machine substrate, adding lock-timeouts,
+-- observation lag, loop durations, tick errors, and the self-health footprint.
+CREATE OR REPLACE VIEW pgfc_govern.governor_metrics AS
+SELECT
+    -- actuation outcomes over a window (mutation pressure + breaker substrate)
+    (SELECT COALESCE(count(*), 0) FROM pgfc_govern.action_history
+      WHERE status = 'applied' AND applied_at > now() - interval '1 hour')  AS applied_actions_last_hour,
+    (SELECT COALESCE(count(*), 0) FROM pgfc_govern.action_history
+      WHERE status = 'applied' AND applied_at > now() - interval '1 day')   AS applied_actions_last_day,
+    (SELECT COALESCE(count(*), 0) FROM pgfc_govern.action_history
+      WHERE status = 'failed'  AND applied_at > now() - interval '1 hour')  AS failed_actions_last_hour,
+    (SELECT COALESCE(count(*), 0) FROM pgfc_govern.action_history
+      WHERE status = 'failed'  AND applied_at > now() - interval '1 day')   AS failed_actions_last_day,
+    (SELECT COALESCE(count(*), 0) FROM pgfc_govern.action_history
+      WHERE failure_reason = 'lock_timeout' AND applied_at > now() - interval '1 hour') AS lock_timeouts_last_hour,
+    (SELECT COALESCE(count(*), 0) FROM pgfc_govern.action_history
+      WHERE failure_reason = 'lock_timeout' AND applied_at > now() - interval '1 day')  AS lock_timeouts_last_day,
+    -- observation freshness (NULL = nothing observed yet)
+    (SELECT max(collected_at) FROM pgfc_observe.snapshots)                   AS newest_snapshot_at,
+    now() - (SELECT max(collected_at) FROM pgfc_observe.snapshots)           AS observation_lag,
+    -- loop health from tick_log (NULL = nothing ticked / not yet finished)
+    (SELECT started_at  FROM pgfc_govern.tick_log ORDER BY tick_id DESC LIMIT 1) AS last_tick_started_at,
+    (SELECT finished_at FROM pgfc_govern.tick_log ORDER BY tick_id DESC LIMIT 1) AS last_tick_finished_at,
+    (SELECT finished_at - started_at FROM pgfc_govern.tick_log
+       ORDER BY tick_id DESC LIMIT 1)                                        AS last_tick_duration,
+    (SELECT max(finished_at - started_at) FROM pgfc_govern.tick_log
+       WHERE started_at > now() - interval '1 day')                         AS max_tick_duration_last_day,
+    (SELECT COALESCE(count(*), 0) FROM pgfc_govern.tick_log
+      WHERE error IS NOT NULL AND started_at > now() - interval '1 day')    AS tick_errors_last_day,
+    -- storage footprint (sourced from the self-health view)
+    (SELECT total_bytes FROM pgfc_govern.self_health)                       AS storage_bytes,
+    (SELECT over_budget FROM pgfc_govern.self_health)                       AS over_budget,
+    -- retention backlog: age of the oldest retained mutation audit row. A raw,
+    -- threshold-free signal; F2 compares it to the governed retention cutoff.
+    (SELECT min(applied_at) FROM pgfc_govern.action_history)                AS oldest_action_at;
+COMMENT ON VIEW pgfc_govern.governor_metrics IS
+  'One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-state evaluator: applied/failed/lock-timeout action counts over 1h/1d windows, observation lag (newest snapshot age), loop durations + tick errors (tick_log), the self-health storage footprint, and the oldest retained audit row (retention backlog). Always returns one row; counts are 0 and freshness signals NULL when nothing has happened yet.';
