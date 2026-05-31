@@ -1142,6 +1142,170 @@ COMMENT ON FUNCTION pgfc_govern.degrade(bigint, interval, interval, interval, in
   'Graceful-degrade prune order (S6): shed storage raw→fine→coarse rollups→diagnostics→actions until under budget; policy is never pruned. No-op when no budget is configured. Returns the ordered prune log.';
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Parameter registry  (Phase 1.6 — parameter governance, P1)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Canonical PROVENANCE registry of pgfc_govern's governed constants — the control-logic
+-- values the governor steers with. Same discipline and shape as
+-- pgfc_observe._parameter_registry(). In P1 these values still live as literals in
+-- classify()/estimate()/plan()/snap_sf()/governor_status, and this function is a separate,
+-- hand-maintained record of them. The single-sourcing increment then makes those
+-- functions READ from here (the _profile_settings() pattern), and a CI gate enforces that
+-- no control literal escapes the registry. Values here MUST match the live code until that
+-- de-duplication lands (P2/P3).
+-- category ∈ {postgresql_derived, safety_bound, empirical_default, operator_policy,
+-- adaptive_value, implementation_convenience}; override_allowed is orthogonal to category.
+CREATE OR REPLACE FUNCTION pgfc_govern._parameter_registry()
+RETURNS TABLE(
+    parameter_name   text,
+    category         text,
+    default_value    text,
+    unit             text,
+    rationale        text,
+    source           text,
+    owner            text,
+    override_allowed boolean,
+    config_ref       text)
+LANGUAGE sql IMMUTABLE AS $fn$
+VALUES
+  -- Safety bounds
+  ('sf_min', 'safety_bound', '0.01', 'fraction',
+   'Floor of the scale-factor actuator range; the governor never sets a table cleaner than this.',
+   'safety analysis', 'maintainer', false, NULL),
+  ('sf_max', 'safety_bound', '0.50', 'fraction',
+   'Ceiling of the scale-factor actuator range.',
+   'safety analysis', 'maintainer', false, NULL),
+  ('freeze_thr', 'safety_bound', '0.6', 'fraction of wraparound limit',
+   'Freeze debt at/above this fraction forces the cleanest scale factor (freeze floor), overriding saturation suppression.',
+   'safety analysis', 'maintainer', false, NULL),
+  ('lock_timeout', 'safety_bound', '100', 'ms',
+   'apply() SET LOCAL lock_timeout: never block on actuation — fail fast and retry.',
+   'safety analysis', 'maintainer', false, NULL),
+  ('daily_mutation_budget', 'safety_bound', '500', 'changes/day',
+   'Cluster-wide cap on applied catalog mutations per day (also operator policy).',
+   'design review', 'operator', true, 'policy.daily_mutation_budget'),
+  ('global_max_changes_per_cycle', 'safety_bound', '50', 'changes/cycle',
+   'Cluster-wide cap on applied changes per control cycle (also operator policy).',
+   'design review', 'operator', true, 'policy.global_max_changes_per_cycle'),
+  ('min_interval', 'safety_bound', '1 hour', 'interval',
+   'Per-relation minimum interval between catalog mutations (also operator policy).',
+   'design review', 'operator', true, 'policy.min_interval'),
+  -- Empirical defaults (estimation + classification + control grid)
+  ('observe_cadence', 'empirical_default', '1', 'minutes',
+   'How often observe_tick() runs.',
+   'MVP estimate — not yet benchmarked', 'operator', true, 'pg_cron schedule'),
+  ('control_cadence', 'empirical_default', '5', 'minutes',
+   'How often control_tick() runs.',
+   'MVP estimate — not yet benchmarked', 'operator', true, 'pg_cron schedule'),
+  ('ewma_tau', 'empirical_default', '3600', 'seconds',
+   'Time constant of the rate EWMA in estimate().',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('ewma_effa', 'empirical_default', '0.5', 'weight',
+   'EWMA weight for cleanup effectiveness / peak in estimate().',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('saturation_persistence_k', 'empirical_default', '3', 'cycles',
+   'Cycles a saturation cause must persist before estimate() commits it (hysteresis on the saturation state machine).',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('class_persistence_n_sustain', 'empirical_default', '3', 'cycles',
+   'Cycles a candidate class must persist before classify() commits it (hysteresis on the classification state machine; distinct from saturation_persistence_k).',
+   'MVP estimate — not yet benchmarked', 'operator', true, 'policy.n_sustain'),
+  ('classify_floor', 'empirical_default', '50', 'writes',
+   'Minimum recent writes before a relation is classified on its write-mix fractions.',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('classify_large', 'empirical_default', '100000', 'rows',
+   'reltuples above which a new, idle relation defaults to ''archive''.',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('classify_append_only_ins_frac', 'empirical_default', '0.95', 'fraction',
+   'Insert fraction above which a relation is append_only.',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('classify_delete_frac', 'empirical_default', '0.30', 'fraction',
+   'Delete fraction above which a relation is queue or delete_heavy (and update fraction for oltp).',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('classify_queue_balance_frac', 'empirical_default', '0.10', 'fraction',
+   'Max |ins−del| fraction for a delete-heavy relation to count as a balanced queue.',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('classify_append_only_del_frac', 'empirical_default', '0.01', 'fraction',
+   'Delete fraction below which (with high inserts) a relation is append_only.',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('eff_low', 'empirical_default', '0.5', 'fraction',
+   'Cleanup-effectiveness below which a vacuum that ran is treated as ineffective (saturation discriminator).',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('target_queue', 'empirical_default', '0.05', 'fraction',
+   'Target dead-tuple fraction for the queue class (before aggressiveness scaling).',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('target_delete_heavy', 'empirical_default', '0.10', 'fraction',
+   'Target dead-tuple fraction for the delete_heavy class.',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('target_oltp', 'empirical_default', '0.20', 'fraction',
+   'Target dead-tuple fraction for the oltp class.',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('target_mixed', 'empirical_default', '0.20', 'fraction',
+   'Target dead-tuple fraction for the mixed class.',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('target_append_only', 'empirical_default', '0.40', 'fraction',
+   'Target dead-tuple fraction for the append_only class.',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('target_archive', 'empirical_default', '0.50', 'fraction',
+   'Target dead-tuple fraction for the archive class.',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('sf_grid', 'empirical_default', '{0.01,0.02,0.05,0.10,0.20,0.30,0.50}', 'fraction set',
+   'Quantization grid the scale-factor target snaps to (snap_sf); the spacing is the anti-oscillation deadband.',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  -- Operator policy
+  ('aggressiveness', 'operator_policy', '1.0', 'multiplier',
+   'Scales every class target: >1 cleaner, <1 more bloat tolerated.',
+   'operator default', 'operator', true, 'policy.aggressiveness'),
+  ('freeze_posture', 'operator_policy', 'standard', 'enum',
+   'Freeze-safety posture: standard | conservative.',
+   'operator default', 'operator', true, 'policy.freeze_posture'),
+  ('manage_user_owned', 'operator_policy', 'false', 'boolean',
+   'Whether the governor may overwrite a reloption a user/other system set first.',
+   'operator default', 'operator', true, 'policy.manage_user_owned'),
+  ('advisory_only', 'operator_policy', 'true', 'boolean',
+   'Dry-run gate: when true, plan() decides but apply() never fires.',
+   'operator default', 'operator', true, 'policy.advisory_only'),
+  ('storage_budget_bytes', 'operator_policy', 'NULL', 'bytes',
+   'Total on-disk cap across both schemas that degrade() enforces; NULL disables it.',
+   'operator default', 'operator', true, 'storage_config.budget_bytes'),
+  ('keep_decisions_days', 'operator_policy', '180', 'days',
+   'Default retention for decision_log.',
+   'MVP estimate — not yet benchmarked', 'operator', true, 'retain() argument'),
+  ('keep_actions_days', 'operator_policy', '180', 'days',
+   'Default retention for action_history.',
+   'MVP estimate — not yet benchmarked', 'operator', true, 'retain() argument'),
+  ('keep_ticks_days', 'operator_policy', '180', 'days',
+   'Default retention for tick_log.',
+   'MVP estimate — not yet benchmarked', 'operator', true, 'retain() argument'),
+  ('keep_diagnostics_days', 'operator_policy', '365', 'days',
+   'Default retention for resolved diagnostics.',
+   'MVP estimate — not yet benchmarked', 'operator', true, 'retain() argument'),
+  -- Implementation convenience
+  ('govern_av_threshold', 'implementation_convenience', '200', 'rows',
+   'Static autovacuum threshold on the govern audit/state tables (scale_factor 0).',
+   'design review (S6)', 'maintainer', false, NULL),
+  -- Adaptive value (computed by the control logic; recorded in the audit trail, not a constant)
+  ('relation_scale_factor', 'adaptive_value', 'computed', 'fraction',
+   'Per-relation scale-factor setpoint plan() derives from the class target, aggressiveness, and table size; not a fixed value. Operators steer it indirectly via class and aggressiveness, never directly.',
+   'governor state estimation / control logic', 'governor', false, 'decision_log / action_history')
+$fn$;
+COMMENT ON FUNCTION pgfc_govern._parameter_registry() IS
+  'Canonical provenance registry of pgfc_govern governed constants (Phase 1.6 P1). Documents the as-built control-logic values; single-sourcing + drift gate land in P2/P3.';
+
+-- Operator-facing unified view: every governed parameter across BOTH schemas, tagged by
+-- schema. Lives in pgfc_govern (the dependent layer) so pgfc_observe stays standalone —
+-- the same layering as storage_budget()/self_health. The "inspect parameters without
+-- reading source" surface (Appendix-E reviewability). Effective-value resolution against
+-- live overrides arrives with the getter in a later increment; P1 exposes the canonical
+-- defaults + provenance.
+CREATE OR REPLACE VIEW pgfc_govern.parameter_registry AS
+    SELECT 'pgfc_observe'::text AS schema_name, r.*
+    FROM pgfc_observe._parameter_registry() r
+    UNION ALL
+    SELECT 'pgfc_govern'::text, r.*
+    FROM pgfc_govern._parameter_registry() r;
+COMMENT ON VIEW pgfc_govern.parameter_registry IS
+  'Unified, operator-facing parameter registry (Phase 1.6 P1): every governed constant across both schemas with category and provenance.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Additive upgrades
 -- ─────────────────────────────────────────────────────────────────────────────
 -- S6: static autovacuum reloptions on the governor's own audit/state tables. Unlike

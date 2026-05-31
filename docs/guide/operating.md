@@ -215,6 +215,30 @@ human-owned record of intent) are **never** pruned. With no `budget_bytes` confi
 SELECT cron.schedule('pgfc_govern_degrade', '27 3 * * *', $$SELECT pgfc_govern.degrade()$$);
 ```
 
+## Inspect the governed parameters
+
+The governor replaces autovacuum folklore with a control framework, so it must not hide
+folklore of its own: every governed constant — every threshold, bound, interval, ratio,
+and target — is registered with its category, value, unit, rationale, owner, and
+provenance, and is inspectable without reading source. The unified registry spans both
+schemas:
+
+<!-- doctest -->
+
+```sql
+SELECT schema_name, parameter_name, category, default_value, unit, override_allowed
+FROM pgfc_govern.parameter_registry
+ORDER BY schema_name, parameter_name;
+```
+
+Each row's `category` is one of `postgresql_derived`, `safety_bound`,
+`empirical_default`, `operator_policy`, `adaptive_value`, or
+`implementation_convenience`; `override_allowed` (independent of category) says whether an
+operator may change it, and `config_ref` names where — e.g. `policy.aggressiveness`. Many
+control values are honestly marked `MVP estimate — not yet benchmarked` in their
+`source`: that is the validation backlog, made visible on purpose. (An observe-only
+install reads `pgfc_observe._parameter_registry()` directly.)
+
 ## Enabling active control
 
 > **Phase status.** Active control is **experimental** in this release. `apply()`
