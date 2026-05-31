@@ -1063,7 +1063,15 @@ BEGIN
       WHERE enabled ORDER BY policy_name LIMIT 1;
     v_adv := COALESCE(v_adv, pgfc_govern._param('advisory_only')::boolean);
 
-    SELECT max(snapshot_id) INTO v_snap FROM pgfc_observe.snapshots;
+    -- Loop-ordering contract (Phase 1.7 F7). plan() joins the latest per-relation estimate
+    -- against current_relation_state(v_snap); now that actuation depends on the result, the
+    -- two must describe the SAME snapshot. The advisory lock serializes control_tick() against
+    -- itself but not against observe_tick(), so planning against the newest *observed*
+    -- snapshot could, on independent cron schedules, actuate fresh observations against the
+    -- prior cycle's hidden state. Plan instead against the newest snapshot whose estimate
+    -- phase has completed — estimate() stamps relation_estimate.snapshot_id, so max() here is
+    -- exactly the latest fully-estimated snapshot. NULL (no estimate yet) plans nothing — safe.
+    SELECT max(snapshot_id) INTO v_snap FROM pgfc_govern.relation_estimate;
     INSERT INTO pgfc_govern.tick_log (snapshot_id) VALUES (v_snap) RETURNING tick_id INTO v_tick;
 
     PERFORM pgfc_govern.plan(v_tick, v_snap);
@@ -1712,7 +1720,7 @@ FROM pol p
 UNION ALL
 SELECT 'advisory_only',
        CASE WHEN p.advisory_only THEN 'OK' ELSE 'WARNING' END,
-       format('advisory_only = %s (false enables active control — experimental in this release)', p.advisory_only)
+       format('advisory_only = %s (false: the governor actively applies changes under the health-state gate; true: plans only)', p.advisory_only)
 FROM pol p
 UNION ALL
 SELECT 'storage_budget_bytes',
