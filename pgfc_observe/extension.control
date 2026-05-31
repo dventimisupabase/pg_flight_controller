@@ -1,5 +1,5 @@
 # dbdev metadata for pgfc_observe (renamed to pgfc_observe.control at publish time).
 comment = 'pg_flight_controller: observe and orient (autovacuum governor telemetry)'
-default_version = '0.0.1'
+default_version = '0.1.0'
 relocatable = false
 schema = 'pgfc_observe'

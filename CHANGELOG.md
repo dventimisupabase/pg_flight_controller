@@ -6,6 +6,12 @@ section in the same pull request as your change (this is a convention, not a CI 
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-05-31
+
+First tagged release. `pgfc_observe` (telemetry) and `pgfc_govern` (control loop)
+through Phase 1.7: advisory by default, with supported active control under the
+governor self-protection net.
+
 ### Added
 
 - **`pgfc_observe` (Phase 0)** — read-only autovacuum telemetry: `snapshots` and
