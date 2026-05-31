@@ -1,0 +1,30 @@
+name: PR Hygiene
+
+# Enforces the merge-then-branch workflow: every PR must target the default
+# branch (main). Stacked PRs — a PR based on another feature branch — are
+# rejected, so increments land one at a time off a current main rather than
+# piling into a deep, conflict-prone stack.
+#
+# The job ALWAYS runs and fails inside the step (rather than gating the whole
+# job on a condition); a required check that is skipped reads as perpetually
+# pending and would block every merge. Mark "PR Hygiene / base-is-main" as a
+# required status check on main for this to be a hard guarantee.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]   # 'edited' catches base-branch retargeting
+
+jobs:
+  base-is-main:
+    name: base-is-main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require base branch = main
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          if [ "$BASE" != "main" ]; then
+            echo "::error::This PR targets '$BASE', not 'main'. Stacked PRs are not allowed — branch off main and target main (merge-then-branch)."
+            exit 1
+          fi
+          echo "OK: PR targets main"

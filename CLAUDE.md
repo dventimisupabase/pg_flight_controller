@@ -4,6 +4,8 @@
 
 Branches follow [Conventional Branches](https://conventional-branch.github.io/): `<type>/<short-description>`, where `<type>` matches Conventional Commits (`feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `perf`, `build`, `ci`, `style`, `revert`) and the description is kebab-case (e.g., `docs/improvements`, `feat/wraparound-monitoring`).
 
+**One increment per PR, merge-then-branch.** Branch each unit of work off the current `main` and target `main`. Do **not** open a PR whose base is another feature branch — no stacked PRs. Before starting the next increment, merge the current PR and confirm the squash landed on `main`, then branch again from the updated `main`. (Enforced on the remote by the `PR Hygiene / base-is-main` required check, which fails any PR not based on `main`.) If a genuine blocker forces working ahead of an unmerged PR, say so and ask before stacking — and keep any such stack shallow (one deep), never a long chain.
+
 ## Project Structure
 
 Two extensions, each in its own subdirectory:
