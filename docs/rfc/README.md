@@ -31,10 +31,10 @@ next finer level, **→** is a cross-link (a see-also or a consumer). The finest
 per-object documentation — is the generated [reference](#6-components-and-code-the-leaf-level),
 linked rather than copied.
 
-> **Outline status.** Sections 1–4 are drafted. Section 5 (subsystems) is seeded from the
-> confirmed object taxonomy — every database object has a home — but the per-subsystem prose,
-> rationale, and "feedback wanted" are still to be filled. Sections 6–9 describe conventions
-> now and fill in as the body lands.
+> **Outline status.** Sections 1–4 are drafted. In Section 5, the **observe subsystems
+> (O1–O5) are filled**; the govern subsystems (G1–G7) remain seeded stubs (correct objects
+> and cross-links, prose still to write). Sections 6–9 describe conventions now and fill in
+> as the body lands.
 
 ## Contents
 
@@ -346,48 +346,121 @@ full per-object docs live in the generated reference
 
 ### O1. Collection
 
-- **Responsibility:** take observations — sample autovacuum-relevant state, sparsely.
-- **Objects:** `observe()`, `collection_policy`, `relation_last_state` (UNLOGGED change
-  cache).
-- **Feedback wanted:** *(tbd — e.g. sparse-logging change-detection correctness; crash
-  rebuild of `relation_last_state`.)*
+- **Responsibility:** Collect one telemetry snapshot per run — a header row plus
+  per-relation autovacuum-relevant state — sampling **sparsely**, so a relation is recorded
+  only when its observed state actually changed since its last sample.
+- **Role:** The Observe stage's data-acquisition surface — the sole writer that turns live
+  catalog / `pg_stat` state into the persisted history the rest of the system Orients on.
+- **Objects:** `observe()` is the collector; `collection_policy` is a singleton config that
+  bounds *which* relations are sampled (system schemas always excluded, plus `exclude_temp`,
+  `include_extension_owned`, `excluded_schemas`, and a `min_partition_size_bytes` floor on
+  child partitions); `relation_last_state` is an UNLOGGED, catalog-rebuildable
+  change-signature cache giving O(1) "did this change?" detection. See the
+  [reference](../reference/pgfc_observe.md) and [source](../../pgfc_observe/install.sql).
+- **Consumers / cross-links:** the dense-reconstruction readers
+  ([O3](#o3-derived-state-and-readers)) and the rollup tiers
+  ([O2](#o2-storage-and-retention)) consume what `observe()` wrote — the filtered, sparse set
+  propagates downstream rather than being re-filtered.
+- **Feedback wanted:** (1) the change test is a full-row `IS DISTINCT FROM` over the dense
+  signature — is any governance-relevant field omitted, such that a meaningful change is
+  coalesced and a sample skipped? (2) after a crash the UNLOGGED cache is empty, so the next
+  `observe()` re-samples every included relation once — is that one-time dense burst
+  acceptable, and is "empty cache" always safely equivalent to "never seen"? (3) are
+  `collection_policy`'s four filters the right knobs?
 - ↑ [pgfc_observe](#41-pgfc_observe) · → writes the raw tables owned by
   [O2](#o2-storage-and-retention).
 
 ### O2. Storage and retention
 
-- **Responsibility:** bounded, bloat-free persistence — partitioned raw tables, rollups,
-  GC, and the extension's own table maintenance. *(Home of finding FMEA-001.)*
-- **Objects:** `relation_samples`, `snapshots`, `rollup_1m`/`rollup_1h`/`rollup_1d`;
-  `_ensure_partition`, `_partition_inventory`, `_epoch_day`/`_epoch_month`/`_month_start`,
-  `retain`, `drop_empty_partitions`, `rollup`, `rollup_retain`, `_rollup_coarsen`,
-  `_rollup_inventory`, `current_rollup`, `_telemetry_reloptions`.
-- **Feedback wanted:** the partition-recycling strategy — see
-  [FMEA-001](../fortification/02-failure-theory.md#fmea-001--partition-recycling-uses-createdrop-not-a-fixed-truncate-ring)
-  (create/drop vs. a fixed `TRUNCATE` ring).
+- **Responsibility:** Bounded, bloat-free persistence for telemetry — raw samples kept only
+  a few days, aggregated into long-range rollups, and reclaimed by whole-partition rotation
+  rather than row deletes. *(Home of finding FMEA-001.)*
+- **Role:** The durable layer of `pgfc_observe`, between the collector that writes samples
+  ([O1](#o1-collection)) and the readers that serve state ([O3](#o3-derived-state-and-readers)).
+- **Objects:** high-volume raw tables `relation_samples` and `snapshots` (daily
+  `RANGE`-partitioned); rollup tiers `rollup_1m`/`rollup_1h`/`rollup_1d` (1m daily-, 1h/1d
+  monthly-partitioned). Partition lifecycle: `_ensure_partition` (on-demand day partitions,
+  called hot by the collector), `_partition_inventory`, and the key encoders
+  `_epoch_day`/`_epoch_month`/`_month_start`. Raw GC: `retain` (`TRUNCATE` partitions older
+  than the window, ~3 days) and `drop_empty_partitions` (`DROP` long-empty shells). Rollup
+  pipeline: `rollup` and `_rollup_coarsen` (cascade raw into the tiers with
+  sample-count-weighted aggregates), `rollup_retain` (cascading per-tier `DROP`),
+  `_rollup_inventory`, and `current_rollup` (reads a tier carrying the last bucket forward).
+  `_telemetry_reloptions` supplies the static, aggressive autovacuum reloptions applied to
+  every telemetry partition (self-maintenance). See the
+  [reference](../reference/pgfc_observe.md) and [source](../../pgfc_observe/install.sql).
+- **Consumers / cross-links:** read by [O3](#o3-derived-state-and-readers), which derives
+  current and historical state from these tables (including `current_rollup`'s carry-forward
+  reads).
+- **Feedback wanted:** is the partition-recycling strategy sound — create/drop vs. a fixed
+  `TRUNCATE` ring — see
+  [FMEA-001](../fortification/02-failure-theory.md#fmea-001--partition-recycling-uses-createdrop-not-a-fixed-truncate-ring)?
+  And is the rollup-before-truncate ordering (raw must be aggregated by `rollup()` before
+  `retain()` truncates its window) safe under skipped or lagging maintenance runs?
 - ↑ [pgfc_observe](#41-pgfc_observe) · → read by [O3](#o3-derived-state-and-readers).
 
 ### O3. Derived state and readers
 
-- **Responsibility:** turn raw, sparse telemetry into meaning (Orient).
-- **Objects:** `relation_health`, `maintenance_debt`; `current_relation_state`,
-  `removability_horizons`, `effective_reloption`.
-- **Feedback wanted:** *(tbd.)*
+- **Responsibility:** Turn the raw, sparsely-stored telemetry into meaning — dense
+  per-relation current state and the maintenance signals derived from it.
+- **Role:** The Orient step — interpreting what was observed before anyone decides.
+- **Objects:** `current_relation_state()` is the keystone reader: it reconstructs the dense,
+  as-of state per relation from sparse change-logged samples (carry-forward — the latest
+  sample at or before the target snapshot) and recomputes freeze ages *live* rather than
+  trusting stored ages. The `relation_health` and `maintenance_debt` views build on it
+  (dead/live tuples, freeze ages, and debt signals such as `dead_tuple_fraction`,
+  `vacuum_debt_ratio`, `analyze_debt_ratio`, `freeze_debt`, scored against effective
+  thresholds). `removability_horizons()` reports the oldest xmin/catalog horizons and the
+  class that pins each (long-running txn, replication slot, standby feedback, prepared
+  xact). `effective_reloption()` extracts the explicitly-set value of a storage parameter.
+  See the [reference](../reference/pgfc_observe.md) and [source](../../pgfc_observe/install.sql).
+- **Consumers / cross-links:** read by operators and by the governor; `maintenance_debt`
+  itself uses `effective_reloption()` to resolve per-relation thresholds, and
+  `effective_reloption` is consumed cross-module by govern's planning.
+- **Feedback wanted:** is the sparse→dense carry-forward (latest sample ≤ snapshot) the
+  reconstruction reviewers expect, including for relations whose last change predates the
+  target snapshot? Is live freeze-age recomputation consistent with what the governor plans
+  against? Are the debt-ratio definitions (overdue *indicators*, not setpoints) framed
+  correctly?
 - ↑ [pgfc_observe](#41-pgfc_observe) · → `effective_reloption` is also consumed cross-module
   by [G1](#g1-control-loop-ooda).
 
 ### O4. Self-monitoring and budget
 
-- **Responsibility:** the extension watching its own storage footprint.
-- **Objects:** `self_health`, `storage_budget`.
-- **Feedback wanted:** *(tbd.)*
+- **Responsibility:** Make `pgfc_observe`'s own on-disk footprint observable, so the
+  telemetry collector does not become an unbounded maintenance burden of its own.
+- **Role:** The schema's introspective floor — observe turning its monitoring discipline
+  back on itself, beside the snapshot/rollup pipeline it measures.
+- **Objects:** `storage_budget()` reports per-logical-relation bytes and dead tuples (child
+  partitions folded into their parent); `self_health` rolls that into a one-row summary
+  (total bytes, aggregate dead tuples, partition counts, oldest raw partition). See the
+  [reference](../reference/pgfc_observe.md) and [source](../../pgfc_observe/install.sql).
+- **Consumers / cross-links:** `storage_budget()`'s `bytes` is read cross-schema by govern
+  (`degrade()` in [G6](#g6-storage-retention-and-self-maintenance)) to enforce a storage
+  cap; this is the observable counterpart to govern's same-named self-maintenance pattern.
+- **Feedback wanted:** within observe these surfaces are purely advisory (govern owns any
+  enforcement) — is that the right split, or should observe carry a self-throttle? Does
+  `self_health` cover the right signals, given `total_dead_tuples` should stay near zero
+  because rotation is `TRUNCATE`/`DROP`, not `DELETE`?
 - ↑ [pgfc_observe](#41-pgfc_observe) · → mirrors govern's [G6](#g6-storage-retention-and-self-maintenance).
 
 ### O5. Parameter registry
 
-- **Responsibility:** the observe-side typed parameter registry.
-- **Objects:** `_parameter_registry`.
-- **Feedback wanted:** *(tbd.)*
+- **Responsibility:** Declare `pgfc_observe`'s tunable thresholds and constants as a single
+  typed table — each with a category, default, unit, rationale, source, owner, override
+  flag, and config reference — so they are *born governed* with explicit provenance rather
+  than scattered as bare literals.
+- **Role:** A cross-cutting inspection and documentation surface spanning the extension's
+  collection, retention, rollup, and storage-tuning knobs.
+- **Objects:** `_parameter_registry` (function). See the
+  [reference](../reference/pgfc_observe.md) and [source](../../pgfc_observe/install.sql).
+- **Consumers / cross-links:** govern's parameter-governance subsystem unions this into the
+  operator-facing registry view; observe is the smaller, control-logic-free side of the pair
+  (it has no control literals to single-source). Mirrors [G3](#g3-parameter-governance).
+- **Feedback wanted:** does observe need the same drift-gate enforcement and validation G3
+  carries, or is a read-only provenance registry sufficient given observe has no active
+  control logic? Is the provenance set complete — any governed constant still living as an
+  inline literal outside the registry?
 - ↑ [pgfc_observe](#41-pgfc_observe) · → mirrors govern's [G3](#g3-parameter-governance).
 
 ### G1. Control loop (OODA)
