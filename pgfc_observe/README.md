@@ -7,8 +7,10 @@ health, xmin removability horizons), and exposes derived views. It writes only t
 its own `pgfc_observe` schema and never modifies database settings — useful on its
 own as a monitoring tool.
 
-This is **Phase 0** of the governor: read-only telemetry, useful on its own. For the
-concepts and the full guide set, see [`docs/`](../docs/index.md).
+This is **Phase 0** of the governor: read-only telemetry, useful on its own. It ships
+in the
+[v0.1.0 release](https://github.com/dventimisupabase/pg_flight_controller/releases/tag/v0.1.0).
+For the concepts and the full guide set, see [`docs/`](../docs/index.md).
 
 ## Install
 
