@@ -31,10 +31,9 @@ next finer level, **→** is a cross-link (a see-also or a consumer). The finest
 per-object documentation — is the generated [reference](#6-components-and-code-the-leaf-level),
 linked rather than copied.
 
-> **Outline status.** Sections 1–4 are drafted. Section 5 (subsystems) is seeded from the
-> confirmed object taxonomy — every database object has a home — but the per-subsystem prose,
-> rationale, and "feedback wanted" are still to be filled. Sections 6–9 describe conventions
-> now and fill in as the body lands.
+> **Outline status.** Sections 1–5 are drafted — the full subsystem catalog (O1–O5, G1–G7)
+> is filled. Sections 6–9 describe conventions; §6/§8's generated bottom-up navigation is the
+> main remaining build.
 
 ## Contents
 
@@ -346,120 +345,325 @@ full per-object docs live in the generated reference
 
 ### O1. Collection
 
-- **Responsibility:** take observations — sample autovacuum-relevant state, sparsely.
-- **Objects:** `observe()`, `collection_policy`, `relation_last_state` (UNLOGGED change
-  cache).
-- **Feedback wanted:** *(tbd — e.g. sparse-logging change-detection correctness; crash
-  rebuild of `relation_last_state`.)*
+- **Responsibility:** Collect one telemetry snapshot per run — a header row plus
+  per-relation autovacuum-relevant state — sampling **sparsely**, so a relation is recorded
+  only when its observed state actually changed since its last sample.
+- **Role:** The Observe stage's data-acquisition surface — the sole writer that turns live
+  catalog / `pg_stat` state into the persisted history the rest of the system Orients on.
+- **Objects:** `observe()` is the collector; `collection_policy` is a singleton config that
+  bounds *which* relations are sampled (system schemas always excluded, plus `exclude_temp`,
+  `include_extension_owned`, `excluded_schemas`, and a `min_partition_size_bytes` floor on
+  child partitions); `relation_last_state` is an UNLOGGED, catalog-rebuildable
+  change-signature cache giving O(1) "did this change?" detection. See the
+  [reference](../reference/pgfc_observe.md) and [source](../../pgfc_observe/install.sql).
+- **Consumers / cross-links:** the dense-reconstruction readers
+  ([O3](#o3-derived-state-and-readers)) and the rollup tiers
+  ([O2](#o2-storage-and-retention)) consume what `observe()` wrote — the filtered, sparse set
+  propagates downstream rather than being re-filtered.
+- **Feedback wanted:** (1) the change test is a full-row `IS DISTINCT FROM` over the dense
+  signature — is any governance-relevant field omitted, such that a meaningful change is
+  coalesced and a sample skipped? (2) after a crash the UNLOGGED cache is empty, so the next
+  `observe()` re-samples every included relation once — is that one-time dense burst
+  acceptable, and is "empty cache" always safely equivalent to "never seen"? (3) are
+  `collection_policy`'s four filters the right knobs?
 - ↑ [pgfc_observe](#41-pgfc_observe) · → writes the raw tables owned by
   [O2](#o2-storage-and-retention).
 
 ### O2. Storage and retention
 
-- **Responsibility:** bounded, bloat-free persistence — partitioned raw tables, rollups,
-  GC, and the extension's own table maintenance. *(Home of finding FMEA-001.)*
-- **Objects:** `relation_samples`, `snapshots`, `rollup_1m`/`rollup_1h`/`rollup_1d`;
-  `_ensure_partition`, `_partition_inventory`, `_epoch_day`/`_epoch_month`/`_month_start`,
-  `retain`, `drop_empty_partitions`, `rollup`, `rollup_retain`, `_rollup_coarsen`,
-  `_rollup_inventory`, `current_rollup`, `_telemetry_reloptions`.
-- **Feedback wanted:** the partition-recycling strategy — see
-  [FMEA-001](../fortification/02-failure-theory.md#fmea-001--partition-recycling-uses-createdrop-not-a-fixed-truncate-ring)
-  (create/drop vs. a fixed `TRUNCATE` ring).
+- **Responsibility:** Bounded, bloat-free persistence for telemetry — raw samples kept only
+  a few days, aggregated into long-range rollups, and reclaimed by whole-partition rotation
+  rather than row deletes. *(Home of finding FMEA-001.)*
+- **Role:** The durable layer of `pgfc_observe`, between the collector that writes samples
+  ([O1](#o1-collection)) and the readers that serve state ([O3](#o3-derived-state-and-readers)).
+- **Objects:** high-volume raw tables `relation_samples` and `snapshots` (daily
+  `RANGE`-partitioned); rollup tiers `rollup_1m`/`rollup_1h`/`rollup_1d` (1m daily-, 1h/1d
+  monthly-partitioned). Partition lifecycle: `_ensure_partition` (on-demand day partitions,
+  called hot by the collector), `_partition_inventory`, and the key encoders
+  `_epoch_day`/`_epoch_month`/`_month_start`. Raw GC: `retain` (`TRUNCATE` partitions older
+  than the window, ~3 days) and `drop_empty_partitions` (`DROP` long-empty shells). Rollup
+  pipeline: `rollup` and `_rollup_coarsen` (cascade raw into the tiers with
+  sample-count-weighted aggregates), `rollup_retain` (cascading per-tier `DROP`),
+  `_rollup_inventory`, and `current_rollup` (reads a tier carrying the last bucket forward).
+  `_telemetry_reloptions` supplies the static, aggressive autovacuum reloptions applied to
+  every telemetry partition (self-maintenance). See the
+  [reference](../reference/pgfc_observe.md) and [source](../../pgfc_observe/install.sql).
+- **Consumers / cross-links:** read by [O3](#o3-derived-state-and-readers), which derives
+  current and historical state from these tables (including `current_rollup`'s carry-forward
+  reads).
+- **Feedback wanted:** is the partition-recycling strategy sound — create/drop vs. a fixed
+  `TRUNCATE` ring — see
+  [FMEA-001](../fortification/02-failure-theory.md#fmea-001--partition-recycling-uses-createdrop-not-a-fixed-truncate-ring)?
+  And is the rollup-before-truncate ordering (raw must be aggregated by `rollup()` before
+  `retain()` truncates its window) safe under skipped or lagging maintenance runs?
 - ↑ [pgfc_observe](#41-pgfc_observe) · → read by [O3](#o3-derived-state-and-readers).
 
 ### O3. Derived state and readers
 
-- **Responsibility:** turn raw, sparse telemetry into meaning (Orient).
-- **Objects:** `relation_health`, `maintenance_debt`; `current_relation_state`,
-  `removability_horizons`, `effective_reloption`.
-- **Feedback wanted:** *(tbd.)*
+- **Responsibility:** Turn the raw, sparsely-stored telemetry into meaning — dense
+  per-relation current state and the maintenance signals derived from it.
+- **Role:** The Orient step — interpreting what was observed before anyone decides.
+- **Objects:** `current_relation_state()` is the keystone reader: it reconstructs the dense,
+  as-of state per relation from sparse change-logged samples (carry-forward — the latest
+  sample at or before the target snapshot) and recomputes freeze ages *live* rather than
+  trusting stored ages. The `relation_health` and `maintenance_debt` views build on it
+  (dead/live tuples, freeze ages, and debt signals such as `dead_tuple_fraction`,
+  `vacuum_debt_ratio`, `analyze_debt_ratio`, `freeze_debt`, scored against effective
+  thresholds). `removability_horizons()` reports the oldest xmin/catalog horizons and the
+  class that pins each (long-running txn, replication slot, standby feedback, prepared
+  xact). `effective_reloption()` extracts the explicitly-set value of a storage parameter.
+  See the [reference](../reference/pgfc_observe.md) and [source](../../pgfc_observe/install.sql).
+- **Consumers / cross-links:** read by operators and by the governor; `maintenance_debt`
+  itself uses `effective_reloption()` to resolve per-relation thresholds, and
+  `effective_reloption` is consumed cross-module by govern's planning.
+- **Feedback wanted:** is the sparse→dense carry-forward (latest sample ≤ snapshot) the
+  reconstruction reviewers expect, including for relations whose last change predates the
+  target snapshot? Is live freeze-age recomputation consistent with what the governor plans
+  against? Are the debt-ratio definitions (overdue *indicators*, not setpoints) framed
+  correctly?
 - ↑ [pgfc_observe](#41-pgfc_observe) · → `effective_reloption` is also consumed cross-module
   by [G1](#g1-control-loop-ooda).
 
 ### O4. Self-monitoring and budget
 
-- **Responsibility:** the extension watching its own storage footprint.
-- **Objects:** `self_health`, `storage_budget`.
-- **Feedback wanted:** *(tbd.)*
+- **Responsibility:** Make `pgfc_observe`'s own on-disk footprint observable, so the
+  telemetry collector does not become an unbounded maintenance burden of its own.
+- **Role:** The schema's introspective floor — observe turning its monitoring discipline
+  back on itself, beside the snapshot/rollup pipeline it measures.
+- **Objects:** `storage_budget()` reports per-logical-relation bytes and dead tuples (child
+  partitions folded into their parent); `self_health` rolls that into a one-row summary
+  (total bytes, aggregate dead tuples, partition counts, oldest raw partition). See the
+  [reference](../reference/pgfc_observe.md) and [source](../../pgfc_observe/install.sql).
+- **Consumers / cross-links:** `storage_budget()`'s `bytes` is read cross-schema by govern
+  (`degrade()` in [G6](#g6-storage-retention-and-self-maintenance)) to enforce a storage
+  cap; this is the observable counterpart to govern's same-named self-maintenance pattern.
+- **Feedback wanted:** within observe these surfaces are purely advisory (govern owns any
+  enforcement) — is that the right split, or should observe carry a self-throttle? Does
+  `self_health` cover the right signals, given `total_dead_tuples` should stay near zero
+  because rotation is `TRUNCATE`/`DROP`, not `DELETE`?
 - ↑ [pgfc_observe](#41-pgfc_observe) · → mirrors govern's [G6](#g6-storage-retention-and-self-maintenance).
 
 ### O5. Parameter registry
 
-- **Responsibility:** the observe-side typed parameter registry.
-- **Objects:** `_parameter_registry`.
-- **Feedback wanted:** *(tbd.)*
+- **Responsibility:** Declare `pgfc_observe`'s tunable thresholds and constants as a single
+  typed table — each with a category, default, unit, rationale, source, owner, override
+  flag, and config reference — so they are *born governed* with explicit provenance rather
+  than scattered as bare literals.
+- **Role:** A cross-cutting inspection and documentation surface spanning the extension's
+  collection, retention, rollup, and storage-tuning knobs.
+- **Objects:** `_parameter_registry` (function). See the
+  [reference](../reference/pgfc_observe.md) and [source](../../pgfc_observe/install.sql).
+- **Consumers / cross-links:** govern's parameter-governance subsystem unions this into the
+  operator-facing registry view; observe is the smaller, control-logic-free side of the pair
+  (it has no control literals to single-source). Mirrors [G3](#g3-parameter-governance).
+- **Feedback wanted:** does observe need the same drift-gate enforcement and validation G3
+  carries, or is a read-only provenance registry sufficient given observe has no active
+  control logic? Is the provenance set complete — any governed constant still living as an
+  inline literal outside the registry?
 - ↑ [pgfc_observe](#41-pgfc_observe) · → mirrors govern's [G3](#g3-parameter-governance).
 
 ### G1. Control loop (OODA)
 
-- **Responsibility:** the heart — orchestrate the two cadences and run classify → estimate
-  → plan → apply → verify. Refines into six components.
+- **Responsibility:** The heart of the governor — orchestrate the two cadences and run the
+  per-cycle pipeline classify → estimate → plan → apply → verify, turning observed catalog
+  state into bounded `ALTER TABLE` actuations.
+- **Role:** Reads derived state from `pgfc_observe`, decides per-relation, and is the only
+  loop path that mutates the host catalog.
 - **Components and objects:**
-  - **Orchestration:** `observe_tick`, `control_tick`, `tick_log`.
-  - **Classify:** `classify`, `relation_class`, `relation_kind`, `_class_target`.
-  - **Estimate:** `estimate`, `relation_estimate`, `ewma`.
-  - **Plan / Decide:** `plan`, `decision_log`, `snap_sf`, `_sf_grid`.
-  - **Apply / Act:** `apply`, `actuator_state`, `action_history`, `batch_seq`. *(Subject of
-    fortification Phase 1.)*
-  - **Verify:** `verify`.
-- **Feedback wanted:** *(tbd — e.g. the `apply()` path; see
-  [Phase 1](../fortification/01-security-correctness-apply.md).)*
+  - **Orchestration:** `observe_tick`, `control_tick`, `tick_log` — two cadences:
+    `observe_tick` (~1 min) snapshots, classifies, and estimates, never actuating;
+    `control_tick` (~5 min) takes an advisory xact lock (no overlap), evaluates health
+    first, then plans + applies-if-not-advisory + verifies, logging each cycle to `tick_log`.
+  - **Classify:** `classify`, `relation_class`, `relation_kind`, `_class_target` — assign
+    each relation a workload class (a `relation_kind`) with N-cycle hysteresis; `_class_target`
+    maps the class to its base dead-tuple fraction.
+  - **Estimate:** `estimate`, `relation_estimate`, `ewma` — derive hidden state (EWMA-smoothed
+    rates, debts, effectiveness, a saturation cause) into `relation_estimate`, stamped with
+    its `snapshot_id`.
+  - **Plan / Decide:** `plan`, `decision_log`, `snap_sf`, `_sf_grid` — the control law: class
+    target ÷ aggressiveness, clamped to `[sf_min, sf_max]`, snapped to the `_sf_grid` deadband
+    via `snap_sf`, with a freeze floor that dominates saturation suppression; one
+    `decision_log` row per relation (adjust / hold / escalate / suppressed).
+  - **Apply / Act:** `apply`, `actuator_state`, `action_history`, `batch_seq` — the sole
+    catalog mutator: actuate one approved change via `ALTER TABLE`, recording every attempt in
+    `action_history` (rollback baselines in `actuator_state`); runs only when not
+    `advisory_only`, then gated by G4 and the Invariant-4 budget. *(Subject of fortification
+    Phase 1.)*
+  - **Verify:** `verify` — currently a no-op stub that exists to close the loop on past
+    actions; expanded later.
+  - See the [reference](../reference/pgfc_govern.md) and [source](../../pgfc_govern/install.sql).
+- **Consumers / cross-links:** `control_tick` is bounded by [G4](#g4-self-protection-f1-f7)
+  before actuating; both cadences read derived observe state via
+  [O3](#o3-derived-state-and-readers); the `action_history` it writes is consumed by
+  [G4](#g4-self-protection-f1-f7) (oscillation/failure/budget signals) and pruned by
+  [G6](#g6-storage-retention-and-self-maintenance).
+- **Feedback wanted:** (1) is the `apply()` path correct and safe at the security boundary —
+  argument handling, the live-vs-proposed no-op check, the `pg_stat_progress_vacuum` skip, and
+  ownership of user-set reloptions (the focus of fortification
+  [Phase 1](../fortification/01-security-correctness-apply.md))? (2) does the control law
+  converge and stay stable (target ÷ aggressiveness, clamp, grid-snap, freeze floor), or can
+  grid-snapping interact with hysteresis to flap? (3) is planning against the newest
+  *estimated* snapshot the right loop-ordering contract, and does `verify` as a no-op leave a
+  real gap until it is expanded?
 - ↑ [pgfc_govern](#42-pgfc_govern) · → gated by [G4](#g4-self-protection-f1-f7); reads
   observe [O3](#o3-derived-state-and-readers); `action_history` is consumed by
   [G4](#g4-self-protection-f1-f7) and [G6](#g6-storage-retention-and-self-maintenance).
 
 ### G2. Policy and intent
 
-- **Responsibility:** operator intent as outcomes, with an audited history.
-- **Objects:** `policy`, `policy_history`, `_log_policy_change`.
-- **Feedback wanted:** *(tbd.)*
+- **Responsibility:** Capture operator intent as desired *outcomes* — aggressiveness scaling
+  of per-class targets, the `advisory_only` dry-run gate, the actuation-economy budgets
+  (`min_interval`, per-cycle and per-day caps), `n_sustain`, `manage_user_owned` — not raw
+  per-table autovacuum parameters, with an append-only audit of every change.
+- **Role:** The desired-state source for the Decide stage; a single auto-seeded `default`
+  policy makes the loop operable out of the box, and `advisory_only = true` (the default)
+  means the loop plans but `apply()` never fires.
+- **Objects:** the `policy` table (operator-expressed outcomes), its append-only
+  `policy_history` audit, and the `_log_policy_change` AFTER trigger that writes it. See the
+  [reference](../reference/pgfc_govern.md) and [source](../../pgfc_govern/install.sql).
+- **Consumers / cross-links:** read by [G1](#g1-control-loop-ooda), which reads
+  `aggressiveness`, `manage_user_owned`, and `n_sustain` to scale class targets and gate
+  suppression during a control tick.
+- **Feedback wanted:** is "intent as outcomes" expressive enough, or will operators need a
+  richer target vocabulary than scalar aggressiveness plus per-class templates? Does a single
+  `default` policy suffice, or should the design admit multiple named/scoped policies (and how
+  would relations bind to one)? Is indefinite `policy_history` retention, and not logging the
+  auto-seeded default, the right call?
 - ↑ [pgfc_govern](#42-pgfc_govern) · → read by [G1](#g1-control-loop-ooda).
 
 ### G3. Parameter governance
 
-- **Responsibility:** the typed parameter registry, provenance, the inline-literal **drift
-  gate**, and validation.
-- **Objects:** `parameter_registry`, `_parameter_registry`, `_param`,
-  `_audit_control_literals`, `validate_parameters`.
-- **Feedback wanted:** *(tbd.)*
+- **Responsibility:** Single-source every governed constant the control loop uses —
+  thresholds, grids, class targets, health bounds, retention windows — in a typed registry
+  recording each value's category and provenance ("born governed"), and guard against any
+  control value escaping that registry.
+- **Role:** Cross-cutting — not a stage of the loop but the substrate every stage reads its
+  constants from, plus the operator-facing surfaces for inspecting and validating config.
+- **Objects:** the canonical registry (`_parameter_registry`) and its single read accessor
+  (`_param`); the unified operator view (`parameter_registry`); the drift gate
+  (`_audit_control_literals`); and the live-config grader (`validate_parameters`). See the
+  [reference](../reference/pgfc_govern.md) and [source](../../pgfc_govern/install.sql).
+- **Consumers / cross-links:** `_param()` is the single accessor every control function reads
+  constants through; the `parameter_registry` view unions this with observe's
+  ([O5](#o5-parameter-registry)) so operators see both schemas at once. `_audit_control_literals()`
+  is the CI-enforced drift gate: it scans every `pgfc_govern` function body (fail-closed, with
+  a small explicit exclusion set) plus `governor_status`'s target computation and returns any
+  literal not in the structural allowlist, so a new untyped knob cannot slip in.
+- **Feedback wanted:** (1) is the drift gate's coverage right — does scanning by catalog name
+  leave any real control path unguarded, and are the documented exclusions (`retain`/`degrade`,
+  policy DEFAULTs, `catalog_health` windows) safe to leave out? (2) does `validate_parameters()`
+  check the right safety properties — should any WARNING (e.g. `advisory_only = false`,
+  `manage_user_owned`) be CRITICAL? (3) is the provenance vocabulary complete enough for review?
 - ↑ [pgfc_govern](#42-pgfc_govern) · → mirrors observe's [O5](#o5-parameter-registry);
   consumed by nearly every control function via `_param`.
 
 ### G4. Self-protection (F1-F7)
 
-- **Responsibility:** the governor governing itself before it governs PostgreSQL — health
-  state, circuit breakers, authority limiting, oscillation detection, load shedding,
-  failure taxonomy.
-- **Objects:** `governor_state`, `state_transitions`, `governor_health_state`,
-  `governor_metrics`, `evaluate_health`, `force_state`, `clear_forced_state`, `disable`,
-  `suspend_actuation`, `_oscillating_relations`, `_reconcile_oscillation`, `_failure_class`,
-  `failure_taxonomy`.
-- **Feedback wanted:** *(tbd.)*
+- **Responsibility:** The appendix-F self-protection net — the governor governs itself before
+  it governs PostgreSQL, deriving a health state from its own telemetry and bounding its
+  authority to act so a sick controller steps back rather than thrashing the catalog.
+- **Role:** Sits ahead of the Act stage. `evaluate_health()` runs first each control cycle and
+  writes the singleton `governor_state`; `apply()`'s authority gate then reads that state and
+  may refuse before any `ALTER TABLE`. The state machine is advisory — actuation is gated only
+  at `apply()`.
+- **Objects:** health state and audit — `governor_state` (singleton + operator-override
+  columns), the `governor_health_state` enum (`normal` → `degraded` → `diagnostic` →
+  `emergency` → `disabled`, ordered by increasing caution so worst-wins), and the append-only
+  `state_transitions` log. Self-monitoring substrate (F1): the `governor_metrics` view.
+  Evaluator (F2): `evaluate_health()` composes a candidate per signal and takes the worst.
+  Operator override (F3): `force_state`, `clear_forced_state`, `disable`, `suspend_actuation`
+  — a downward-only caution floor. Detectors: `_oscillating_relations` /
+  `_reconcile_oscillation` (F5 flapping); the load-shed signal (F6) lives in the metrics view.
+  Failure taxonomy (F6): `_failure_class` and the `failure_taxonomy` view. See the
+  [reference](../reference/pgfc_govern.md) and [source](../../pgfc_govern/install.sql).
+- **Consumers / cross-links:** derives state from `governor_metrics`; the apply authority gate
+  consults `governor_state`; the F5 detector and the F4 per-relation rate limit read
+  `action_history` from [G1](#g1-control-loop-ooda). The mutation-budget breaker is
+  *degraded-level only* (degraded still actuates, "one step from suspension"); only
+  failure-driven breakers and the F5/F6 signals reach `diagnostic`, where the gate suspends
+  actuation. `disabled` is operator-forced only.
+- **Feedback wanted:** (1) can the authority gate be bypassed — a direct `apply()` out of cycle
+  (it reads whatever `evaluate_health()` last wrote), or crafted `action_history` skewing the
+  rate limit / reversal count? (2) is the worst-of composition free of self-amplifying loops —
+  refusals return `false` *silently* and are not recorded as failed actions, precisely so they
+  cannot feed the failed-action breaker; is that boundary right everywhere? (3) are the
+  per-signal recovery semantics intended — F5 oscillation **windowed** (must age out), F6
+  load-shed **immediate/transient**?
 - ↑ [pgfc_govern](#42-pgfc_govern) · → gates the [G1](#g1-control-loop-ooda) apply path;
   reads `action_history`.
 
 ### G5. Diagnostics
 
-- **Responsibility:** diagnose saturation and external inhibitors rather than escalate.
-- **Objects:** `diagnostics`, `active_diagnostics`, `_findings`, `_reconcile_diagnostics`.
-- **Feedback wanted:** *(tbd.)*
+- **Responsibility:** Turn a relation that cannot keep up into an operator-facing root-cause
+  finding with an actionable recommendation, rather than cranking actuation harder. When
+  `plan()` sees high vacuum debt it discriminates the cause — `config` (autovacuum not
+  firing), `io_limited` (running but I/O-bound), or `inhibited` (a pinned xmin horizon, named
+  by its owner) — and says plainly when more aggressive settings will not help.
+- **Role:** The diagnosis output of the loop, written as a side effect of `plan()` alongside
+  the decision trail; advisory, never DDL.
+- **Objects:** the `diagnostics` table (open/resolved findings) and its operator-facing
+  `active_diagnostics` view (open findings only), with `_findings` computing the findings for a
+  snapshot and `_reconcile_diagnostics` opening and auto-resolving them idempotently. See the
+  [reference](../reference/pgfc_govern.md) and [source](../../pgfc_govern/install.sql).
+- **Consumers / cross-links:** fed by [G1](#g1-control-loop-ooda)'s `plan()`, which runs the
+  reconciler each cycle. Governor-scope findings such as `control_oscillation` are owned by
+  [G4](#g4-self-protection-f1-f7); the saturation reconciler is scoped to leave that class
+  untouched.
+- **Feedback wanted:** is the three-way saturation taxonomy (`config` / `io_limited` /
+  `inhibited`) complete and correctly discriminated? Is the open/auto-resolve reconciliation
+  churn-free — stable findings rather than a fresh row per tick? Are the inhibitor attributions
+  (the named horizon owner) reliable enough to act on?
 - ↑ [pgfc_govern](#42-pgfc_govern) · → fed by [G1](#g1-control-loop-ooda) `plan()`;
   oscillation findings come from [G4](#g4-self-protection-f1-f7).
 
 ### G6. Storage, retention, and self-maintenance
 
-- **Responsibility:** bound the govern-side audit tables and the storage budget; graceful
-  degrade.
-- **Objects:** `storage_config`, `storage_budget`, `self_health`, `retain`, `degrade`.
-- **Feedback wanted:** *(tbd.)*
+- **Responsibility:** Bound the govern side's worst-case footprint and keep its own catalog
+  clean: prune the append-only audit tables by time cutoff, report whole-governor storage
+  against an operator budget, and shed storage gracefully under pressure.
+- **Role:** The govern-side storage surface; it sits atop observe's primitives (reads observe
+  cross-schema, never the reverse) and mirrors observe's self-monitoring at the whole-system
+  level.
+- **Objects:** `retain()` prunes the append-only audit tables (`decision_log`,
+  `action_history`, `tick_log`, resolved `diagnostics`, `state_transitions`) by **time
+  cutoff** — acceptable because they are low-volume, unlike observe's high-volume partition
+  rotation — while `policy_history` is kept indefinitely. `storage_config` holds the
+  total-bytes budget; `storage_budget()` reports usage; the `self_health` view is the one-row
+  summary (with an `over_budget` flag); `degrade()` is the graceful prune order under pressure
+  (raw → fine → coarse rollups → diagnostics → actions; policy never pruned), reading observe's
+  storage bytes cross-schema. Govern's own state/audit tables carry static autovacuum
+  reloptions because they are mutated in place and accrue dead tuples — distinct from observe's
+  zero-bloat rotation. See the [reference](../reference/pgfc_govern.md) and
+  [source](../../pgfc_govern/install.sql).
+- **Consumers / cross-links:** the F1/F2 self-protection path reads `self_health`
+  (`storage_bytes`, `over_budget`) as the storage signal feeding the health-state machine
+  ([G4](#g4-self-protection-f1-f7)); mirrors observe's
+  [O4](#o4-self-monitoring-and-budget); prunes the audit tables written by
+  [G1](#g1-control-loop-ooda).
+- **Feedback wanted:** is time-cutoff `DELETE` pruning (rather than partition rotation) the
+  right call for these audit tables given the project's bloat-free thesis (cf. FMEA-001 for
+  observe)? Is the `degrade()` prune order — raw telemetry before resolved diagnostics before
+  actions — the correct precedence under storage pressure?
 - ↑ [pgfc_govern](#42-pgfc_govern) · → mirrors observe's
   [O4](#o4-self-monitoring-and-budget); prunes [G1](#g1-control-loop-ooda) audit tables.
 
 ### G7. Status and reporting
 
-- **Responsibility:** operator-facing rollups of governor and catalog health.
-- **Objects:** `governor_status`, `catalog_health`.
-- **Feedback wanted:** *(tbd.)*
+- **Responsibility:** Expose operator-facing rollups of what the governor sees and would do:
+  `governor_status` summarizes, per relation, the workload class, observed and target
+  dead-tuple fraction, debt, last decision, proposed value, applied flag, and current scale
+  factor; `catalog_health` rolls up catalog-mutation health (the governor's own applied/failed
+  DDL counts over 1h/1d windows) against live `pg_class` state.
+- **Role:** Read-only reporting surfaces at the edge of the schema — they present governor
+  state, they do not feed it; neither is a control input.
+- **Objects:** `governor_status` (view), `catalog_health` (view). See the
+  [reference](../reference/pgfc_govern.md) and [source](../../pgfc_govern/install.sql).
+- **Consumers / cross-links:** consumed by operators and dashboards; `catalog_health` reads
+  `pgfc_observe` cross-schema for the live `pg_class` columns — the one outward dependency
+  here.
+- **Feedback wanted:** do these views give operators enough to trust and audit the governor's
+  per-relation decisions, or are key columns missing? Is `catalog_health`'s cross-schema read
+  acceptable here, or should that catalog-state rollup live in `pgfc_observe`?
 - ↑ [pgfc_govern](#42-pgfc_govern) · → `catalog_health` reads observe cross-schema.
 
 ## 6. Components and code (the leaf level)
