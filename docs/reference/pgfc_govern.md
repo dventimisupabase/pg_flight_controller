@@ -332,7 +332,7 @@ Scale-factor quantization grid, read from the registry (Phase 1.6 P2).
 
 ### `pgfc_govern.apply(p_tick_id bigint, p_relid oid) → boolean`
 
-Actuate one relation's approved scale-factor change (gated by advisory_only).
+Actuate one relation's approved scale-factor change. Gated by advisory_only (the dry-run switch), then by the Phase 1.7 F4 self-protection layer: the governor health-state authority gate (refuses when diagnostic/emergency/disabled) and the three-tier Invariant-4 mutation budget (per-relation min_interval, per-cycle and per-day cluster caps). A refused attempt returns false silently — never recorded as a failed action.
 
 ### `pgfc_govern.classify(p_snapshot_id bigint) → integer`
 
@@ -360,7 +360,7 @@ Derive hidden state (rates, effectiveness, saturation) into relation_estimate.
 
 ### `pgfc_govern.evaluate_health() → pgfc_govern.governor_health_state`
 
-Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds, then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. Advisory — does not gate actuation (that is the F4 authority gate). Returns the effective state.
+Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds (failed actions, lock timeouts, observation lag, storage footprint, and the F4 daily-mutation-budget circuit breaker — degraded-level only), then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. The state it writes is the input to the F4 apply() authority gate. Returns the effective state.
 
 ### `pgfc_govern.ewma(prior double precision, sample double precision, alpha double precision) → double precision`
 
