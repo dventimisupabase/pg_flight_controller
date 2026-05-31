@@ -326,4 +326,7 @@ governor self-protection net.
   and with no separate "Phase 2". The broader actuator roadmap (the small-table threshold
   lever, the analyze objective, cost/IO-budget actuators, and the catalog-bloat braking
   loop) remains future work beyond Phase 1.7.
-- No tagged releases yet; the project is pre-1.0.
+- The project is pre-1.0, and the extensions are not yet published to
+  [dbdev](https://database.dev) — they install by running `install.sql`. dbdev
+  publishing is tracked in
+  [#37](https://github.com/dventimisupabase/pg_flight_controller/issues/37).
