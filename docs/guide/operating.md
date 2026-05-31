@@ -90,8 +90,8 @@ metrics and records it as a single state. The states, in order of increasing cau
   storage budget, or the daily mutation budget spent); observe/estimate/diagnose continue
   and actuation is still **permitted** — degraded is "limited," one breaker-step from
   suspension, not suspended.
-- **`diagnostic`** — repeated failures or a lock-timeout storm; **actuation is suspended**
-  (observation and diagnosis continue).
+- **`diagnostic`** — repeated failures, a lock-timeout storm, or control oscillation (a
+  setting flapping); **actuation is suspended** (observation and diagnosis continue).
 - **`emergency`** — the governor is effectively flying blind (observation badly stale);
   minimal observation and health reporting only, **no actuation**.
 - **`disabled`** — nothing acts; history is preserved. Reached **only** via the operator
@@ -105,8 +105,30 @@ permit it (subject to the mutation budget below). A withheld actuation is declin
 silently — it is never recorded as a failed action, which would otherwise feed the
 failed-action breaker and amplify itself. Refusing to *tighten* a setting never reduces
 freeze safety: the prior setting and PostgreSQL's own anti-wraparound autovacuum remain in
-place. The automatic evaluator only reaches `emergency` via stale observation today; more
-triggers (oscillation, load) arrive with later increments.
+place. The automatic evaluator reaches `emergency` via stale observation and `diagnostic`
+via failed actions, lock timeouts, or control oscillation (below); load-driven shedding
+arrives with a later increment.
+
+### Control-oscillation detection (Phase 1.7 F5)
+
+A scale factor that flaps — repeatedly increased, then decreased, then increased — is the
+controller fighting itself, a *safety* failure rather than a tuning question. The governor
+reads its own catalog-mutation audit (`action_history`, applied changes only) and, per
+relation, counts **direction reversals** within a governed window (`oscillation_window`,
+default 1 day). A relation with at least `oscillation_min_reversals` reversals (default 2 —
+a full up-down-up flap) is flapping. When any relation flaps:
+
+- the governor enters **`diagnostic`**, so the authority gate suspends actuation
+  **cluster-wide** (not only for the flapping table) — preferring inaction to an unsafe,
+  self-amplifying control loop;
+- the flapping relation gets a **`critical` finding** in `active_diagnostics`
+  (`inhibitor_class = 'control_oscillation'`) naming the reversal count and recent values;
+- recovery is **automatic**: with actuation suspended, no new changes are recorded, so the
+  flap ages out of `oscillation_window` and the governor returns to `normal` and resolves the
+  finding. (Because the window must be several hours to observe a flap under the 1-hour
+  `min_interval`, this suspension is intrinsically multi-hour. An operator who wants control
+  back sooner should address the underlying instability — an automatic `diagnostic` cannot be
+  forced down, only its cause removed; `clear_forced_state()` only releases *operator* holds.)
 
 ### Mutation budget (Invariant 4)
 

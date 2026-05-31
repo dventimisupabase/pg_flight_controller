@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.diagnostics (
     resolved_at     timestamptz
 );
 COMMENT ON TABLE pgfc_govern.diagnostics IS
-  'When control saturates, the cause + a recommendation, not more DDL.';
+  'Per-relation findings + a recommendation, not more DDL: maintenance-inhibitor / saturation causes, and governor-scope findings such as control oscillation (Phase 1.7 F5).';
 
 -- Governor health state (Phase 1.7 F2). The current self-protection state, computed by
 -- evaluate_health() from the governor_metrics substrate. Enforced singleton (constant-true
@@ -747,11 +747,12 @@ BEGIN
     GET DIAGNOSTICS n = ROW_COUNT;
 
     PERFORM pgfc_govern._reconcile_diagnostics(p_snapshot_id);
+    PERFORM pgfc_govern._reconcile_oscillation();   -- Phase 1.7 F5: governor-scope finding
     RETURN n;
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.plan(bigint, bigint) IS
-  'Advisory: write decision_log per relation (vacuum objective) + reconcile diagnostics.';
+  'Advisory: write decision_log per relation (vacuum objective) + reconcile diagnostics (saturation + Phase 1.7 F5 control oscillation).';
 
 -- Findings worthy of a diagnostic for the relations in a snapshot: (relid, class,
 -- severity, recommendation, evidence). Set-returning so it composes into the
@@ -813,9 +814,14 @@ BEGIN
         WHERE d.resolved_at IS NULL AND d.relid = f.relid
           AND d.inhibitor_class IS NOT DISTINCT FROM f.inhibitor_class);
 
-    -- resolve open findings whose condition cleared this cycle
+    -- resolve open findings whose condition cleared this cycle. Scoped to the saturation
+    -- classes this reconciler owns: control_oscillation diagnostics (Phase 1.7 F5) are owned
+    -- by _reconcile_oscillation() — they attach to a LIVE relid that _findings never emits, so
+    -- without this exclusion the NOT EXISTS below would resolve them every cycle, churning a
+    -- fresh finding each tick instead of one stable, persisting alert.
     UPDATE pgfc_govern.diagnostics d SET resolved_at = now()
     WHERE d.resolved_at IS NULL
+      AND d.inhibitor_class IS DISTINCT FROM 'control_oscillation'
       AND d.relid IN (SELECT relid FROM pgfc_observe.current_relation_state(p_snapshot_id))
       AND NOT EXISTS (
         SELECT 1 FROM pgfc_govern._findings(p_snapshot_id) f
@@ -1490,6 +1496,14 @@ VALUES
   ('health_lock_timeouts_diagnostic', 'empirical_default', '10', 'lock timeouts/hour',
    'Lock-timeout failures in the last hour above which the governor enters diagnostic (cannot acquire locks to act).',
    'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  -- Control-oscillation detection (Phase 1.7 F5 — self-protection). Flapping (the controller
+  -- fighting itself) is a safety failure: it trips diagnostic, suspending actuation.
+  ('oscillation_window', 'empirical_default', '1 day', 'interval',
+   'Window over which applied scale-factor changes are examined for flapping; also the cooldown after which a stopped oscillation ages out and the governor auto-recovers. Must exceed min_interval (which spaces the changes) by enough cycles to observe a flap.',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('oscillation_min_reversals', 'empirical_default', '2', 'reversals',
+   'Direction reversals in a relation''s applied scale-factor sequence within oscillation_window at or above which the governor treats it as oscillating (a full A->B->A->B flap is 2 reversals).',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
   -- Implementation convenience
   ('govern_av_threshold', 'implementation_convenience', '200', 'rows',
    'Static autovacuum threshold on the govern audit/state tables (scale_factor 0).',
@@ -1535,8 +1549,9 @@ COMMENT ON VIEW pgfc_govern.parameter_registry IS
 -- SCOPE — what this enforces vs what is documented-only:
 --   ENFORCED: every pgfc_govern function by default (fail-closed — see the exclusion set
 --     in the query), plus governor_status's target computation. So the control path
---     (estimate, classify, plan, snap_sf, _findings, _reconcile_diagnostics, apply,
---     observe_tick, control_tick, verify) and any control function added later are scanned
+--     (estimate, classify, plan, snap_sf, _findings, _reconcile_diagnostics,
+--     _oscillating_relations, _reconcile_oscillation, apply, observe_tick, control_tick,
+--     verify) and any control function added later are scanned
 --     automatically; every governed value there must come through the accessors.
 --   DOCUMENTED but NOT gate-enforced (excluded; may still drift from the registry — a
 --     later call): retain()/degrade() (operator retention orchestration; their signature
@@ -1703,6 +1718,94 @@ END
 $reloptions$;
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Control-oscillation detection  (Phase 1.7 F5 — governor self-protection)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- A setting that flaps — repeatedly increased then decreased then increased — is the
+-- controller fighting itself (appendix F "Control Oscillation Detection"), a SAFETY failure,
+-- not a tuning question. We read it straight from the catalog-mutation audit (action_history,
+-- status='applied'): per relation, order the applied scale-factor values by time and count
+-- DIRECTION REVERSALS (a step up after a step down, or vice versa) within the governed
+-- oscillation_window. A relation with at least oscillation_min_reversals reversals is flapping.
+-- Defined before governor_metrics because that view counts its output. STABLE/SQL; reads only
+-- the audit. All thresholds via _param(), so it stays clean under the P3 drift gate (which
+-- scans this body). relid 0 (the synthetic cluster-budget audit rows) and other actuators are
+-- excluded; ties on applied_at are broken by action_id so the lag() ordering is deterministic.
+CREATE OR REPLACE FUNCTION pgfc_govern._oscillating_relations()
+RETURNS TABLE(relid oid, relname text, reversals bigint, n_changes bigint,
+              first_at timestamptz, last_at timestamptz, recent_values text[])
+LANGUAGE sql STABLE AS $fn$
+WITH seq AS (
+    SELECT ah.relid, ah.relname, ah.action_id, ah.applied_at,
+           ah.new_value::double precision AS v
+    FROM pgfc_govern.action_history ah
+    WHERE ah.status = 'applied'
+      AND ah.actuator = 'autovacuum_vacuum_scale_factor'
+      AND ah.relid <> 0::oid
+      AND ah.applied_at > now() - pgfc_govern._param('oscillation_window')::interval
+), dir AS (   -- direction of each change vs the previous one for the same relation
+    SELECT relid, relname, action_id, applied_at, v,
+           sign(v - lag(v) OVER (PARTITION BY relid ORDER BY applied_at, action_id)) AS d
+    FROM seq
+), rev AS (   -- a reversal: this step's direction differs from the previous step's
+    SELECT relid, relname, action_id, applied_at, v, d,
+           lag(d) OVER (PARTITION BY relid ORDER BY applied_at, action_id) AS prev_d
+    FROM dir
+)
+SELECT r.relid,
+       max(r.relname)                                          AS relname,
+       count(*) FILTER (WHERE r.d <> 0 AND r.prev_d <> 0
+                              AND r.d <> r.prev_d)              AS reversals,
+       count(*)                                                AS n_changes,
+       min(r.applied_at)                                       AS first_at,
+       max(r.applied_at)                                       AS last_at,
+       array_agg(r.v::text ORDER BY r.applied_at, r.action_id) AS recent_values
+FROM rev r
+GROUP BY r.relid
+HAVING count(*) FILTER (WHERE r.d <> 0 AND r.prev_d <> 0 AND r.d <> r.prev_d)
+       >= pgfc_govern._param('oscillation_min_reversals')::bigint;
+$fn$;
+COMMENT ON FUNCTION pgfc_govern._oscillating_relations() IS
+  'Control-oscillation detector (Phase 1.7 F5): relations whose applied scale-factor flaps — at least oscillation_min_reversals direction reversals within oscillation_window. Read from action_history (applied only). The governor_metrics oscillating_relations count and the evaluate_health() oscillation signal both read it; the plan() reconciler raises the operator-visible finding.';
+
+-- Open/resolve the operator-visible oscillation diagnostic (appendix F: "operator
+-- visibility"). One unresolved control_oscillation row per flapping relation; resolved when
+-- the relation stops flapping (the changes age out of the window — actuation having been
+-- suspended by the diagnostic state, so no new ones arrive). Called from plan() alongside
+-- the saturation reconciler, which is scoped NOT to touch this class. No magic numbers (the
+-- window comes through _param), so it stays clean under the drift gate that scans it.
+CREATE OR REPLACE FUNCTION pgfc_govern._reconcile_oscillation()
+RETURNS void LANGUAGE plpgsql AS $fn$
+BEGIN
+    INSERT INTO pgfc_govern.diagnostics (relid, severity, inhibitor_class, evidence, recommendation)
+    SELECT o.relid, 'critical', 'control_oscillation',
+           jsonb_build_object('reversals', o.reversals,
+                              'changes', o.n_changes,
+                              'window', pgfc_govern._param('oscillation_window'),
+                              'recent_values', o.recent_values,
+                              'first_at', o.first_at,
+                              'last_at', o.last_at),
+           format('Scale factor is flapping (%s direction reversals in %s) — the controller is '
+                  'fighting itself. The governor has entered diagnostic mode and suspended '
+                  'actuation cluster-wide. Investigate the relation''s workload stability and '
+                  'class; actuation resumes automatically once the oscillation ages out of the '
+                  'window.', o.reversals, pgfc_govern._param('oscillation_window'))
+    FROM pgfc_govern._oscillating_relations() o
+    WHERE NOT EXISTS (
+        SELECT 1 FROM pgfc_govern.diagnostics d
+        WHERE d.resolved_at IS NULL AND d.relid = o.relid
+          AND d.inhibitor_class = 'control_oscillation');
+
+    UPDATE pgfc_govern.diagnostics d SET resolved_at = now()
+    WHERE d.resolved_at IS NULL
+      AND d.inhibitor_class = 'control_oscillation'
+      AND NOT EXISTS (SELECT 1 FROM pgfc_govern._oscillating_relations() o
+                       WHERE o.relid = d.relid);
+END
+$fn$;
+COMMENT ON FUNCTION pgfc_govern._reconcile_oscillation() IS
+  'Open/resolve the control_oscillation diagnostic (Phase 1.7 F5, appendix F "operator visibility"): one unresolved critical finding per flapping relation, auto-resolved when it stops flapping. Called from plan(); the saturation reconciler is scoped not to touch this class.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Self-monitoring  (Phase 1.7 F1 — governor self-protection)
 -- ─────────────────────────────────────────────────────────────────────────────
 -- The single one-row substrate the F2 health-state evaluator will read. It has NO
@@ -1749,9 +1852,12 @@ SELECT
     (SELECT over_budget FROM pgfc_govern.self_health)                       AS over_budget,
     -- retention backlog: age of the oldest retained mutation audit row. A raw,
     -- threshold-free signal; F2 compares it to the governed retention cutoff.
-    (SELECT min(applied_at) FROM pgfc_govern.action_history)                AS oldest_action_at;
+    (SELECT min(applied_at) FROM pgfc_govern.action_history)                AS oldest_action_at,
+    -- control oscillation (Phase 1.7 F5): how many relations are currently flapping their
+    -- scale factor. The evaluate_health() oscillation signal reads this; 0 when none.
+    (SELECT COALESCE(count(*), 0) FROM pgfc_govern._oscillating_relations()) AS oscillating_relations;
 COMMENT ON VIEW pgfc_govern.governor_metrics IS
-  'One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-state evaluator: applied/failed/lock-timeout action counts over 1h/1d windows, observation lag (newest snapshot age), loop durations + tick errors (tick_log), the self-health storage footprint, and the oldest retained audit row (retention backlog). Always returns one row; counts are 0 and freshness signals NULL when nothing has happened yet.';
+  'One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-state evaluator: applied/failed/lock-timeout action counts over 1h/1d windows, observation lag (newest snapshot age), loop durations + tick errors (tick_log), the self-health storage footprint, the oldest retained audit row (retention backlog), and the count of oscillating relations (Phase 1.7 F5). Always returns one row; counts are 0 and freshness signals NULL when nothing has happened yet.';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Health-state machine  (Phase 1.7 F2 — governor self-protection)
@@ -1826,7 +1932,17 @@ BEGIN
               ELSE 'normal' END::pgfc_govern.governor_health_state,
          CASE WHEN m.applied_actions_last_day >= v_daily_budget
               THEN format('daily mutation budget spent (%s applied in the last day)',
-                          m.applied_actions_last_day) END)
+                          m.applied_actions_last_day) END),
+        -- control oscillation (Phase 1.7 F5): a setting flapping is the controller fighting
+        -- itself — a SAFETY failure, so it trips diagnostic (not degraded): the F4 authority
+        -- gate then suspends actuation cluster-wide while the oscillating relation gets an
+        -- operator-visible finding (_reconcile_oscillation in plan()). Diagnostic, not
+        -- emergency: observation and diagnosis stay on. It auto-recovers once the flapping
+        -- ages out of oscillation_window (actuation having been suspended, none is added).
+        (CASE WHEN m.oscillating_relations > 0 THEN 'diagnostic'
+              ELSE 'normal' END::pgfc_govern.governor_health_state,
+         CASE WHEN m.oscillating_relations > 0
+              THEN format('%s relation(s) oscillating — control is flapping', m.oscillating_relations) END)
     ) AS c(state, reason)
     ORDER BY c.state DESC, (c.reason IS NULL)              -- worst state; non-null reason wins ties
     LIMIT 1;
@@ -1860,7 +1976,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.evaluate_health() IS
-  'Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds (failed actions, lock timeouts, observation lag, storage footprint, and the F4 daily-mutation-budget circuit breaker — degraded-level only), then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. The state it writes is the input to the F4 apply() authority gate. Returns the effective state.';
+  'Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds (failed actions, lock timeouts, observation lag, storage footprint, the F4 daily-mutation-budget circuit breaker — degraded-level only — and the F5 control-oscillation signal — diagnostic), then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. The state it writes is the input to the F4 apply() authority gate. Returns the effective state.';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Human-override surface  (Phase 1.7 F3 — governor self-protection)

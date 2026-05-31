@@ -65,7 +65,7 @@ Every actuator attempt (applied or failed). revert() replays only status=applied
 
 ### pgfc_govern.diagnostics
 
-When control saturates, the cause + a recommendation, not more DDL.
+Per-relation findings + a recommendation, not more DDL: maintenance-inhibitor / saturation causes, and governor-scope findings such as control oscillation (Phase 1.7 F5).
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -231,7 +231,7 @@ Single-row storage config (S6): budget_bytes is the total-bytes cap over both sc
 
 ### pgfc_govern.governor_metrics
 
-One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-state evaluator: applied/failed/lock-timeout action counts over 1h/1d windows, observation lag (newest snapshot age), loop durations + tick errors (tick_log), the self-health storage footprint, and the oldest retained audit row (retention backlog). Always returns one row; counts are 0 and freshness signals NULL when nothing has happened yet.
+One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-state evaluator: applied/failed/lock-timeout action counts over 1h/1d windows, observation lag (newest snapshot age), loop durations + tick errors (tick_log), the self-health storage footprint, the oldest retained audit row (retention backlog), and the count of oscillating relations (Phase 1.7 F5). Always returns one row; counts are 0 and freshness signals NULL when nothing has happened yet.
 
 | Column | Type |
 | --- | --- |
@@ -251,6 +251,7 @@ One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-stat
 | `storage_bytes` | `numeric` |
 | `over_budget` | `boolean` |
 | `oldest_action_at` | `timestamp with time zone` |
+| `oscillating_relations` | `bigint` |
 
 ### pgfc_govern.governor_status
 
@@ -316,6 +317,10 @@ Base (pre-aggressiveness) target dead-tuple fraction for a workload class, read 
 
 AFTER row trigger: records every policy insert/update/delete into policy_history.
 
+### `pgfc_govern._oscillating_relations() → TABLE(relid oid, relname text, reversals bigint, n_changes bigint, first_at timestamp with time zone, last_at timestamp with time zone, recent_values text[])`
+
+Control-oscillation detector (Phase 1.7 F5): relations whose applied scale-factor flaps — at least oscillation_min_reversals direction reversals within oscillation_window. Read from action_history (applied only). The governor_metrics oscillating_relations count and the evaluate_health() oscillation signal both read it; the plan() reconciler raises the operator-visible finding.
+
 ### `pgfc_govern._param(p_name text) → text`
 
 Read a governed parameter's value from the registry (Phase 1.6 P2); the control logic single-sources its constants through this.
@@ -325,6 +330,10 @@ Read a governed parameter's value from the registry (Phase 1.6 P2); the control 
 Canonical registry of pgfc_govern governed constants; the control logic reads its values from here through the registry accessor functions (Phase 1.6 P2, single-sourced). The CI drift gate that makes divergence impossible lands in P3.
 
 ### `pgfc_govern._reconcile_diagnostics(p_snapshot_id bigint) → void`
+
+### `pgfc_govern._reconcile_oscillation() → void`
+
+Open/resolve the control_oscillation diagnostic (Phase 1.7 F5, appendix F "operator visibility"): one unresolved critical finding per flapping relation, auto-resolved when it stops flapping. Called from plan(); the saturation reconciler is scoped not to touch this class.
 
 ### `pgfc_govern._sf_grid() → double precision[]`
 
@@ -360,7 +369,7 @@ Derive hidden state (rates, effectiveness, saturation) into relation_estimate.
 
 ### `pgfc_govern.evaluate_health() → pgfc_govern.governor_health_state`
 
-Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds (failed actions, lock timeouts, observation lag, storage footprint, and the F4 daily-mutation-budget circuit breaker — degraded-level only), then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. The state it writes is the input to the F4 apply() authority gate. Returns the effective state.
+Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds (failed actions, lock timeouts, observation lag, storage footprint, the F4 daily-mutation-budget circuit breaker — degraded-level only — and the F5 control-oscillation signal — diagnostic), then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. The state it writes is the input to the F4 apply() authority gate. Returns the effective state.
 
 ### `pgfc_govern.ewma(prior double precision, sample double precision, alpha double precision) → double precision`
 
@@ -372,7 +381,7 @@ Operator override (Phase 1.7 F3): force the governor into a more-cautious state 
 
 ### `pgfc_govern.plan(p_tick_id bigint, p_snapshot_id bigint) → integer`
 
-Advisory: write decision_log per relation (vacuum objective) + reconcile diagnostics.
+Advisory: write decision_log per relation (vacuum objective) + reconcile diagnostics (saturation + Phase 1.7 F5 control oscillation).
 
 ### `pgfc_govern.retain(keep_decisions interval, keep_actions interval, keep_ticks interval, keep_diagnostics interval, keep_transitions interval) → TABLE(relation text, deleted bigint)`
 
