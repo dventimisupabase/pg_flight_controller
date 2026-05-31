@@ -210,6 +210,12 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.action_history (
     revert_value   text,
     status         text NOT NULL DEFAULT 'applied' CHECK (status IN ('applied','failed')),
     failure_reason text,
+    -- Failure taxonomy (Phase 1.7 F6): the appendix-F category this failure belongs to,
+    -- derived from failure_reason by _failure_class(). NULL when status='applied'. The CHECK
+    -- pins the five-category vocabulary at the schema level.
+    failure_class  text CONSTRAINT action_history_failure_class_check
+                    CHECK (failure_class IS NULL
+                    OR failure_class IN ('observation','decision','actuation','resource','safety')),
     lock_wait_outcome text,
     budget_consumed boolean NOT NULL DEFAULT false,   -- only true for applied non-emergency
     emergency_override boolean NOT NULL DEFAULT false,
@@ -217,7 +223,7 @@ CREATE TABLE IF NOT EXISTS pgfc_govern.action_history (
     reverted_at    timestamptz
 );
 COMMENT ON TABLE pgfc_govern.action_history IS
-  'Every actuator attempt (applied or failed). revert() replays only status=applied.';
+  'Every actuator attempt (applied or failed). revert() replays only status=applied. failed rows carry failure_reason + the F6 failure_class (taxonomy category).';
 
 -- Per control-cycle orchestration log.
 CREATE TABLE IF NOT EXISTS pgfc_govern.tick_log (
@@ -839,6 +845,34 @@ $fn$;
 -- (rate limits) are Phase 2.
 CREATE SEQUENCE IF NOT EXISTS pgfc_govern.batch_seq;
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Failure taxonomy  (Phase 1.7 F6 — governor self-protection)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Appendix F "Failure Classification": every governor failure belongs to one of five
+-- categories — observation / decision / actuation / resource / safety. This function is the
+-- single source of truth mapping a recorded failure_reason to its category; apply() stamps
+-- action_history.failure_class through it, and the additive backfill below labels historical
+-- rows. IMMUTABLE (a pure lookup) so it is safe in generated/indexed contexts. Today the
+-- governor records only actuation failures (apply()'s lock_timeout / insufficient_privilege),
+-- so the codomain enumerated here is wider than what is currently produced — that is
+-- deliberate: it fixes the vocabulary for the failure sites later actuators will add (a
+-- conflicting-DDL actuation failure, a sampling observation failure, …). The other categories'
+-- *current* conditions are not action_history rows; they surface through their own channels and
+-- are unified for operators by the failure_taxonomy view below. No numeric literals, so it
+-- stays clean under the P3 drift gate (which scans this body).
+CREATE OR REPLACE FUNCTION pgfc_govern._failure_class(p_failure_reason text)
+RETURNS text LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT CASE p_failure_reason
+        -- actuation failures: the governor tried to act and the action itself failed
+        WHEN 'lock_timeout'           THEN 'actuation'   -- could not acquire the lock in time
+        WHEN 'insufficient_privilege' THEN 'actuation'   -- not allowed to ALTER the relation
+        WHEN 'conflicting_ddl'        THEN 'actuation'   -- (future) a concurrent DDL conflict
+        ELSE NULL   -- unknown/unclassified reason: leave NULL rather than mislabel
+    END;
+$fn$;
+COMMENT ON FUNCTION pgfc_govern._failure_class(text) IS
+  'Failure taxonomy (Phase 1.7 F6): map a recorded failure_reason to its appendix-F category (observation/decision/actuation/resource/safety). Single source of the mapping; apply() stamps action_history.failure_class through it. IMMUTABLE pure lookup; NULL for an unknown reason.';
+
 CREATE OR REPLACE FUNCTION pgfc_govern.apply(p_tick_id bigint, p_relid oid)
 RETURNS boolean LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -943,16 +977,18 @@ BEGIN
         WHEN lock_not_available THEN
             INSERT INTO pgfc_govern.action_history
               (batch_id, decision_id, relid, relname, actuator, old_value, new_value,
-               prev_reloptions, status, failure_reason, lock_wait_outcome, budget_consumed)
+               prev_reloptions, status, failure_reason, failure_class, lock_wait_outcome, budget_consumed)
             VALUES (v_batch, v_decid, p_relid, v_relname, v_act, v_cur, v_prop,
-                    v_live, 'failed', 'lock_timeout', 'timeout', false);
+                    v_live, 'failed', 'lock_timeout', pgfc_govern._failure_class('lock_timeout'),
+                    'timeout', false);
             RETURN false;
         WHEN insufficient_privilege THEN
             INSERT INTO pgfc_govern.action_history
               (batch_id, decision_id, relid, relname, actuator, old_value, new_value,
-               prev_reloptions, status, failure_reason, budget_consumed)
+               prev_reloptions, status, failure_reason, failure_class, budget_consumed)
             VALUES (v_batch, v_decid, p_relid, v_relname, v_act, v_cur, v_prop,
-                    v_live, 'failed', 'insufficient_privilege', false);
+                    v_live, 'failed', 'insufficient_privilege',
+                    pgfc_govern._failure_class('insufficient_privilege'), false);
             RETURN false;
     END;
 
@@ -1504,6 +1540,14 @@ VALUES
   ('oscillation_min_reversals', 'empirical_default', '2', 'reversals',
    'Direction reversals in a relation''s applied scale-factor sequence within oscillation_window at or above which the governor treats it as oscillating (a full A->B->A->B flap is 2 reversals).',
    'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  -- Load shedding (Phase 1.7 F6 — self-protection). When the database is under connection
+  -- pressure, the governor sheds its own load by suspending actuation (the pg_flight_recorder
+  -- load_shedding_active_pct pattern, adapted from collector-sampling to actuation authority):
+  -- it consumes fewer resources, and stops competing for locks, when the database needs them
+  -- most. Born governed (a stress %, like every other health-transition threshold).
+  ('load_shed_connection_pct', 'empirical_default', '0.9', 'fraction',
+   'Connection pressure (client_backends / max_connections, from the newest snapshot) at or above which the governor sheds load: it enters diagnostic and the F4 authority gate suspends actuation cluster-wide until the pressure eases. A fraction in (0, 1]; lower sheds sooner.',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
   -- Implementation convenience
   ('govern_av_threshold', 'implementation_convenience', '200', 'rows',
    'Static autovacuum threshold on the govern audit/state tables (scale_factor 0).',
@@ -1694,6 +1738,23 @@ ALTER TABLE pgfc_govern.governor_state ADD COLUMN IF NOT EXISTS forced_reason te
 ALTER TABLE pgfc_govern.governor_state ADD COLUMN IF NOT EXISTS forced_by     text;
 ALTER TABLE pgfc_govern.governor_state ADD COLUMN IF NOT EXISTS forced_at     timestamptz;
 
+-- F6: the failure-taxonomy class on action_history, for installs that already have the
+-- table. Add the (nullable) column, then the five-category CHECK (guarded: ADD CONSTRAINT
+-- has no IF NOT EXISTS), then backfill historical failed rows through _failure_class() — the
+-- same single-source mapping apply() now stamps live. NULLs (applied rows, or an unknown
+-- reason) pass the CHECK, so the order is safe.
+ALTER TABLE pgfc_govern.action_history ADD COLUMN IF NOT EXISTS failure_class text;
+DO $$ BEGIN
+    ALTER TABLE pgfc_govern.action_history
+        ADD CONSTRAINT action_history_failure_class_check
+        CHECK (failure_class IS NULL
+               OR failure_class IN ('observation','decision','actuation','resource','safety'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+UPDATE pgfc_govern.action_history
+   SET failure_class = pgfc_govern._failure_class(failure_reason)
+ WHERE status = 'failed' AND failure_class IS NULL
+   AND pgfc_govern._failure_class(failure_reason) IS NOT NULL;
+
 -- S6: static autovacuum reloptions on the governor's own audit/state tables. Unlike
 -- the partition-rotated observe tables, these are mutated in place (UPDATE-heavy state
 -- tables; DELETE-pruned audit tables by retain()/degrade()), so they DO accrue dead
@@ -1855,9 +1916,89 @@ SELECT
     (SELECT min(applied_at) FROM pgfc_govern.action_history)                AS oldest_action_at,
     -- control oscillation (Phase 1.7 F5): how many relations are currently flapping their
     -- scale factor. The evaluate_health() oscillation signal reads this; 0 when none.
-    (SELECT COALESCE(count(*), 0) FROM pgfc_govern._oscillating_relations()) AS oscillating_relations;
+    (SELECT COALESCE(count(*), 0) FROM pgfc_govern._oscillating_relations()) AS oscillating_relations,
+    -- connection pressure (Phase 1.7 F6 — load shedding): the client_backends/max_connections
+    -- ratio from the NEWEST snapshot (observe() collects both). The evaluate_health()
+    -- load-shed signal reads connection_pressure; NULL when nothing observed yet or a pre-F6
+    -- snapshot didn't collect the inputs — never treated as "no load". The raw inputs are
+    -- carried alongside so the reason string and operator views can name them.
+    (SELECT client_backends FROM pgfc_observe.snapshots
+       ORDER BY snapshot_id DESC LIMIT 1)                                    AS client_backends,
+    (SELECT max_connections FROM pgfc_observe.snapshots
+       ORDER BY snapshot_id DESC LIMIT 1)                                    AS max_connections,
+    (SELECT s.client_backends::numeric / NULLIF(s.max_connections, 0)
+       FROM pgfc_observe.snapshots s ORDER BY s.snapshot_id DESC LIMIT 1)    AS connection_pressure,
+    -- the same pressure as a whole-percent integer, for the human-readable reason string.
+    -- Computed in the view (not a control function) so evaluate_health() carries no inline
+    -- 100 literal under the P3 drift gate.
+    (SELECT round(100 * s.client_backends::numeric / NULLIF(s.max_connections, 0))
+       FROM pgfc_observe.snapshots s ORDER BY s.snapshot_id DESC LIMIT 1)    AS connection_pressure_pct;
 COMMENT ON VIEW pgfc_govern.governor_metrics IS
-  'One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-state evaluator: applied/failed/lock-timeout action counts over 1h/1d windows, observation lag (newest snapshot age), loop durations + tick errors (tick_log), the self-health storage footprint, the oldest retained audit row (retention backlog), and the count of oscillating relations (Phase 1.7 F5). Always returns one row; counts are 0 and freshness signals NULL when nothing has happened yet.';
+  'One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-state evaluator: applied/failed/lock-timeout action counts over 1h/1d windows, observation lag (newest snapshot age), loop durations + tick errors (tick_log), the self-health storage footprint, the oldest retained audit row (retention backlog), the count of oscillating relations (Phase 1.7 F5), and the connection pressure from the newest snapshot (Phase 1.7 F6 load-shedding input). Always returns one row; counts are 0 and freshness signals NULL when nothing has happened yet.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Failure taxonomy — unified operator surface  (Phase 1.7 F6 — self-protection)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- One row per appendix-F failure category, always all five, so an operator can read the
+-- governor's whole failure picture at a glance: which categories are CURRENTLY in failure
+-- and the recorded actuation failures by class. condition_present is the live signal for
+-- the category (drawn from the same governor_metrics/self_health substrate the health-state
+-- machine reads), recorded_failures_last_day counts action_history rows stamped with that
+-- failure_class (only actuation is produced today — the other categories' conditions are not
+-- action_history rows but surface here via their live signals). This is a reporting view,
+-- not a control function, so it is not scanned by the P3 drift gate; the lag threshold still
+-- comes through _param() rather than an inline literal, for consistency with the evaluator.
+CREATE OR REPLACE VIEW pgfc_govern.failure_taxonomy AS
+WITH m AS (SELECT * FROM pgfc_govern.governor_metrics),
+     recorded AS (
+        SELECT failure_class, count(*) AS n
+        FROM pgfc_govern.action_history
+        WHERE status = 'failed' AND failure_class IS NOT NULL
+          AND applied_at > now() - interval '1 day'
+        GROUP BY failure_class
+     )
+SELECT cat.failure_class,
+       cat.condition_present,
+       COALESCE(r.n, 0)  AS recorded_failures_last_day,
+       cat.detail
+FROM m,
+LATERAL (VALUES
+    -- observation: the governor is losing sight of the database (stale telemetry). NULL lag
+    -- (nothing observed yet) is fresh, not failing — COALESCE so condition_present is never NULL.
+    ('observation',
+     COALESCE(m.observation_lag > make_interval(secs => pgfc_govern._param('health_lag_degraded_secs')::double precision), false),
+     CASE WHEN COALESCE(m.observation_lag > make_interval(secs => pgfc_govern._param('health_lag_degraded_secs')::double precision), false)
+          THEN format('observation lag %s — telemetry is stale', m.observation_lag)
+          ELSE 'telemetry fresh' END),
+    -- decision: a control cycle errored out (estimation/planning failure)
+    ('decision',
+     m.tick_errors_last_day > 0,
+     CASE WHEN m.tick_errors_last_day > 0
+          THEN format('%s control cycle(s) errored in the last day', m.tick_errors_last_day)
+          ELSE 'no cycle errors' END),
+    -- actuation: an attempted change failed (lock timeout / permission / conflicting DDL)
+    ('actuation',
+     m.failed_actions_last_hour > 0,
+     CASE WHEN m.failed_actions_last_day > 0
+          THEN format('%s failed action(s) in the last hour, %s in the last day',
+                      m.failed_actions_last_hour, m.failed_actions_last_day)
+          ELSE 'no failed actions' END),
+    -- resource: the governor is over its own storage footprint budget
+    ('resource',
+     COALESCE(m.over_budget, false),
+     CASE WHEN COALESCE(m.over_budget, false)
+          THEN format('governor storage footprint over budget (%s bytes)', m.storage_bytes)
+          ELSE 'within storage budget' END),
+    -- safety: the controller is fighting itself (control oscillation — F5)
+    ('safety',
+     m.oscillating_relations > 0,
+     CASE WHEN m.oscillating_relations > 0
+          THEN format('%s relation(s) oscillating — control is flapping', m.oscillating_relations)
+          ELSE 'no safety-class failures' END)
+) AS cat(failure_class, condition_present, detail)
+LEFT JOIN recorded r ON r.failure_class = cat.failure_class;
+COMMENT ON VIEW pgfc_govern.failure_taxonomy IS
+  'Unified failure-classification surface (Phase 1.7 F6, appendix F): one row per category (observation/decision/actuation/resource/safety) with condition_present (the live signal, from the same substrate the health-state machine reads) and recorded_failures_last_day (action_history rows stamped with that failure_class — actuation only, today). The governor''s whole failure picture in five rows.';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Health-state machine  (Phase 1.7 F2 — governor self-protection)
@@ -1942,7 +2083,24 @@ BEGIN
         (CASE WHEN m.oscillating_relations > 0 THEN 'diagnostic'
               ELSE 'normal' END::pgfc_govern.governor_health_state,
          CASE WHEN m.oscillating_relations > 0
-              THEN format('%s relation(s) oscillating — control is flapping', m.oscillating_relations) END)
+              THEN format('%s relation(s) oscillating — control is flapping', m.oscillating_relations) END),
+        -- load shedding (Phase 1.7 F6): under connection pressure the governor sheds its own
+        -- load by entering diagnostic, so the F4 authority gate suspends actuation cluster-wide
+        -- — it stops competing for locks and consumes fewer resources when the database needs
+        -- them most ("the governor should consume fewer resources when the database needs them
+        -- most"). Diagnostic, not emergency: observation and diagnosis stay on (observe
+        -- aggressively, act cautiously). A degraded tier would be cosmetic here — degraded still
+        -- actuates, so it would not actually shed — so the single threshold goes straight to the
+        -- tier that bites. NULL pressure (boot, or a pre-F6 snapshot) yields the 'normal'
+        -- candidate (NULL >= x is NULL → ELSE), so absence of data is not ill health. Recovers
+        -- automatically: when pressure eases, the next evaluation returns to normal (transient,
+        -- unlike F5's windowed oscillation hold). Surfaced via governor_state.reason and the
+        -- state_transitions audit, like the other breaker signals.
+        (CASE WHEN m.connection_pressure >= pgfc_govern._param('load_shed_connection_pct')::numeric
+              THEN 'diagnostic' ELSE 'normal' END::pgfc_govern.governor_health_state,
+         CASE WHEN m.connection_pressure >= pgfc_govern._param('load_shed_connection_pct')::numeric
+              THEN format('connection pressure %s%% (%s/%s client backends) — shedding load, actuation suspended',
+                          m.connection_pressure_pct, m.client_backends, m.max_connections) END)
     ) AS c(state, reason)
     ORDER BY c.state DESC, (c.reason IS NULL)              -- worst state; non-null reason wins ties
     LIMIT 1;
@@ -1976,7 +2134,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.evaluate_health() IS
-  'Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds (failed actions, lock timeouts, observation lag, storage footprint, the F4 daily-mutation-budget circuit breaker — degraded-level only — and the F5 control-oscillation signal — diagnostic), then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. The state it writes is the input to the F4 apply() authority gate. Returns the effective state.';
+  'Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds (failed actions, lock timeouts, observation lag, storage footprint, the F4 daily-mutation-budget circuit breaker — degraded-level only — the F5 control-oscillation signal — diagnostic — and the F6 connection-pressure load-shedding signal — diagnostic), then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. The state it writes is the input to the F4 apply() authority gate. Returns the effective state.';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Human-override surface  (Phase 1.7 F3 — governor self-protection)

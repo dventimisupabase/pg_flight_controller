@@ -238,6 +238,28 @@ section in the same pull request as your change (this is a convention, not a CI 
   clean under the P3 drift gate (which scans them automatically). The `diagnostics` table now
   carries governor-scope findings alongside per-relation saturation causes.
 
+- **Governor self-protection Phase 1.7 — F6 (load shedding + failure taxonomy).** Two
+  appendix-F items land together. **Load shedding:** `observe()` now captures the cluster's
+  client-backend count and `max_connections` into the `snapshots` header (two additive,
+  nullable columns), and `governor_metrics` derives a `connection_pressure` ratio from the
+  newest snapshot. `evaluate_health()` gains a load-shedding signal — when pressure reaches
+  the born-governed `load_shed_connection_pct` (default `0.90`), the governor enters
+  **`diagnostic`** so the F4 authority gate suspends actuation **cluster-wide**: it stops
+  competing for locks and consumes fewer resources when the database needs them most (the
+  `pg_flight_recorder` `load_shedding_active_pct` pattern, adapted from collector sampling to
+  actuation authority). Recovery is immediate and windowless — the next snapshot showing
+  eased pressure returns the governor to `normal`. A pre-F6 (or boot) snapshot has a NULL
+  pressure and never sheds. **Failure taxonomy:** a new `_failure_class()` function is the
+  single source mapping a recorded `failure_reason` to one of appendix F's five categories
+  (observation / decision / actuation / resource / safety); `action_history` gains a
+  `failure_class` column (CHECK-pinned, backfilled) that `apply()` now stamps on every failed
+  attempt. The new `failure_taxonomy` view unifies the governor's whole failure picture into
+  five rows — `condition_present` (the live signal, from the same substrate the health-state
+  machine reads) and `recorded_failures_last_day` per category. Both new control functions are
+  clean under the P3 drift gate (no inline literals — the percentage display lives in the
+  un-scanned `governor_metrics` view). New pgTAP suite `18_load_shedding.sql` (33 tests, green
+  on PG 15–18).
+
 ### Changed
 
 - **`docs/` is now the self-contained, as-built spec.** The hand-written guides no

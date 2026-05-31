@@ -136,6 +136,13 @@ CREATE TABLE IF NOT EXISTS pgfc_observe.snapshots (
     def_mxid_freeze_max_age  bigint,
     autovacuum_max_workers   integer,
     wal_bytes                numeric,
+    -- cluster load signals: the governor's load-shedding stress input (Phase 1.7 F6).
+    -- client_backends is the connection-exhaustion numerator (client backends only —
+    -- background workers / autovacuum / walsenders are not bounded by max_connections);
+    -- connection pressure = client_backends / max_connections. Nullable: pre-F6 snapshots
+    -- did not collect them, and a NULL pressure is "not collected", never "no load".
+    client_backends          bigint,
+    max_connections          integer,
     -- catalog self-monitoring (the governor's actuation mutates pg_class.reloptions)
     pg_class_size_bytes      bigint,
     pg_class_n_dead_tup      bigint,
@@ -150,7 +157,7 @@ CREATE TABLE IF NOT EXISTS pgfc_observe.snapshots (
     PRIMARY KEY (collected_day, snapshot_id)
 ) PARTITION BY RANGE (collected_day);
 COMMENT ON TABLE pgfc_observe.snapshots IS
-  'Header row per observe() run: timestamp + cluster/GUC + pg_class health + xmin horizons. Daily RANGE partitioned on collected_day.';
+  'Header row per observe() run: timestamp + cluster/GUC + cluster load signals (client_backends/max_connections — the F6 load-shedding stress input) + pg_class health + xmin horizons. Daily RANGE partitioned on collected_day.';
 
 -- One row per relation per snapshot. Additive-only: new columns are nullable;
 -- existing columns are never dropped or renamed.
@@ -637,6 +644,7 @@ BEGIN
         def_ana_scale_factor, def_ana_threshold, def_vac_cost_limit,
         def_vac_cost_delay, def_freeze_max_age, def_mxid_freeze_max_age,
         autovacuum_max_workers, wal_bytes,
+        client_backends, max_connections,
         pg_class_size_bytes, pg_class_n_dead_tup, pg_class_n_live_tup,
         pg_class_last_autovacuum,
         oldest_xmin_age, oldest_xmin_owner, oldest_xmin_owner_detail,
@@ -655,6 +663,9 @@ BEGIN
         current_setting('autovacuum_multixact_freeze_max_age')::bigint,
         current_setting('autovacuum_max_workers')::int,
         (SELECT wal_bytes FROM pg_stat_wal),
+        -- connection pressure inputs (F6): client backends only, against the connection cap.
+        (SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend'),
+        current_setting('max_connections')::int,
         pg_total_relation_size('pg_catalog.pg_class'::regclass),
         c.n_dead_tup, c.n_live_tup, c.last_autovacuum,
         h.oldest_xmin_age, h.oldest_xmin_owner, h.oldest_xmin_owner_detail,
@@ -1448,6 +1459,11 @@ SELECT pgfc_observe._ensure_part('rollup_1d', pgfc_observe._epoch_month(now()), 
 -- created by its CREATE UNLOGGED TABLE IF NOT EXISTS above, so it needs no ALTER here.
 ALTER TABLE pgfc_observe.relation_samples ADD COLUMN IF NOT EXISTS relfrozenxid xid;
 ALTER TABLE pgfc_observe.relation_samples ADD COLUMN IF NOT EXISTS relminmxid  xid;
+
+-- F6: cluster load signals on the snapshot header — the governor's load-shedding stress
+-- input (connection exhaustion). Nullable; pre-F6 snapshots keep NULL ("not collected").
+ALTER TABLE pgfc_observe.snapshots ADD COLUMN IF NOT EXISTS client_backends bigint;
+ALTER TABLE pgfc_observe.snapshots ADD COLUMN IF NOT EXISTS max_connections integer;
 
 -- S6: static autovacuum reloptions. New partitions get them in their WITH clause
 -- (via _telemetry_reloptions in _ensure_partition/_ensure_part), but partitions
