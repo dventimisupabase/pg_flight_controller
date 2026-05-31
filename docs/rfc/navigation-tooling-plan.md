@@ -49,7 +49,7 @@ add a Sequences section to the reference, bring `batch_seq` into scope.)
 
 ## Status
 
-- [ ] **PR 1 — metadata + reference injection + exhaustiveness gate (atomic).** See
+- [x] **PR 1 — metadata + reference injection + exhaustiveness gate (atomic).** See
   [steps](#pr-1--metadata--reference-injection--exhaustiveness-gate).
 - [ ] **PR 2 — bottom-up index + staleness gate + RFC wiring.** See
   [steps](#pr-2--bottom-up-index--staleness-gate--rfc-wiring).
@@ -61,23 +61,23 @@ Update this section and the per-PR checkboxes as each lands. Record merged PR nu
 These three land **together** (atomic): adding tags to comments would otherwise dirty the
 generated reference and break the "Reference up to date" gate.
 
-- [ ] Add `[subsystem:<ID>]` to every in-scope object's `COMMENT ON` in
+- [x] Add `[subsystem:<ID>]` to every in-scope object's `COMMENT ON` in
   [`pgfc_observe/install.sql`](../../pgfc_observe/install.sql) and
   [`pgfc_govern/install.sql`](../../pgfc_govern/install.sql), per the
   [map](#object--subsystem-map-working-checklist). Add a real comment to any object lacking
   one (~17 objects; observe has 33 comments / govern 40, vs. the in-scope counts below).
-- [ ] Update [`scripts/gen_reference.sql`](../../scripts/gen_reference.sql) to: parse the
+- [x] Update [`scripts/gen_reference.sql`](../../scripts/gen_reference.sql) to: parse the
   marker, strip it from the rendered comment prose, and emit a `**Subsystem:** <ID>` field
   for each object (table/view/function/type).
-- [ ] Regenerate the reference (`scripts/gen-reference.sh`) and commit the updated
+- [x] Regenerate the reference (`scripts/gen-reference.sh`) and commit the updated
   [`docs/reference/pgfc_observe.md`](../reference/pgfc_observe.md) and
   [`docs/reference/pgfc_govern.md`](../reference/pgfc_govern.md).
-- [ ] New pgTAP test (one per schema, or shared) asserting **every in-scope object carries
+- [x] New pgTAP test (one per schema, or shared) asserting **every in-scope object carries
   exactly one valid subsystem tag** — the "every object is classified" gate. Place under
   `pgfc_observe/tests/` and `pgfc_govern/tests/`; it runs in the existing PG 15–18 matrix.
   Query `pg_description` joined to `pg_class`/`pg_proc`/`pg_type`; fail on any in-scope object
   whose comment is NULL or lacks the marker, or whose marker ID is not in the valid set.
-- [ ] **Exit:** all CI green — `Markdown Lint`, `Links`, `Reference up to date`, the pgTAP
+- [x] **Exit:** all CI green — `Markdown Lint`, `Links`, `Reference up to date`, the pgTAP
   matrix (new gate passes), `Doctests`, `Doc Drift Review`, `base-is-main`.
 
 ## PR 2 — bottom-up index + staleness gate + RFC wiring
@@ -165,7 +165,7 @@ govern — [G1](README.md#g1-control-loop-ooda), [G2](README.md#g2-policy-and-in
 [G5](README.md#g5-diagnostics), [G6](README.md#g6-storage-retention-and-self-maintenance),
 [G7](README.md#g7-status-and-reporting).
 
-### pgfc_observe (29 objects; 29 in tag scope)
+### pgfc_observe (30 objects; 30 in tag scope)
 
 | Object | Kind | Subsystem |
 | --- | --- | --- |
@@ -178,6 +178,7 @@ govern — [G1](README.md#g1-control-loop-ooda), [G2](README.md#g2-policy-and-in
 | `rollup_1h` | table (partitioned) | O2 |
 | `rollup_1d` | table (partitioned) | O2 |
 | `_ensure_partition()` | function | O2 |
+| `_ensure_part()` | function | O2 |
 | `_partition_inventory()` | function | O2 |
 | `_epoch_day()` | function | O2 |
 | `_epoch_month()` | function | O2 |

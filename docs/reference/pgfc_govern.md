@@ -12,6 +12,8 @@ pg_flight_controller control loop: classify, estimate, plan, (apply), verify.
 
 Every actuator attempt (applied or failed). revert() replays only status=applied. failed rows carry failure_reason + the F6 failure_class (taxonomy category).
 
+**Subsystem:** G1
+
 | Column | Type | Description |
 | --- | --- | --- |
 | `action_id` | `bigint` |  |
@@ -36,6 +38,10 @@ Every actuator attempt (applied or failed). revert() replays only status=applied
 
 ### pgfc_govern.actuator_state
 
+Current governor-set value and rollback baseline per (relation, actuator); baseline_explicit drives SET-vs-RESET on revert.
+
+**Subsystem:** G1
+
 | Column | Type | Description |
 | --- | --- | --- |
 | `relid` | `oid` |  |
@@ -47,6 +53,10 @@ Every actuator attempt (applied or failed). revert() replays only status=applied
 | `av_count_at_apply` | `bigint` |  |
 
 ### pgfc_govern.decision_log
+
+Audit of every control decision (applied or not): observation, prior/desired state, the decision, and proposed value.
+
+**Subsystem:** G1
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -68,6 +78,8 @@ Every actuator attempt (applied or failed). revert() replays only status=applied
 
 Per-relation findings + a recommendation, not more DDL: maintenance-inhibitor / saturation causes, and governor-scope findings such as control oscillation (Phase 1.7 F5).
 
+**Subsystem:** G5
+
 | Column | Type | Description |
 | --- | --- | --- |
 | `diagnostic_id` | `bigint` |  |
@@ -82,6 +94,8 @@ Per-relation findings + a recommendation, not more DDL: maintenance-inhibitor / 
 ### pgfc_govern.governor_state
 
 Single-row governor health state (Phase 1.7 F2): the current self-protection state computed by evaluate_health(). The operator_forced/forced_* columns hold the F3 human override — a caution floor (force more caution, never less). Advisory; the apply() authority gate consults it in F4.
+
+**Subsystem:** G4
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -98,6 +112,8 @@ Single-row governor health state (Phase 1.7 F2): the current self-protection sta
 ### pgfc_govern.policy
 
 Operator-expressed outcomes. advisory_only=true means plan but never apply.
+
+**Subsystem:** G2
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -118,6 +134,8 @@ Operator-expressed outcomes. advisory_only=true means plan but never apply.
 
 Append-only audit of policy changes (insert/update/delete); retained indefinitely.
 
+**Subsystem:** G2
+
 | Column | Type | Description |
 | --- | --- | --- |
 | `history_id` | `bigint` |  |
@@ -129,6 +147,10 @@ Append-only audit of policy changes (insert/update/delete); retained indefinitel
 | `changed_at` | `timestamp with time zone` |  |
 
 ### pgfc_govern.relation_class
+
+Per-relation workload classification with hysteresis (candidate/streak): the desired-state template feeding plan().
+
+**Subsystem:** G1
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -142,6 +164,10 @@ Append-only audit of policy changes (insert/update/delete); retained indefinitel
 | `classified_at` | `timestamp with time zone` |  |
 
 ### pgfc_govern.relation_estimate
+
+Latest derived hidden state per relation from estimate(): rates, effectiveness, and saturation diagnosis (one row per relation).
+
+**Subsystem:** G1
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -171,6 +197,8 @@ Append-only audit of policy changes (insert/update/delete); retained indefinitel
 
 Append-only audit of governor health-state transitions (Phase 1.7 F2): from/to state, reason, and the metrics snapshot that triggered it. Pruned by retain().
 
+**Subsystem:** G4
+
 | Column | Type | Description |
 | --- | --- | --- |
 | `transition_id` | `bigint` |  |
@@ -184,12 +212,18 @@ Append-only audit of governor health-state transitions (Phase 1.7 F2): from/to s
 
 Single-row storage config (S6): budget_bytes is the total-bytes cap over both schemas that degrade() enforces. NULL = no cap (degrade is a no-op).
 
+**Subsystem:** G6
+
 | Column | Type | Description |
 | --- | --- | --- |
 | `singleton` | `boolean` |  |
 | `budget_bytes` | `bigint` | Total on-disk cap across pgfc_observe + pgfc_govern. NULL disables degrade(). |
 
 ### pgfc_govern.tick_log
+
+Per control-cycle orchestration log: snapshot, timing, relation/decision/applied counts, and any error.
+
+**Subsystem:** G1
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -206,6 +240,10 @@ Single-row storage config (S6): budget_bytes is the total-bytes cap over both sc
 
 ### pgfc_govern.active_diagnostics
 
+Unresolved maintenance-inhibitor / saturation findings, critical first.
+
+**Subsystem:** G5
+
 | Column | Type |
 | --- | --- |
 | `diagnostic_id` | `bigint` |
@@ -217,6 +255,10 @@ Single-row storage config (S6): budget_bytes is the total-bytes cap over both sc
 | `evidence` | `jsonb` |
 
 ### pgfc_govern.catalog_health
+
+Catalog-mutation health: the governor's own DDL footprint (applied/failed counts over 1h/1d) plus the latest snapshot's live pg_class state.
+
+**Subsystem:** G7
 
 | Column | Type |
 | --- | --- |
@@ -234,6 +276,8 @@ Single-row storage config (S6): budget_bytes is the total-bytes cap over both sc
 
 Unified failure-classification surface (Phase 1.7 F6, appendix F): one row per category (observation/decision/actuation/resource/safety) with condition_present (the live signal, from the same substrate the health-state machine reads) and recorded_failures_last_day (action_history rows stamped with that failure_class — actuation only, today). The governor's whole failure picture in five rows.
 
+**Subsystem:** G4
+
 | Column | Type |
 | --- | --- |
 | `failure_class` | `text` |
@@ -244,6 +288,8 @@ Unified failure-classification surface (Phase 1.7 F6, appendix F): one row per c
 ### pgfc_govern.governor_metrics
 
 One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-state evaluator: applied/failed/lock-timeout action counts over 1h/1d windows, observation lag (newest snapshot age), loop durations + tick errors (tick_log), the self-health storage footprint, the oldest retained audit row (retention backlog), the count of oscillating relations (Phase 1.7 F5), and the connection pressure from the newest snapshot (Phase 1.7 F6 load-shedding input). Always returns one row; counts are 0 and freshness signals NULL when nothing has happened yet.
+
+**Subsystem:** G4
 
 | Column | Type |
 | --- | --- |
@@ -271,6 +317,10 @@ One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-stat
 
 ### pgfc_govern.governor_status
 
+Per-relation operator view: workload class, target vs observed dead fraction, debt/saturation, last decision, and current scale factor.
+
+**Subsystem:** G7
+
 | Column | Type |
 | --- | --- |
 | `relid` | `oid` |
@@ -292,6 +342,8 @@ One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-stat
 
 Unified, operator-facing parameter registry (Phase 1.6 P1): every governed constant across both schemas with category and provenance.
 
+**Subsystem:** G3
+
 | Column | Type |
 | --- | --- |
 | `schema_name` | `text` |
@@ -309,6 +361,8 @@ Unified, operator-facing parameter registry (Phase 1.6 P1): every governed const
 
 One-row whole-governor self-health (S6): total bytes + dead tuples across both schemas vs the configured budget; over_budget flags when degrade() should run.
 
+**Subsystem:** G6
+
 | Column | Type |
 | --- | --- |
 | `total_bytes` | `numeric` |
@@ -323,114 +377,190 @@ One-row whole-governor self-health (S6): total bytes + dead tuples across both s
 
 Drift gate (Phase 1.6 P3): returns unregistered numeric/interval literals in the decision/actuation path. A pgTAP test asserts it is empty; non-empty means a control value escaped the registry.
 
+**Subsystem:** G3
+
 ### `pgfc_govern._class_target(p_kind text) → double precision`
 
 Base (pre-aggressiveness) target dead-tuple fraction for a workload class, read from the registry (Phase 1.6 P2).
+
+**Subsystem:** G1
 
 ### `pgfc_govern._failure_class(p_failure_reason text) → text`
 
 Failure taxonomy (Phase 1.7 F6): map a recorded failure_reason to its appendix-F category (observation/decision/actuation/resource/safety). Single source of the mapping; apply() stamps action_history.failure_class through it. IMMUTABLE pure lookup; NULL for an unknown reason.
 
+**Subsystem:** G4
+
 ### `pgfc_govern._findings(p_snapshot_id bigint) → TABLE(relid oid, inhibitor_class text, severity text, recommendation text, evidence jsonb)`
+
+Set-returning: candidate diagnostic findings for a snapshot's relations (saturation cause / freeze-pinned horizon) with severity, recommendation, and evidence.
+
+**Subsystem:** G5
 
 ### `pgfc_govern._log_policy_change() → trigger`
 
 AFTER row trigger: records every policy insert/update/delete into policy_history.
 
+**Subsystem:** G2
+
 ### `pgfc_govern._oscillating_relations() → TABLE(relid oid, relname text, reversals bigint, n_changes bigint, first_at timestamp with time zone, last_at timestamp with time zone, recent_values text[])`
 
 Control-oscillation detector (Phase 1.7 F5): relations whose applied scale-factor flaps — at least oscillation_min_reversals direction reversals within oscillation_window. Read from action_history (applied only). The governor_metrics oscillating_relations count and the evaluate_health() oscillation signal both read it; the plan() reconciler raises the operator-visible finding.
+
+**Subsystem:** G4
 
 ### `pgfc_govern._param(p_name text) → text`
 
 Read a governed parameter's value from the registry (Phase 1.6 P2); the control logic single-sources its constants through this.
 
+**Subsystem:** G3
+
 ### `pgfc_govern._parameter_registry() → TABLE(parameter_name text, category text, default_value text, unit text, rationale text, source text, owner text, override_allowed boolean, config_ref text)`
 
 Canonical registry of pgfc_govern governed constants; the control logic reads its values from here through the registry accessor functions (Phase 1.6 P2, single-sourced). The CI drift gate that makes divergence impossible lands in P3.
 
+**Subsystem:** G3
+
 ### `pgfc_govern._reconcile_diagnostics(p_snapshot_id bigint) → void`
+
+Open a diagnostic per (relid, class) lacking an unresolved one this cycle, and resolve findings whose condition cleared (control_oscillation diagnostics excluded — owned by the oscillation reconciler).
+
+**Subsystem:** G5
 
 ### `pgfc_govern._reconcile_oscillation() → void`
 
 Open/resolve the control_oscillation diagnostic (Phase 1.7 F5, appendix F "operator visibility"): one unresolved critical finding per flapping relation, auto-resolved when it stops flapping. Called from plan(); the saturation reconciler is scoped not to touch this class.
 
+**Subsystem:** G4
+
 ### `pgfc_govern._sf_grid() → double precision[]`
 
 Scale-factor quantization grid, read from the registry (Phase 1.6 P2).
+
+**Subsystem:** G1
 
 ### `pgfc_govern.apply(p_tick_id bigint, p_relid oid) → boolean`
 
 Actuate one relation's approved scale-factor change. Gated by advisory_only (the dry-run switch), then by the Phase 1.7 F4 self-protection layer: the governor health-state authority gate (refuses when diagnostic/emergency/disabled) and the three-tier Invariant-4 mutation budget (per-relation min_interval, per-cycle and per-day cluster caps). A refused attempt returns false silently — never recorded as a failed action.
 
+**Subsystem:** G1
+
 ### `pgfc_govern.classify(p_snapshot_id bigint) → integer`
 
 Assign each relation a workload class with a signal floor and N-cycle hysteresis.
+
+**Subsystem:** G1
 
 ### `pgfc_govern.clear_forced_state(p_reason text) → pgfc_govern.governor_health_state`
 
 Operator override (Phase 1.7 F3): release any operator-forced hold and return to fully automatic control. The subsequent automatic transition is audited. Returns the (now automatic) effective state.
 
+**Subsystem:** G4
+
 ### `pgfc_govern.control_tick() → bigint`
 
 One control cycle: plan, apply (only if not advisory_only), verify.
+
+**Subsystem:** G1
 
 ### `pgfc_govern.degrade(p_budget_bytes bigint, keep_raw interval, keep_rollup_fine interval, keep_rollup_coarse interval, keep_diagnostics interval, keep_actions interval) → TABLE(step integer, level text, action text, bytes_after bigint)`
 
 Graceful-degrade prune order (S6): shed storage raw→fine→coarse rollups→diagnostics→actions until under budget; policy is never pruned. No-op when no budget is configured. Returns the ordered prune log.
 
+**Subsystem:** G6
+
 ### `pgfc_govern.disable(p_reason text) → pgfc_govern.governor_health_state`
 
 Operator override (Phase 1.7 F3): force the disabled state (all control ceases, history preserved). Distinct from policy.enabled — this forces the health state, which the F4 authority gate honors. Released by clear_forced_state().
+
+**Subsystem:** G4
 
 ### `pgfc_govern.estimate(p_snapshot_id bigint) → integer`
 
 Derive hidden state (rates, effectiveness, saturation) into relation_estimate.
 
+**Subsystem:** G1
+
 ### `pgfc_govern.evaluate_health() → pgfc_govern.governor_health_state`
 
 Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds (failed actions, lock timeouts, observation lag, storage footprint, the F4 daily-mutation-budget circuit breaker — degraded-level only — the F5 control-oscillation signal — diagnostic — and the F6 connection-pressure load-shedding signal — diagnostic), then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. The state it writes is the input to the F4 apply() authority gate. Returns the effective state.
 
+**Subsystem:** G4
+
 ### `pgfc_govern.ewma(prior double precision, sample double precision, alpha double precision) → double precision`
+
+Exponentially-weighted moving average (alpha*sample + (1-alpha)*prior); NULL-safe, seeds on the first sample.
+
+**Subsystem:** G1
 
 ### `pgfc_govern.force_state(p_state pgfc_govern.governor_health_state, p_reason text) → pgfc_govern.governor_health_state`
 
 Operator override (Phase 1.7 F3): force the governor into a more-cautious state (a caution floor honored by evaluate_health's worst-of rule); rejects normal. Audited as a state transition; recorded in operator_forced/forced_by/forced_at. Returns the effective state. Released by clear_forced_state().
 
+**Subsystem:** G4
+
 ### `pgfc_govern.observe_tick() → bigint`
+
+Fast loop (~1 min): observe + classify + estimate; never actuates. Returns the new snapshot id.
+
+**Subsystem:** G1
 
 ### `pgfc_govern.plan(p_tick_id bigint, p_snapshot_id bigint) → integer`
 
 Advisory: write decision_log per relation (vacuum objective) + reconcile diagnostics (saturation + Phase 1.7 F5 control oscillation).
 
+**Subsystem:** G1
+
 ### `pgfc_govern.retain(keep_decisions interval, keep_actions interval, keep_ticks interval, keep_diagnostics interval, keep_transitions interval) → TABLE(relation text, deleted bigint)`
 
 Prune audit tables by time cutoff (decisions/actions 180d, ticks 180d, resolved diagnostics 365d, state transitions 180d); policy_history is never pruned. Returns per-table delete counts.
 
+**Subsystem:** G6
+
 ### `pgfc_govern.snap_sf(x double precision) → double precision`
+
+Snap a scale factor to the nearest value on the bounded quantization grid (_sf_grid).
+
+**Subsystem:** G1
 
 ### `pgfc_govern.storage_budget() → TABLE(schema_name text, relation text, bytes bigint, dead_tuples bigint)`
 
 Whole-governor storage report (S6): per-relation bytes + dead tuples across pgfc_observe and pgfc_govern, tagged by schema.
 
+**Subsystem:** G6
+
 ### `pgfc_govern.suspend_actuation(p_reason text) → pgfc_govern.governor_health_state`
 
 Operator override (Phase 1.7 F3): force the diagnostic state — actuation suspended, full observation/diagnosis retained (appendix F "suspend actuation"). Released by clear_forced_state().
+
+**Subsystem:** G4
 
 ### `pgfc_govern.validate_parameters() → TABLE(parameter text, status text, message text)`
 
 Parameter validation (Phase 1.6 P4): grades the live operator configuration against the registry's safety bounds (OK/WARNING/CRITICAL). The reviewability surface; checks hard safety properties only.
 
+**Subsystem:** G3
+
 ### `pgfc_govern.verify(p_tick_id bigint) → integer`
 
 Close the control loop on past actions (Phase 1: no-op; expanded in Phase 2).
+
+**Subsystem:** G1
 
 ## Types
 
 ### `pgfc_govern.governor_health_state`
 
+Governor self-protection states (Phase 1.7 F2) declared in increasing-caution order, so the enum's native ordering makes the most cautious state win.
+
+**Subsystem:** G4
+
 Enum values: 'normal', 'degraded', 'diagnostic', 'emergency', 'disabled'
 
 ### `pgfc_govern.relation_kind`
+
+Workload-class template a relation is assigned to by classify(); selects its desired dead-tuple target.
+
+**Subsystem:** G1
 
 Enum values: 'append_only', 'oltp', 'queue', 'delete_heavy', 'archive', 'mixed'
