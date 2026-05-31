@@ -31,8 +31,8 @@ next finer level, **→** is a cross-link (a see-also or a consumer). The finest
 per-object documentation — is the generated [reference](#6-components-and-code-the-leaf-level),
 linked rather than copied.
 
-> **Outline status.** Sections 1 and 4 are skeletons; **§2 Concepts and §3 Architecture are
-> drafted**. Section 5 (subsystems) is seeded from the confirmed object taxonomy — every database
+> **Outline status.** Section 1 (abstract) is a skeleton; **§2 Concepts, §3 Architecture, and
+> §4 Modules are drafted**. Section 5 (subsystems) is seeded from the confirmed object taxonomy — every database
 > object has a home — but the per-subsystem prose, rationale, and "feedback wanted" are
 > still to be filled. Sections 6–9 describe conventions now and fill in as the body lands.
 
@@ -259,20 +259,67 @@ satisfy, and they are the backbone of the fortification review's traceability.
 
 ## 4. Modules
 
+The two extensions in detail — each module's responsibility, the contract at its boundary,
+and the subsystems it comprises. This refines
+[§3.1](#31-two-modules-one-boundary); each subsystem links down to its [§5](#5-subsystems)
+entry.
+
 ### 4.1 pgfc_observe
 
-*(Outline.)* Read-only telemetry: observe the database, store it bloat-free, derive
-meaning, and watch its own footprint — independently useful as a monitor. Subsystems:
-[O1](#o1-collection), [O2](#o2-storage-and-retention), [O3](#o3-derived-state-and-readers),
-[O4](#o4-self-monitoring-and-budget), [O5](#o5-parameter-registry).
+**Responsibility.** Read-only telemetry and orientation: sample autovacuum-relevant state on
+a fast cadence, store it bloat-free, derive health and debt signals, and watch its own
+footprint. Owns the `pgfc_observe` schema.
+
+**Contract.** Writes *only* its own schema and *never* changes a database setting; has *no*
+dependency on govern; is usable standalone as an autovacuum-health monitor. Re-running
+`install.sql` is the upgrade path; uninstall is `DROP SCHEMA pgfc_observe CASCADE`.
+
+**Subsystems** *(detail in [§5](#5-subsystems))*:
+
+- [O1 · Collection](#o1-collection) — the act of observing, sampled sparsely.
+- [O2 · Storage and retention](#o2-storage-and-retention) — bounded, bloat-free persistence
+  (partitions, rollups, GC). *(Home of [FMEA-001](../fortification/02-failure-theory.md#fmea-001--partition-recycling-uses-createdrop-not-a-fixed-truncate-ring).)*
+- [O3 · Derived state and readers](#o3-derived-state-and-readers) — raw telemetry → meaning
+  (health/debt views, removability horizons).
+- [O4 · Self-monitoring and budget](#o4-self-monitoring-and-budget) — watching its own
+  storage footprint.
+- [O5 · Parameter registry](#o5-parameter-registry) — typed, born-governed thresholds.
+
+**Internal flow.** O1 writes the tables O2 owns; O3 reads them to derive meaning; O4 reports
+the footprint; O5 supplies the thresholds the others read.
 
 ↑ [Architecture](#3-architecture) · ↳ [Subsystems](#5-subsystems)
 
 ### 4.2 pgfc_govern
 
-*(Outline.)* The control loop — classify, estimate, plan, apply, verify — advisory by
-default, active control under a self-protection net. Depends on `pgfc_observe`. Subsystems:
-[G1](#g1-control-loop-ooda) through [G7](#g7-status-and-reporting).
+**Responsibility.** The control loop: read observe, classify and estimate, decide, and — under
+active control — act and verify, all under a self-protection net and a parameter-governance
+discipline. Owns the `pgfc_govern` schema.
+
+**Contract.** Reads `pgfc_observe` cross-schema, **read-only**; is the *only* component that
+mutates the catalog (`ALTER TABLE` on a relation's autovacuum reloptions), and only when
+`advisory_only = false`. Depends on observe (install observe first). **Advisory by default** —
+the resting state plans and diagnoses but changes nothing.
+
+**Subsystems** *(detail in [§5](#5-subsystems))*:
+
+- [G1 · Control loop (OODA)](#g1-control-loop-ooda) — the heart: orchestration plus classify →
+  estimate → plan → apply → verify. `apply()` is the sole mutator.
+- [G2 · Policy and intent](#g2-policy-and-intent) — operator outcomes, with an audited history.
+- [G3 · Parameter governance](#g3-parameter-governance) — typed registry, drift gate,
+  validation.
+- [G4 · Self-protection (F1-F7)](#g4-self-protection-f1-f7) — the governor governing itself;
+  gates the Act stage.
+- [G5 · Diagnostics](#g5-diagnostics) — diagnose, don't escalate.
+- [G6 · Storage, retention, and self-maintenance](#g6-storage-retention-and-self-maintenance)
+  — bound its own audit tables; graceful degrade.
+- [G7 · Status and reporting](#g7-status-and-reporting) — operator-facing rollups.
+
+**Internal flow.** G1 is the spine; G2 supplies intent and G3 supplies governed thresholds;
+G4 gates G1's apply step; G5 is fed by G1's plan; G6 prunes G1's audit tables; G7 reports.
+Three subsystems **mirror** their observe counterparts (G3↔O5 registry, G6↔O4 storage/
+self-maintenance, and a `self_health` surface in both) — see
+[§3.5](#35-cross-cutting-patterns).
 
 ↑ [Architecture](#3-architecture) · ↳ [Subsystems](#5-subsystems)
 
