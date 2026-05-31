@@ -80,7 +80,7 @@ When control saturates, the cause + a recommendation, not more DDL.
 
 ### pgfc_govern.governor_state
 
-Single-row governor health state (Phase 1.7 F2): the current self-protection state computed by evaluate_health(). Advisory in F2; the apply() authority gate consults it in F4.
+Single-row governor health state (Phase 1.7 F2): the current self-protection state computed by evaluate_health(). The operator_forced/forced_* columns hold the F3 human override — a caution floor (force more caution, never less). Advisory; the apply() authority gate consults it in F4.
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -89,6 +89,10 @@ Single-row governor health state (Phase 1.7 F2): the current self-protection sta
 | `since` | `timestamp with time zone` |  |
 | `reason` | `text` |  |
 | `evaluated_at` | `timestamp with time zone` |  |
+| `operator_forced` | `pgfc_govern.governor_health_state` | Operator-forced health state (Phase 1.7 F3); NULL = fully automatic. evaluate_health() takes the WORST of this and the auto-computed state, so the operator can force more caution but never less. Set via force_state()/disable()/suspend_actuation(); cleared via clear_forced_state(). |
+| `forced_reason` | `text` |  |
+| `forced_by` | `text` |  |
+| `forced_at` | `timestamp with time zone` |  |
 
 ### pgfc_govern.policy
 
@@ -334,6 +338,10 @@ Actuate one relation's approved scale-factor change (gated by advisory_only).
 
 Assign each relation a workload class with a signal floor and N-cycle hysteresis.
 
+### `pgfc_govern.clear_forced_state(p_reason text) → pgfc_govern.governor_health_state`
+
+Operator override (Phase 1.7 F3): release any operator-forced hold and return to fully automatic control. The subsequent automatic transition is audited. Returns the (now automatic) effective state.
+
 ### `pgfc_govern.control_tick() → bigint`
 
 One control cycle: plan, apply (only if not advisory_only), verify.
@@ -342,15 +350,23 @@ One control cycle: plan, apply (only if not advisory_only), verify.
 
 Graceful-degrade prune order (S6): shed storage raw→fine→coarse rollups→diagnostics→actions until under budget; policy is never pruned. No-op when no budget is configured. Returns the ordered prune log.
 
+### `pgfc_govern.disable(p_reason text) → pgfc_govern.governor_health_state`
+
+Operator override (Phase 1.7 F3): force the disabled state (all control ceases, history preserved). Distinct from policy.enabled — this forces the health state, which the F4 authority gate honors. Released by clear_forced_state().
+
 ### `pgfc_govern.estimate(p_snapshot_id bigint) → integer`
 
 Derive hidden state (rates, effectiveness, saturation) into relation_estimate.
 
 ### `pgfc_govern.evaluate_health() → pgfc_govern.governor_health_state`
 
-Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds; write governor_state and record a state_transitions row on change. Advisory — does not gate actuation (that is the F4 authority gate). Returns the computed state.
+Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds, then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. Advisory — does not gate actuation (that is the F4 authority gate). Returns the effective state.
 
 ### `pgfc_govern.ewma(prior double precision, sample double precision, alpha double precision) → double precision`
+
+### `pgfc_govern.force_state(p_state pgfc_govern.governor_health_state, p_reason text) → pgfc_govern.governor_health_state`
+
+Operator override (Phase 1.7 F3): force the governor into a more-cautious state (a caution floor honored by evaluate_health's worst-of rule); rejects normal. Audited as a state transition; recorded in operator_forced/forced_by/forced_at. Returns the effective state. Released by clear_forced_state().
 
 ### `pgfc_govern.observe_tick() → bigint`
 
@@ -367,6 +383,10 @@ Prune audit tables by time cutoff (decisions/actions 180d, ticks 180d, resolved 
 ### `pgfc_govern.storage_budget() → TABLE(schema_name text, relation text, bytes bigint, dead_tuples bigint)`
 
 Whole-governor storage report (S6): per-relation bytes + dead tuples across pgfc_observe and pgfc_govern, tagged by schema.
+
+### `pgfc_govern.suspend_actuation(p_reason text) → pgfc_govern.governor_health_state`
+
+Operator override (Phase 1.7 F3): force the diagnostic state — actuation suspended, full observation/diagnosis retained (appendix F "suspend actuation"). Released by clear_forced_state().
 
 ### `pgfc_govern.validate_parameters() → TABLE(parameter text, status text, message text)`
 

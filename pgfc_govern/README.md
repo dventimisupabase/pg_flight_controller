@@ -68,8 +68,12 @@ Self-protection (Phase 1.7): `governor_metrics` (F1) is the one-row substrate
 `evaluate_health()` (F2) reads to compute a health state
 (`normal → degraded → diagnostic → emergency → disabled`) against born-governed
 thresholds, writing the single-row `governor_state` and the `state_transitions` audit
-each `control_tick()`. Advisory for now — the state is recorded and surfaced but does not
-yet gate actuation (the `apply()` authority gate consults it in a later increment).
+each `control_tick()`. Operators retain ultimate authority (F3): `force_state()` /
+`disable()` / `suspend_actuation()` force a more-cautious state and `clear_forced_state()`
+releases it — a caution floor `evaluate_health()` honors by taking the worst of the
+automatic and forced states (force more caution, never less). Advisory for now — the state
+is recorded and surfaced but does not yet gate actuation (the `apply()` authority gate
+consults it in a later increment).
 
 ### Deliberately deferred (so scope is explicit, not accidental)
 
