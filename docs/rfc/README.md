@@ -31,8 +31,8 @@ next finer level, **→** is a cross-link (a see-also or a consumer). The finest
 per-object documentation — is the generated [reference](#6-components-and-code-the-leaf-level),
 linked rather than copied.
 
-> **Outline status.** Sections 1, 2, and 4 are skeletons; **§3 Architecture is drafted**.
-> Section 5 (subsystems) is seeded from the confirmed object taxonomy — every database
+> **Outline status.** Sections 1 and 4 are skeletons; **§2 Concepts and §3 Architecture are
+> drafted**. Section 5 (subsystems) is seeded from the confirmed object taxonomy — every database
 > object has a home — but the per-subsystem prose, rationale, and "feedback wanted" are
 > still to be filled. Sections 6–9 describe conventions now and fill in as the body lands.
 
@@ -64,16 +64,75 @@ decide → act, advisory by default). Seed: the top-level README abstract.
 
 ## 2. Concepts and principles
 
-*(Outline.)* The mental model a reviewer needs before the architecture. Frame *why each
-concept matters to a reviewer*; link down to the [concepts guide](../guide/concepts.md) for
-the full as-built explanation rather than restating it.
+The mental model a reviewer needs before the architecture. Each concept below is framed for
+review — what it is, and what to scrutinize about it — with the full as-built explanation in
+the [concepts guide](../guide/concepts.md), linked per concept rather than restated here.
 
-- Autovacuum settings as **actuator positions**, not static configuration.
-- The **observe → estimate → decide → act** (OODA) loop; **advisory by default**.
-- **Diagnose, don't escalate** — saturation causes, external inhibitors, removability
-  horizons.
-- The **safety invariants (1–6)** and why an autonomous actuator needs an explicit theory
-  of failure.
+### 2.1 Autovacuum settings as actuator positions
+
+PostgreSQL exposes per-table autovacuum knobs (scale factors, thresholds) as static
+configuration you set once and hope stays appropriate. pg_flight_controller reframes them as
+**actuator positions** a supervisory loop moves to hold a desired *outcome* as the workload
+shifts. It never runs `VACUUM` — it changes *when* autovacuum fires. **For review:** the
+whole value proposition rests on this reframing — that steering setpoints, not performing
+maintenance, is the right control surface.
+→ [guide](../guide/concepts.md#autovacuum-settings-are-actuator-positions); it takes
+architectural shape in [§3](#3-architecture).
+
+### 2.2 The control loop (OODA)
+
+The system is a feedback loop — **observe** the database, **orient** (estimate hidden state,
+classify the workload), **decide** a setpoint, **act**, and **verify** — drawn from control
+theory and state estimation, not machine learning. **For review:** whether the loop's inputs
+are sufficient and whether the feedback (`verify`) genuinely closes.
+→ [guide](../guide/concepts.md#the-loop-observe--estimate--decide--act); the cadences are
+[§3.2](#32-the-control-loop-and-its-two-cadences).
+
+### 2.3 Policy as outcomes; workload classes and the control law
+
+Operators express **intent as outcomes** — how clean a kind of table should be kept — not
+raw parameters. Each relation is assigned a **workload class** with a target dead-tuple
+fraction template; the control law derives the setpoint as roughly *template ÷
+aggressiveness*, clamped to a safe range and snapped to a discrete grid (a deadband that
+suppresses churn). **For review:** the classification taxonomy and the control law's
+stability — does it converge, and are the clamps and grid right?
+→ [workload classes](../guide/concepts.md#workload-classes),
+[what it steers](../guide/concepts.md#what-it-steers-the-dead-tuple-fraction).
+
+### 2.4 Act rarely: cost, deadband, and the gates
+
+Moving a setpoint has cost — an MVCC catalog write and a behavior change — so the system is
+built to act sparingly: a deadband (no-op suppression), an ownership guard (never overwrite a
+human's or another system's setting), and rate/budget limits. **For review:** whether these
+gates are sufficient to keep catalog churn and actuation pressure bounded.
+→ [movement has cost](../guide/concepts.md#movement-has-cost-so-act-rarely),
+[advisory by default](../guide/concepts.md#advisory-by-default); enforced in
+[§3.4](#34-advisory-by-default-active-control-under-the-self-protection-net) and
+[G1](#g1-control-loop-ooda).
+
+### 2.5 Diagnose, don't escalate
+
+When a table is not keeping up, more aggressiveness often cannot help — the cause may be an
+external inhibitor (a long transaction or a replication slot pinning the xmin horizon) or an
+I/O limit. Rather than escalate blindly, the governor **diagnoses the cause** (`config` /
+`io_limited` / `inhibited`) and names it, using **removability horizons** to identify who
+pins the horizon. **For review:** whether the saturation taxonomy is correct and complete,
+and whether "diagnose, don't escalate" is honored consistently.
+→ [diagnose, don't escalate](../guide/concepts.md#diagnose-dont-escalate),
+[removability horizons](../guide/concepts.md#removability-horizons); the subsystem is
+[G5](#g5-diagnostics).
+
+### 2.6 Safety first: an explicit theory of failure
+
+An autonomous actuator on a live catalog must be safe before it is effective. The system
+holds **six safety invariants** — never wait on locks; never disable autovacuum; never
+reduce freeze safety; never exceed mutation budgets; never escalate without evidence; every
+action explainable — and makes every change **reversible** (a captured pre-governor baseline
+plus revert). **For review:** whether the invariants are actually enforced where claimed —
+the core of the fortification review.
+→ [safety first](../guide/concepts.md#safety-first); architectural framing in
+[§3.6](#36-safety-invariants-as-architectural-constraints); enforcement under
+[G4](#g4-self-protection-f1-f7).
 
 ↑ [Abstract](#1-abstract) · ↳ [Architecture](#3-architecture)
 
