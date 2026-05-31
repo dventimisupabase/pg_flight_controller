@@ -104,6 +104,16 @@ section in the same pull request as your change (this is a convention, not a CI 
   (**never** pruned) — stopping as soon as the footprint is back under budget. With no
   cap configured `degrade()` is a no-op, so it never silently destroys telemetry.
 
+- **Parameter governance Phase 1.6 — P1 (parameter registry).** Every governed constant
+  now has explicit provenance. A canonical `_parameter_registry()` function in each schema
+  (the single-source-of-truth pattern) records each parameter's name, category (one of six:
+  PostgreSQL-derived, safety bound, empirical default, operator policy, adaptive value,
+  implementation convenience), value, unit, rationale, source, owner, `override_allowed`,
+  and `config_ref`. A unified `pgfc_govern.parameter_registry` view spans both schemas as
+  the operator-facing inspection surface. P1 is read-only and documents the as-built values
+  (many honestly marked "MVP estimate — not yet benchmarked"); later increments make the
+  control logic read from the registry and add a CI drift gate.
+
 ### Changed
 
 - **`docs/` is now the self-contained, as-built spec.** The hand-written guides no

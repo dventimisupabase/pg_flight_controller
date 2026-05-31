@@ -287,6 +287,10 @@ Whole UTC calendar months since 1970-01 — the int4 monthly RANGE partition key
 
 UTC instant at the start of epoch-month k (inverse of _epoch_month).
 
+### `pgfc_observe._parameter_registry() → TABLE(parameter_name text, category text, default_value text, unit text, rationale text, source text, owner text, override_allowed boolean, config_ref text)`
+
+Canonical provenance registry of pgfc_observe governed constants (Phase 1.6 P1). Documents the as-built values; the control logic does not yet read from it (single-sourcing + drift gate land in P2/P3). pgfc_govern.parameter_registry unions it into the operator-facing view.
+
 ### `pgfc_observe._partition_inventory() → TABLE(parent text, partition text, day integer, range_start timestamp with time zone, range_end timestamp with time zone, approx_rows bigint, size_bytes bigint)`
 
 Child partitions of the telemetry tables with day, decoded range, est. rows, and size.

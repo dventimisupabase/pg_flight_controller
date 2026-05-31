@@ -218,6 +218,23 @@ Single-row storage config (S6): budget_bytes is the total-bytes cap over both sc
 | `last_decision_at` | `timestamp with time zone` |
 | `current_scale_factor` | `text` |
 
+### pgfc_govern.parameter_registry
+
+Unified, operator-facing parameter registry (Phase 1.6 P1): every governed constant across both schemas with category and provenance.
+
+| Column | Type |
+| --- | --- |
+| `schema_name` | `text` |
+| `parameter_name` | `text` |
+| `category` | `text` |
+| `default_value` | `text` |
+| `unit` | `text` |
+| `rationale` | `text` |
+| `source` | `text` |
+| `owner` | `text` |
+| `override_allowed` | `boolean` |
+| `config_ref` | `text` |
+
 ### pgfc_govern.self_health
 
 One-row whole-governor self-health (S6): total bytes + dead tuples across both schemas vs the configured budget; over_budget flags when degrade() should run.
@@ -237,6 +254,10 @@ One-row whole-governor self-health (S6): total bytes + dead tuples across both s
 ### `pgfc_govern._log_policy_change() → trigger`
 
 AFTER row trigger: records every policy insert/update/delete into policy_history.
+
+### `pgfc_govern._parameter_registry() → TABLE(parameter_name text, category text, default_value text, unit text, rationale text, source text, owner text, override_allowed boolean, config_ref text)`
+
+Canonical provenance registry of pgfc_govern governed constants (Phase 1.6 P1). Documents the as-built control-logic values; single-sourcing + drift gate land in P2/P3.
 
 ### `pgfc_govern._reconcile_diagnostics(p_snapshot_id bigint) → void`
 

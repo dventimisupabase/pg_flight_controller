@@ -1251,6 +1251,78 @@ COMMENT ON VIEW pgfc_observe.self_health IS
   'One-row self-maintenance summary for pgfc_observe (S6): total bytes, aggregate dead tuples, partition counts, oldest raw partition.';
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Parameter registry  (Phase 1.6 — parameter governance, P1)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- The governor must not replace autovacuum folklore with folklore of its own: every
+-- governed constant has a name, meaning, unit, rationale, owner, and provenance, and is
+-- inspectable without reading source. This function is the canonical PROVENANCE registry
+-- for pgfc_observe's governed constants. In P1 the control logic still defines and reads
+-- its own literals — this is a separate, hand-maintained record of them. Making the code
+-- READ from this function (the _profile_settings() pattern from pg_flight_recorder, which
+-- makes code and registry unable to disagree) and the CI drift gate that enforces it
+-- arrive in later increments (P2/P3).
+-- category is one of: postgresql_derived | safety_bound | empirical_default |
+-- operator_policy | adaptive_value | implementation_convenience.
+-- override_allowed is orthogonal to category; config_ref names the override home
+-- (NULL = a fixed code default). Values here MUST match the live code until the
+-- single-sourcing increment removes the duplication.
+CREATE OR REPLACE FUNCTION pgfc_observe._parameter_registry()
+RETURNS TABLE(
+    parameter_name   text,
+    category         text,
+    default_value    text,
+    unit             text,
+    rationale        text,
+    source           text,
+    owner            text,
+    override_allowed boolean,
+    config_ref       text)
+LANGUAGE sql IMMUTABLE AS $fn$
+VALUES
+  ('epoch_day_seconds', 'postgresql_derived', '86400', 'seconds',
+   'Seconds per day; the int4 daily RANGE partition key is whole days since 1970.',
+   'calendar / PostgreSQL time math', 'maintainer', false, NULL),
+  ('epoch_base_year', 'postgresql_derived', '1970', 'year',
+   'Unix epoch base for the day/month partition keys.',
+   'calendar / PostgreSQL time math', 'maintainer', false, NULL),
+  ('telemetry_av_threshold', 'implementation_convenience', '1000', 'rows',
+   'Static autovacuum vacuum/analyze/insert threshold on telemetry + rollup partitions (scale_factor 0).',
+   'design review (S6)', 'maintainer', false, NULL),
+  ('last_state_av_threshold', 'implementation_convenience', '50', 'rows',
+   'Static, aggressive autovacuum threshold on the UNLOGGED relation_last_state cache.',
+   'design review (S3)', 'maintainer', false, NULL),
+  ('last_state_fillfactor', 'implementation_convenience', '70', 'percent',
+   'fillfactor on relation_last_state so its per-minute updates stay HOT.',
+   'design review (S3)', 'maintainer', false, NULL),
+  ('retain_raw_days', 'operator_policy', '3', 'days',
+   'Default raw-telemetry retention window before partitions are truncated.',
+   'MVP estimate — not yet benchmarked', 'operator', true, 'retain() argument'),
+  ('drop_empty_partition_days', 'operator_policy', '30', 'days',
+   'Default age before empty (truncated) partition shells are dropped.',
+   'MVP estimate — not yet benchmarked', 'operator', true, 'drop_empty_partitions() argument'),
+  ('rollup_lookback', 'operator_policy', '3 days', 'interval',
+   'Default rollup() lookback window; must cover at least one raw-retention window.',
+   'MVP estimate — not yet benchmarked', 'operator', true, 'rollup() argument'),
+  ('retain_rollup_1m_days', 'operator_policy', '7', 'days',
+   'Default retention for the fine (1m) rollup tier.',
+   'MVP estimate — not yet benchmarked', 'operator', true, 'rollup_retain() argument'),
+  ('retain_rollup_1h_days', 'operator_policy', '90', 'days',
+   'Default retention for the 1h rollup tier.',
+   'MVP estimate — not yet benchmarked', 'operator', true, 'rollup_retain() argument'),
+  ('retain_rollup_1d_days', 'operator_policy', '365', 'days',
+   'Default retention for the 1d rollup tier.',
+   'MVP estimate — not yet benchmarked', 'operator', true, 'rollup_retain() argument'),
+  ('exclude_temp', 'operator_policy', 'true', 'boolean',
+   'Whether observe() skips temporary tables.',
+   'design review (S5)', 'operator', true, 'collection_policy.exclude_temp'),
+  ('min_partition_size_bytes', 'operator_policy', '0', 'bytes',
+   'Cardinality floor: child partitions below this size are not sampled (0 = disabled).',
+   'MVP estimate — not yet benchmarked', 'operator', true, 'collection_policy.min_partition_size_bytes')
+$fn$;
+COMMENT ON FUNCTION pgfc_observe._parameter_registry() IS
+  'Canonical provenance registry of pgfc_observe governed constants (Phase 1.6 P1). Documents the as-built values; the control logic does not yet read from it (single-sourcing + drift gate land in P2/P3). pgfc_govern.parameter_registry unions it into the operator-facing view.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- Retention — two-tier partition GC  (Phase 1.5 S2)
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Retention is whole-partition rotation, never row-by-row DELETE: that produces zero
