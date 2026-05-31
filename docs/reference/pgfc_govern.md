@@ -10,7 +10,7 @@ pg_flight_controller control loop: classify, estimate, plan, (apply), verify.
 
 ### pgfc_govern.action_history
 
-Every actuator attempt (applied or failed). revert() replays only status=applied.
+Every actuator attempt (applied or failed). revert() replays only status=applied. failed rows carry failure_reason + the F6 failure_class (taxonomy category).
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -27,6 +27,7 @@ Every actuator attempt (applied or failed). revert() replays only status=applied
 | `revert_value` | `text` |  |
 | `status` | `text` |  |
 | `failure_reason` | `text` |  |
+| `failure_class` | `text` |  |
 | `lock_wait_outcome` | `text` |  |
 | `budget_consumed` | `boolean` |  |
 | `emergency_override` | `boolean` |  |
@@ -229,9 +230,20 @@ Single-row storage config (S6): budget_bytes is the total-bytes cap over both sc
 | `pg_class_last_autovacuum` | `timestamp with time zone` |
 | `collected_at` | `timestamp with time zone` |
 
+### pgfc_govern.failure_taxonomy
+
+Unified failure-classification surface (Phase 1.7 F6, appendix F): one row per category (observation/decision/actuation/resource/safety) with condition_present (the live signal, from the same substrate the health-state machine reads) and recorded_failures_last_day (action_history rows stamped with that failure_class — actuation only, today). The governor's whole failure picture in five rows.
+
+| Column | Type |
+| --- | --- |
+| `failure_class` | `text` |
+| `condition_present` | `boolean` |
+| `recorded_failures_last_day` | `bigint` |
+| `detail` | `text` |
+
 ### pgfc_govern.governor_metrics
 
-One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-state evaluator: applied/failed/lock-timeout action counts over 1h/1d windows, observation lag (newest snapshot age), loop durations + tick errors (tick_log), the self-health storage footprint, the oldest retained audit row (retention backlog), and the count of oscillating relations (Phase 1.7 F5). Always returns one row; counts are 0 and freshness signals NULL when nothing has happened yet.
+One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-state evaluator: applied/failed/lock-timeout action counts over 1h/1d windows, observation lag (newest snapshot age), loop durations + tick errors (tick_log), the self-health storage footprint, the oldest retained audit row (retention backlog), the count of oscillating relations (Phase 1.7 F5), and the connection pressure from the newest snapshot (Phase 1.7 F6 load-shedding input). Always returns one row; counts are 0 and freshness signals NULL when nothing has happened yet.
 
 | Column | Type |
 | --- | --- |
@@ -252,6 +264,10 @@ One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-stat
 | `over_budget` | `boolean` |
 | `oldest_action_at` | `timestamp with time zone` |
 | `oscillating_relations` | `bigint` |
+| `client_backends` | `bigint` |
+| `max_connections` | `integer` |
+| `connection_pressure` | `numeric` |
+| `connection_pressure_pct` | `numeric` |
 
 ### pgfc_govern.governor_status
 
@@ -311,6 +327,10 @@ Drift gate (Phase 1.6 P3): returns unregistered numeric/interval literals in the
 
 Base (pre-aggressiveness) target dead-tuple fraction for a workload class, read from the registry (Phase 1.6 P2).
 
+### `pgfc_govern._failure_class(p_failure_reason text) → text`
+
+Failure taxonomy (Phase 1.7 F6): map a recorded failure_reason to its appendix-F category (observation/decision/actuation/resource/safety). Single source of the mapping; apply() stamps action_history.failure_class through it. IMMUTABLE pure lookup; NULL for an unknown reason.
+
 ### `pgfc_govern._findings(p_snapshot_id bigint) → TABLE(relid oid, inhibitor_class text, severity text, recommendation text, evidence jsonb)`
 
 ### `pgfc_govern._log_policy_change() → trigger`
@@ -369,7 +389,7 @@ Derive hidden state (rates, effectiveness, saturation) into relation_estimate.
 
 ### `pgfc_govern.evaluate_health() → pgfc_govern.governor_health_state`
 
-Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds (failed actions, lock timeouts, observation lag, storage footprint, the F4 daily-mutation-budget circuit breaker — degraded-level only — and the F5 control-oscillation signal — diagnostic), then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. The state it writes is the input to the F4 apply() authority gate. Returns the effective state.
+Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds (failed actions, lock timeouts, observation lag, storage footprint, the F4 daily-mutation-budget circuit breaker — degraded-level only — the F5 control-oscillation signal — diagnostic — and the F6 connection-pressure load-shedding signal — diagnostic), then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. The state it writes is the input to the F4 apply() authority gate. Returns the effective state.
 
 ### `pgfc_govern.ewma(prior double precision, sample double precision, alpha double precision) → double precision`
 

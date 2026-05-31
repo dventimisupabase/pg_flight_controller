@@ -106,8 +106,8 @@ silently — it is never recorded as a failed action, which would otherwise feed
 failed-action breaker and amplify itself. Refusing to *tighten* a setting never reduces
 freeze safety: the prior setting and PostgreSQL's own anti-wraparound autovacuum remain in
 place. The automatic evaluator reaches `emergency` via stale observation and `diagnostic`
-via failed actions, lock timeouts, or control oscillation (below); load-driven shedding
-arrives with a later increment.
+via failed actions, lock timeouts, control oscillation, or load shedding under connection
+pressure (all below).
 
 ### Control-oscillation detection (Phase 1.7 F5)
 
@@ -129,6 +129,32 @@ a full up-down-up flap) is flapping. When any relation flaps:
   `min_interval`, this suspension is intrinsically multi-hour. An operator who wants control
   back sooner should address the underlying instability — an automatic `diagnostic` cannot be
   forced down, only its cause removed; `clear_forced_state()` only releases *operator* holds.)
+
+### Load shedding (Phase 1.7 F6)
+
+When the database is under **connection pressure**, the governor sheds its *own* load: it
+backs off so it stops competing for locks and consumes fewer resources just when the
+database needs them most. The stress signal is `connection_pressure` — the count of client
+backends divided by `max_connections`, captured on every `observe()` run and exposed in
+`governor_metrics`. When it reaches `load_shed_connection_pct` (default `0.90`, a
+born-governed registry parameter), the governor enters **`diagnostic`**, so the authority
+gate suspends actuation **cluster-wide** — exactly the oscillation mechanism, on a
+different signal.
+
+Unlike oscillation, load shedding is **transient**: there is no cooldown window. As soon as
+the next snapshot shows pressure has eased, the governor returns to `normal` and resumes. The
+condition is surfaced through `governor_state.reason` and the `state_transitions` audit (the
+reason names the pressure and backend counts), the same way the failed-action and
+lock-timeout breakers are — no separate diagnostic finding. A snapshot from before F6 (or a
+fresh governor with nothing observed) has a NULL `connection_pressure` and never sheds —
+absence of data is not load.
+
+<!-- doctest -->
+
+```sql
+SELECT client_backends, max_connections, connection_pressure
+FROM pgfc_govern.governor_metrics;
+```
 
 ### Mutation budget (Invariant 4)
 
@@ -210,6 +236,29 @@ How to read `inhibitor_class`:
   recommendation names the holder; clearing it (end the transaction, advance/drop the
   slot) is the fix. This is the case where a wraparound emergency is *not* solved by
   more vacuuming.
+
+### Failure taxonomy (Phase 1.7 F6)
+
+Every failure the governor can experience belongs to one of five categories (appendix F):
+**observation**, **decision**, **actuation**, **resource**, and **safety**. The
+`failure_taxonomy` view is the whole picture in five rows — for each category,
+`condition_present` is the live signal (drawn from the same `governor_metrics` substrate the
+health-state machine reads) and `recorded_failures_last_day` counts the audited failures
+stamped with that class:
+
+<!-- doctest -->
+
+```sql
+SELECT failure_class, condition_present, recorded_failures_last_day, detail
+FROM pgfc_govern.failure_taxonomy;
+```
+
+Each *recorded* failure in `action_history` also carries its category in `failure_class`,
+mapped from `failure_reason` by `_failure_class()` (the single source of the mapping). Today
+the governor records only **actuation** failures — a lock timeout or a permission error from
+`apply()`; the other categories surface through their live signals (control oscillation →
+safety, the storage-budget breach → resource, stale telemetry → observation, a cycle that
+errored → decision) until later actuators add their own recorded failure sites.
 
 ## Schedule
 

@@ -188,7 +188,7 @@ Per-relation 1-minute aggregate of raw samples (S4). Daily RANGE partitioned; ~7
 
 ### pgfc_observe.snapshots
 
-Header row per observe() run: timestamp + cluster/GUC + pg_class health + xmin horizons. Daily RANGE partitioned on collected_day.
+Header row per observe() run: timestamp + cluster/GUC + cluster load signals (client_backends/max_connections — the F6 load-shedding stress input) + pg_class health + xmin horizons. Daily RANGE partitioned on collected_day.
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -207,6 +207,8 @@ Header row per observe() run: timestamp + cluster/GUC + pg_class health + xmin h
 | `def_mxid_freeze_max_age` | `bigint` |  |
 | `autovacuum_max_workers` | `integer` |  |
 | `wal_bytes` | `numeric` |  |
+| `client_backends` | `bigint` |  |
+| `max_connections` | `integer` |  |
 | `pg_class_size_bytes` | `bigint` |  |
 | `pg_class_n_dead_tup` | `bigint` |  |
 | `pg_class_n_live_tup` | `bigint` |  |
