@@ -16,6 +16,7 @@ import { execSync } from "node:child_process";
 import MarkdownIt from "markdown-it";
 import anchor from "markdown-it-anchor";
 import { parseRepoSlug } from "./lib/repo.js";
+import { rewriteHref } from "./lib/links.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SITE_DIR = join(__dirname, "..");
@@ -56,9 +57,22 @@ function resolveRepo() {
   );
 }
 
-function buildMarkdown() {
+function buildMarkdown(repo) {
   const md = new MarkdownIt({ html: false, linkify: true, typographer: false });
   md.use(anchor, { slugify: ghSlug });
+
+  // Pass: rewrite repo-relative links to absolute GitHub blob URLs (in-page
+  // anchors and absolute URLs are left alone). link_open lives in inline children.
+  md.core.ruler.push("pgfc_links", (state) => {
+    for (const tok of state.tokens) {
+      if (!tok.children) continue;
+      for (const child of tok.children) {
+        if (child.type !== "link_open") continue;
+        const href = child.attrGet("href");
+        if (href != null) child.attrSet("href", rewriteHref(href, repo));
+      }
+    }
+  });
 
   // Pass 1: section-scoped stable block ids.
   const TAGGED = new Set([
@@ -151,8 +165,10 @@ function copyDir(srcDir, destDir) {
 
 function main() {
   const { owner, repo } = resolveRepo();
+  const branch = process.env.RFC_REPO_BRANCH || "main";
   const src = readFileSync(RFC_PATH, "utf8");
-  const md = buildMarkdown();
+  // RFC lives at docs/rfc/README.md, so its relative links resolve against docs/rfc.
+  const md = buildMarkdown({ owner, repo, branch, baseDir: "docs/rfc" });
 
   const headings = outline(md, src);
   // Notes boxes only on the numbered sections — not front matter (Contents,
