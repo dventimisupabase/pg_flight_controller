@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>pg_flight_controller — RFC</title>
+    <meta
+      name="description"
+      content="Request for Comments: pg_flight_controller, a supervisory autovacuum governor for PostgreSQL — as built."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/easymde/dist/easymde.min.css" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body data-repo-owner="{{OWNER}}" data-repo-name="{{REPO}}">
+    <header class="site-header">
+      <div class="site-header__inner">
+        <div class="site-header__eyebrow">Request for Comments</div>
+        <h1 class="site-header__title">pg_flight_controller</h1>
+        <p class="site-header__tagline">
+          A supervisory autovacuum governor for PostgreSQL — the system as built,
+          for review.
+        </p>
+        <div class="site-header__hint" id="review-hint">
+          Select any passage to leave a margin comment, or use the notes box at the
+          end of each section. When you’re done, <strong>Submit feedback</strong>
+          opens a prefilled GitHub issue.
+        </div>
+      </div>
+    </header>
+
+    <div class="layout">
+      <div class="layout__toc">{{TOC}}</div>
+      <main class="rfc">
+        <article class="rfc-content" id="rfc-content">{{BODY}}</article>
+      </main>
+      <div class="layout__rail" id="comment-rail" aria-label="Margin comments"></div>
+    </div>
+
+    <button type="button" class="selection-pop" id="selection-pop" hidden>
+      💬 Comment
+    </button>
+
+    <footer class="submit-bar" id="submit-bar">
+      <label class="submit-bar__field">
+        <span>GitHub username</span>
+        <input
+          type="text"
+          id="reviewer-handle"
+          placeholder="octocat"
+          autocomplete="off"
+          spellcheck="false"
+        />
+      </label>
+      <div class="submit-bar__count" id="feedback-count">No feedback yet</div>
+      <button type="button" class="submit-bar__btn" id="submit-feedback">
+        Submit feedback
+      </button>
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/easymde/dist/easymde.min.js"></script>
+    <script type="module" src="./app/app.js"></script>
+  </body>
+</html>
