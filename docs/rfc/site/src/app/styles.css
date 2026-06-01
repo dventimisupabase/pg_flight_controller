@@ -431,6 +431,33 @@ mark.hl.is-active {
   border-color: var(--rule);
 }
 
+/*
+ * The notes box lives inside .rfc-content, and CodeMirror renders each editor
+ * line as a <pre> with <code> spans — so the RFC's code-block styling (dark
+ * background, box-shadow, border-radius, margins) leaks onto every line, giving
+ * each one a "ghostly" banded background. Neutralize that styling inside the
+ * editor and the preview so the editor reads as a plain text area.
+ */
+.notes-box .EasyMDEContainer pre,
+.notes-box .EasyMDEContainer .editor-preview pre {
+  margin: 0;
+  background: none;
+  box-shadow: none;
+  border-radius: 0;
+  padding: 0 4px;
+  color: inherit;
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.notes-box .EasyMDEContainer code {
+  background: none;
+  color: inherit;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+}
+
 .notes-box .editor-toolbar {
   border-radius: 6px 6px 0 0;
   border-color: var(--rule);
