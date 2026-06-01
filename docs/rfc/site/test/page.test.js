@@ -31,7 +31,6 @@ describe("generated page contract", () => {
       "rfc-content",
       "comment-rail",
       "selection-pop",
-      "reviewer-handle",
       "submit-feedback",
     ]) {
       expect(document.getElementById(id), `#${id}`).toBeTruthy();

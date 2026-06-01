@@ -16,16 +16,18 @@ export function toBlockquote(text) {
 
 /**
  * @param {object} o
- * @param {string} o.reviewer  GitHub handle (no leading @)
  * @param {string} o.rfcUrl    URL of the published explainer page
  * @param {Array<object>} o.items  { kind: "margin"|"note", order, sectionId, sectionTitle, quote?, body }
  * @returns {string} Markdown body for a prefilled GitHub issue
+ *
+ * No author field: GitHub attributes the issue to whoever submits it (their
+ * logged-in session), so the submitter's identity is captured automatically.
  */
-export function compileFeedback({ reviewer, rfcUrl, items }) {
+export function compileFeedback({ rfcUrl, items }) {
   const ordered = [...items].sort((a, b) => a.order - b.order);
 
   const blocks = [
-    `# RFC review by @${reviewer}`,
+    `# RFC review`,
     `_Submitted via the [RFC explainer](${rfcUrl})._`,
   ];
 

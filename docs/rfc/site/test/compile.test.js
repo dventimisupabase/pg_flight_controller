@@ -15,7 +15,6 @@ describe("toBlockquote", () => {
 
 describe("compileFeedback", () => {
   const base = {
-    reviewer: "octocat",
     rfcUrl: "https://example.com/rfc",
     items: [
       {
@@ -36,10 +35,11 @@ describe("compileFeedback", () => {
     ],
   };
 
-  it("attributes the review to the GitHub handle and links the RFC", () => {
+  it("links the RFC and carries no author field (GitHub attributes the submitter)", () => {
     const md = compileFeedback(base);
-    expect(md).toContain("@octocat");
+    expect(md).toContain("# RFC review");
     expect(md).toContain("https://example.com/rfc");
+    expect(md).not.toContain("@");
   });
 
   it("renders margin comments with the quoted passage as a blockquote, then the comment", () => {
