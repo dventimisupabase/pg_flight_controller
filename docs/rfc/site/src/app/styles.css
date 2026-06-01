@@ -454,32 +454,11 @@ mark.hl.is-active {
   font-family: var(--sans);
 }
 
-.submit-bar__field {
-  display: flex;
-  flex-direction: column;
-  font-size: 0.66rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+.submit-bar__note {
+  font-size: 0.82rem;
+  line-height: 1.4;
   color: #a9b6b2;
-}
-
-.submit-bar__field input {
-  margin-top: 0.2rem;
-  width: 11rem;
-  font-family: var(--mono);
-  font-size: 0.9rem;
-  text-transform: none;
-  letter-spacing: 0;
-  padding: 0.35rem 0.5rem;
-  border: 1px solid #2f4742;
-  border-radius: 5px;
-  background: #0e1b19;
-  color: #f2efe6;
-}
-
-.submit-bar__field input:focus {
-  outline: none;
-  border-color: var(--accent-2);
+  max-width: 32rem;
 }
 
 .submit-bar__count {

@@ -27,7 +27,6 @@ const STORE_KEY = `pgfc-rfc::${OWNER}/${REPO}`;
 const contentEl = document.getElementById("rfc-content");
 const railEl = document.getElementById("comment-rail");
 const popEl = document.getElementById("selection-pop");
-const handleEl = document.getElementById("reviewer-handle");
 const countEl = document.getElementById("feedback-count");
 const submitEl = document.getElementById("submit-feedback");
 
@@ -45,7 +44,7 @@ function load() {
   }
 }
 function blank() {
-  return { reviewer: "", comments: [], notes: {} };
+  return { comments: [], notes: {} };
 }
 function save() {
   localStorage.setItem(STORE_KEY, JSON.stringify(state));
@@ -241,26 +240,20 @@ function mountNotes() {
 // ---- Submit -----------------------------------------------------------
 
 function submit() {
-  const reviewer = handleEl.value.trim().replace(/^@/, "");
-  if (!reviewer) {
-    handleEl.focus();
-    flash(handleEl);
-    return;
-  }
-  state.reviewer = reviewer;
-  save();
-
   const items = gatherItems(state, contentEl, orderIndex, sectionOf);
   if (!items.length) {
     countEl.textContent = "Nothing to submit yet — add a comment or note.";
     return;
   }
-  const body = compileFeedback({ reviewer, rfcUrl: location.href, items });
-  const title = `RFC review by @${reviewer}`;
+  // No author field: GitHub stamps the issue with the submitter's logged-in
+  // identity automatically.
+  const date = new Date().toISOString().slice(0, 10);
+  const body = compileFeedback({ rfcUrl: location.href, items });
+  const title = `RFC review — ${date}`;
   const url = buildIssueUrl({ owner: OWNER, repo: REPO, title, body });
 
   if (isOverflow(url)) {
-    downloadMarkdown(`rfc-review-${reviewer}.md`, body);
+    downloadMarkdown(`rfc-review-${date}.md`, body);
     alert(
       "Your feedback is long enough that GitHub may truncate a prefilled issue, " +
         "so it has been downloaded as a Markdown file. Open a new issue and paste it in."
@@ -290,12 +283,6 @@ function updateCount() {
       : `${c} comment${c === 1 ? "" : "s"}, ${n} section note${n === 1 ? "" : "s"}`;
 }
 
-function flash(el) {
-  el.style.transition = "box-shadow .15s";
-  el.style.boxShadow = "0 0 0 3px rgba(182,113,29,.6)";
-  setTimeout(() => (el.style.boxShadow = ""), 600);
-}
-
 function cryptoId() {
   return (crypto.randomUUID?.() || String(Date.now() + Math.random())).slice(0, 12);
 }
@@ -322,11 +309,6 @@ function scrollSpy() {
 
 // ---- Init -------------------------------------------------------------
 
-handleEl.value = state.reviewer || "";
-handleEl.addEventListener("change", () => {
-  state.reviewer = handleEl.value.trim().replace(/^@/, "");
-  save();
-});
 submitEl.addEventListener("click", submit);
 
 mountNotes();
