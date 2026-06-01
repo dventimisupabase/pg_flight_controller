@@ -8,7 +8,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "generate": "node src/generate.js",
-    "build": "node src/generate.js"
+    "build": "node src/generate.js",
+    "preview": "node preview.js"
   },
   "dependencies": {
     "markdown-it": "^14.1.0",
