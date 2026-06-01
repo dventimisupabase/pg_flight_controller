@@ -6,10 +6,19 @@
 // (anchoring, URL building, overflow, compilation) is shared with — and unit
 // tested in — ../lib.
 
-import { captureAnchor, resolveAnchor } from "./lib/anchor.js";
-import { buildIssueUrl } from "./lib/issue-url.js";
-import { isOverflow } from "./lib/overflow.js";
-import { compileFeedback } from "./lib/compile.js";
+import { captureAnchor } from "../lib/anchor.js";
+import { buildIssueUrl } from "../lib/issue-url.js";
+import { isOverflow } from "../lib/overflow.js";
+import { compileFeedback } from "../lib/compile.js";
+import {
+  offsetWithin,
+  highlightRange,
+  buildOrderIndex,
+  buildSectionMap,
+  gatherItems,
+  repaintHighlight,
+  cssEscape,
+} from "./dom.js";
 
 const OWNER = document.body.dataset.repoOwner;
 const REPO = document.body.dataset.repoName;
@@ -45,27 +54,8 @@ function save() {
 
 // ---- Document-order + section metadata --------------------------------
 
-// Map every orderable element (text block or notes box) to its document index.
-const orderIndex = new Map();
-document
-  .querySelectorAll("#rfc-content [data-block-id], #rfc-content .notes-box")
-  .forEach((el, i) => orderIndex.set(el, i));
-
-// For each block id, the nearest preceding heading (its section label).
-const sectionOf = new Map();
-{
-  let current = { id: "preamble", title: "Preamble" };
-  contentEl.querySelectorAll("h2, h3, [data-block-id]").forEach((el) => {
-    if (el.tagName === "H2" || el.tagName === "H3") {
-      current = { id: el.id || "section", title: headingTitle(el) };
-    }
-    const bid = el.getAttribute("data-block-id");
-    if (bid) sectionOf.set(bid, current);
-  });
-}
-function headingTitle(el) {
-  return el.textContent.replace(/\s*[·↑↳→].*$/u, "").trim();
-}
+const orderIndex = buildOrderIndex(contentEl);
+const sectionOf = buildSectionMap(contentEl);
 
 // ---- Marginalia: selection -> highlight -> card -----------------------
 
@@ -76,13 +66,6 @@ function blockOf(node) {
   if (block.closest(".notes-box")) return null; // notes boxes own their editor
   if (!contentEl.contains(block)) return null;
   return block;
-}
-
-function offsetWithin(block, node, nodeOffset) {
-  const r = document.createRange();
-  r.setStart(block, 0);
-  r.setEnd(node, nodeOffset);
-  return r.toString().length;
 }
 
 document.addEventListener("mouseup", () => {
@@ -127,41 +110,8 @@ function hidePop() {
   pending = null;
 }
 
-// Wrap [start,end) of a block's text in <mark> spans (one per text-node segment).
-function highlightRange(block, start, end, commentId) {
-  const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
-  let pos = 0;
-  const ops = [];
-  while (walker.nextNode()) {
-    const node = walker.currentNode;
-    const nodeStart = pos;
-    const nodeEnd = pos + node.nodeValue.length;
-    pos = nodeEnd;
-    const from = Math.max(start, nodeStart);
-    const to = Math.min(end, nodeEnd);
-    if (from < to) ops.push({ node, from: from - nodeStart, to: to - nodeStart });
-  }
-  for (const op of ops.reverse()) {
-    const r = document.createRange();
-    r.setStart(op.node, op.from);
-    r.setEnd(op.node, op.to);
-    const mark = document.createElement("mark");
-    mark.className = "hl";
-    mark.dataset.commentId = commentId;
-    try {
-      r.surroundContents(mark);
-    } catch {
-      /* skip a segment that straddles element boundaries */
-    }
-  }
-}
-
 function paintComment(comment) {
-  const block = contentEl.querySelector(`[data-block-id="${cssEscape(comment.blockId)}"]`);
-  if (block) {
-    const r = resolveAnchor(block.textContent, comment);
-    if (r.ok) highlightRange(block, r.start, r.end, comment.id);
-  }
+  const { block } = repaintHighlight(contentEl, comment);
   renderCard(comment, block);
 }
 
@@ -169,9 +119,7 @@ function renderCard(comment, block) {
   const card = document.createElement("div");
   card.className = "comment-card";
   card.dataset.commentId = comment.id;
-  card.dataset.anchorTop = block
-    ? block.getBoundingClientRect().top + window.scrollY
-    : "0";
+  card.dataset.blockId = comment.blockId;
 
   const quote = document.createElement("div");
   quote.className = "comment-card__quote";
@@ -225,16 +173,21 @@ function focusCard(id) {
     ?.focus();
 }
 
-// Stack cards near their anchors without overlapping.
+// Stack cards near their anchors without overlapping. Anchor positions are read
+// LIVE from each card's block on every layout (not cached at paint time), so the
+// stack stays aligned across font reflow, resize, and content shifts.
 function layoutCards() {
   railEl.style.height = `${contentEl.offsetHeight}px`;
   const contentTop = contentEl.getBoundingClientRect().top + window.scrollY;
-  const cards = [...railEl.querySelectorAll(".comment-card")].sort(
-    (a, b) => Number(a.dataset.anchorTop) - Number(b.dataset.anchorTop)
-  );
+  const cards = [...railEl.querySelectorAll(".comment-card")]
+    .map((card) => {
+      const block = contentEl.querySelector(`[data-block-id="${cssEscape(card.dataset.blockId)}"]`);
+      const want = block ? block.getBoundingClientRect().top + window.scrollY - contentTop : 0;
+      return { card, want };
+    })
+    .sort((a, b) => a.want - b.want);
   let cursor = 0;
-  for (const card of cards) {
-    const want = Number(card.dataset.anchorTop) - contentTop;
+  for (const { card, want } of cards) {
     const top = Math.max(want, cursor);
     card.style.top = `${top}px`;
     cursor = top + card.offsetHeight + 12;
@@ -287,37 +240,6 @@ function mountNotes() {
 
 // ---- Submit -----------------------------------------------------------
 
-function gatherItems() {
-  const items = [];
-  for (const c of state.comments) {
-    if (!c.body.trim()) continue;
-    const block = contentEl.querySelector(`[data-block-id="${cssEscape(c.blockId)}"]`);
-    const sec = sectionOf.get(c.blockId) || { id: "?", title: "Unanchored" };
-    const order = (block ? orderIndex.get(block) ?? 1e6 : 1e6) * 1e4 + (c.start || 0);
-    items.push({
-      kind: "margin",
-      order,
-      sectionId: sec.id,
-      sectionTitle: sec.title,
-      quote: c.quote,
-      body: c.body.trim(),
-    });
-  }
-  document.querySelectorAll(".notes-box").forEach((box) => {
-    const sectionId = box.dataset.sectionId;
-    const body = (state.notes[sectionId] || "").trim();
-    if (!body) return;
-    items.push({
-      kind: "note",
-      order: (orderIndex.get(box) ?? 1e6) * 1e4,
-      sectionId,
-      sectionTitle: box.dataset.sectionTitle,
-      body,
-    });
-  });
-  return items;
-}
-
 function submit() {
   const reviewer = handleEl.value.trim().replace(/^@/, "");
   if (!reviewer) {
@@ -328,7 +250,7 @@ function submit() {
   state.reviewer = reviewer;
   save();
 
-  const items = gatherItems();
+  const items = gatherItems(state, contentEl, orderIndex, sectionOf);
   if (!items.length) {
     countEl.textContent = "Nothing to submit yet — add a comment or note.";
     return;
@@ -376,9 +298,6 @@ function flash(el) {
 
 function cryptoId() {
   return (crypto.randomUUID?.() || String(Date.now() + Math.random())).slice(0, 12);
-}
-function cssEscape(s) {
-  return window.CSS?.escape ? CSS.escape(s) : s.replace(/["\\]/g, "\\$&");
 }
 
 // ---- Scroll-spy TOC ---------------------------------------------------

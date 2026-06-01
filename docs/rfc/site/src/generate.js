@@ -112,15 +112,20 @@ function notesBox({ id, title }) {
 </aside>`;
 }
 
-/** Inject a notes box at the end of each h2 section's content. */
-function injectNotesBoxes(html, sections) {
-  // Each part (after the first) begins with an <h2 ...>; that part is one
-  // section's content. Append its notes box to the end of the part.
+/** Inject a notes box at the end of each notable section's content. */
+function injectNotesBoxes(html, sectionsById) {
+  // Each part (after the first) begins with an <h2 id="...">; that part is one
+  // section's content. Append a notes box only for sections we want reviewed
+  // (the numbered ones) — not front matter like "Contents" or "How to read this".
   const parts = html.split(/(?=<h2\b)/);
   if (parts.length <= 1) return html;
-  let s = 0;
   return parts
-    .map((part, i) => (i === 0 ? part : part + notesBox(sections[s++])))
+    .map((part, i) => {
+      if (i === 0) return part;
+      const id = part.match(/^<h2\s+id="([^"]+)"/)?.[1];
+      const sec = id && sectionsById.get(id);
+      return sec ? part + notesBox(sec) : part;
+    })
     .join("");
 }
 
@@ -150,9 +155,14 @@ function main() {
   const md = buildMarkdown();
 
   const headings = outline(md, src);
-  const sections = headings.filter((h) => h.level === NOTES_HEADING_LEVEL);
+  // Notes boxes only on the numbered sections — not front matter (Contents,
+  // How to read this), whose ids don't start with a digit.
+  const sections = headings.filter(
+    (h) => h.level === NOTES_HEADING_LEVEL && /^\d/.test(h.id)
+  );
+  const sectionsById = new Map(sections.map((h) => [h.id, h]));
 
-  const body = injectNotesBoxes(md.render(src), sections);
+  const body = injectNotesBoxes(md.render(src), sectionsById);
   const toc = renderToc(headings);
 
   const template = readFileSync(join(APP_DIR, "template.html"), "utf8");
@@ -165,7 +175,13 @@ function main() {
   mkdirSync(DIST, { recursive: true });
   writeFileSync(join(DIST, "index.html"), out);
   copyFileSync(join(APP_DIR, "styles.css"), join(DIST, "styles.css"));
-  copyFileSync(join(APP_DIR, "app.js"), join(DIST, "app.js"));
+  // App scripts keep their src/app layout under dist/app so their "../lib/..."
+  // imports resolve identically in source and in the build.
+  const distApp = join(DIST, "app");
+  mkdirSync(distApp, { recursive: true });
+  for (const name of readdirSync(APP_DIR)) {
+    if (name.endsWith(".js")) copyFileSync(join(APP_DIR, name), join(distApp, name));
+  }
   copyDir(LIB_DIR, join(DIST, "lib"));
 
   console.log(`Generated dist/index.html for ${owner}/${repo} (${sections.length} sections).`);
