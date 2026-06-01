@@ -1,0 +1,21 @@
+{
+  "name": "pgfc-rfc-explainer",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Generated, commentable HTML explainer for the pg_flight_controller RFC.",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "generate": "node src/generate.js",
+    "build": "node src/generate.js"
+  },
+  "dependencies": {
+    "markdown-it": "^14.1.0",
+    "markdown-it-anchor": "^9.2.0"
+  },
+  "devDependencies": {
+    "jsdom": "^25.0.1",
+    "vitest": "^2.1.8"
+  }
+}
