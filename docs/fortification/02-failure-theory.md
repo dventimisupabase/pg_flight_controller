@@ -32,6 +32,11 @@ invariant or mechanism it stresses.
 - A `snapshots` row with NULL pressure/lag (boot / pre-feature).
 - Partition rotation (`retain()`) racing a read or a write.
 - Health-state transitions under conflicting signals (worst-of correctness).
+- **Within-cycle human-`ALTER` race** (carried from Phase 1 Concurrency): a human value set
+  between `plan()` and `apply()` that *differs* from the proposal is overwritten this cycle —
+  `apply()`'s no-op arbiter only catches the exact-match case, and it re-checks neither
+  `actuator_state` nor `manage_user_owned`. Narrow (sub-second; COR-001 heals it next cycle);
+  enumerate cause → effect → fail-safe? → detection → recovery here.
 
 ## Findings
 

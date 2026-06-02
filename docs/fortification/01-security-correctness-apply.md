@@ -1,7 +1,13 @@
 # Phase 1 — Security + correctness of the `apply()` path
 
-**Status:** In progress · **Lead surface:** the actuation chain
+**Status:** Complete · **Lead surface:** the actuation chain
 `control_tick() → plan() → apply()` in `pgfc_govern/install.sql`.
+
+> **Closed.** Both checklists are dispositioned (each item cited-safe or attached to a
+> finding); the four findings are resolved — **COR-001** (High) and **SEC-001** / **SEC-002**
+> (Low) are *Verified* with regression tests, **COR-002** (Low) is *Won't-fix (by-design,
+> documented)*; the traceability spine is filled for the `apply()` path, with one test-coverage
+> gap (the live lock-timeout path) carried forward to Phase 3. Exit criteria met (see end).
 
 The only place the system mutates the catalog. Everything else observes, estimates,
 decides, or reports — `apply()` is where a decision becomes an `ALTER TABLE`. This phase
@@ -67,55 +73,99 @@ Stages 1–6 are the caller (`control_tick()`); stages 7–17 are the actuator
 
 ## Security checklist
 
-- [ ] **Dynamic SQL — the `ALTER TABLE`.** `%s` for `p_relid::regclass`, `%I` for the
-      actuator name, `%s` for `v_prop`. Confirm each renders un-injectable: relid via
-      `regclass` (not text), actuator is a literal constant but `%I`-quoted anyway, and
-      **`v_prop` provenance** — trace `decision_log.proposed_value` back through `plan()`
-      / `snap_sf()` / the SF grid and confirm it can only be a bounded numeric string,
-      even if a row were hand-inserted.
-- [ ] **Dynamic SQL — `set_config('lock_timeout', …)`.** Confirm `_param('lock_timeout')`
-      is registry-sourced and numeric-bounded; it is concatenated, not parameterized.
-- [ ] **Privilege model.** What role executes the loop, and what does `apply()`'s
-      `ALTER TABLE` require? Document the intended role and least privilege.
-- [ ] **`SECURITY DEFINER` exposure.** Are any path functions `SECURITY DEFINER`? If so,
-      are they `search_path`-pinned and arg-validated? If not, the caller needs `ALTER`
-      rights — document that.
-- [ ] **`search_path` safety.** Are all object references schema-qualified
-      (`pgfc_govern.` / `pgfc_observe.` / `pg_catalog`), so behavior doesn't depend on
-      the caller's `search_path`? Note any bare references.
-- [ ] **Ownership guard.** `manage_user_owned` is honored in `plan()` (decision
-      `suppressed:user_owned`), not in `apply()`. Confirm `apply()` cannot act on a
-      user-owned setting via a stale/crafted decision — i.e. the guard is not bypassable
-      by reaching `apply()` directly.
-- [ ] **Audit integrity.** Can `action_history` be made to misrepresent what happened
-      (e.g. a refusal recorded as applied, or vice versa)?
+- [x] **Dynamic SQL — the `ALTER TABLE`.** `%s` for `p_relid::regclass`, `%I` for the
+      actuator name, `%s` for `v_prop`.
+      **Disposition:** cited-safe + **SEC-002**. `p_relid::regclass` renders catalog
+      output, not attacker text; the actuator is a literal constant, `%I`-quoted anyway;
+      `v_prop` provenance is hardened by SEC-002 — `apply()` parses it to a number,
+      range-checks `[sf_min, sf_max]`, and splices only the *validated* text. Verified by
+      `21_value_validation`.
+- [x] **Dynamic SQL — `set_config('lock_timeout', …)`.**
+      **Disposition:** cited-safe. `_param('lock_timeout')` reads a single typed registry
+      row (`pgfc_govern/install.sql:1524`, a `safety_bound` defaulting to `100`), never
+      caller input; it is concatenated with `'ms'`, not attacker-controlled.
+- [x] **Privilege model.**
+      **Disposition:** **SEC-001** (Verified). The cron role/least-privilege model is
+      documented in the operating guide ("Which role runs the loop").
+- [x] **`SECURITY DEFINER` exposure.**
+      **Disposition:** cited-safe + **SEC-001**. No path function is `SECURITY DEFINER`
+      (all `SECURITY INVOKER`); every plpgsql function now pins an explicit `search_path`
+      as defense-in-depth ahead of any future `SECURITY DEFINER` posture. `22_search_path`.
+- [x] **`search_path` safety.**
+      **Disposition:** **SEC-001** (Verified). All object references are schema-qualified;
+      the plpgsql functions pin an explicit `search_path`, and `22_search_path` drives the
+      whole path under an empty caller `search_path` to prove caller-independence.
+- [x] **Ownership guard (bypass).** `manage_user_owned` is honored in `plan()`, not in
+      `apply()`.
+      **Disposition:** cited-safe under the trust model (distinct from **COR-001**, which
+      is the guard's own logic in `plan()`). `apply()` acts only on a `decision = 'adjust'`
+      row and re-checks neither `actuator_state` nor `manage_user_owned`, so the ownership
+      guard *is* a `plan()`-layer policy; reaching `apply()` with a crafted `adjust` row for
+      a user-owned relation would bypass it — but that requires write access to
+      `decision_log` (a caller who could `ALTER` the table directly), the same boundary as
+      SEC-002, and **COR-002** records `control_tick()` as the sole sanctioned entrypoint.
+      Not a separate finding. (The related *within-cycle* human-`ALTER` race — where `apply()`
+      overwrites a post-`plan()` human value that differs from the proposal — is treated under
+      **Concurrency** above and deferred to Phase 2 FMEA.)
+- [x] **Audit integrity.**
+      **Disposition:** cited-safe. `action_history` is written only on the real outcome —
+      `applied` on success (stage 17), `failed` only inside the `lock_not_available` /
+      `insufficient_privilege` handlers; every pre-mutation refusal returns `false` without
+      writing a row (verified `16_authority_gate`, `21_value_validation`). `status` and
+      `failure_class` CHECKs pin the vocabulary; no path records a refusal as `applied` or a
+      success as `failed`.
 
 ## Correctness checklist
 
-- [ ] **Gate ordering.** Authority gate → existence → vacuum-progress → no-op → budget →
-      mutate. Confirm a withheld/no-op action consumes **no** budget, and that refusals
-      that must be silent are silent (no `failed` row feeding the breaker).
-- [ ] **Budget arithmetic & windows.** `>=` vs `>` on each tier; the per-cycle join is
-      scoped to `p_tick_id`; the per-day window matches `governor_metrics`'
-      definition; concurrent ticks can't race the cap (advisory lock holds for
-      `control_tick`, but direct `apply()` calls bypass it).
-- [ ] **Baseline / rollback integrity.** Baseline captured on first touch and never
-      overwritten; `revert_kind` (`SET`/`RESET`) and `revert_value` reconstruct the
-      pre-governor state exactly; `ON CONFLICT` update path preserves the baseline.
-- [ ] **Exception completeness.** Only `lock_not_available` and `insufficient_privilege`
-      are caught. Confirm no other `ALTER TABLE` failure mode is plausible-and-unhandled
-      (an uncaught error aborts the surrounding `control_tick` txn — is that acceptable,
-      and does it roll back the tick cleanly?).
-- [ ] **No-op / stale-window.** The live re-read correctly downgrades `adjust → no-op`
-      when the value changed between observe and apply (covered by
-      `19_activation.sql` — confirm it's the same code path and not a parallel one).
-- [ ] **Concurrency.** `control_tick` is serialized vs itself by the advisory lock, and
-      the loop-ordering (F7) and stale-window arbiter address `observe_tick` and human
-      `ALTER` races. Confirm there is no *remaining* interleaving (e.g. two sessions
-      calling `apply()` directly, or `apply()` vs `degrade()`/`retain()`) that breaks the
-      budget or the baseline.
-- [ ] **Idempotency / re-entrancy.** Re-invoking the same decision (retry, replay) does
-      not double-apply, double-count budget, or corrupt `actuator_state`.
+- [x] **Gate ordering.** Authority → existence → vacuum-progress → no-op → value
+      validation → budget → mutate.
+      **Disposition:** cited-safe, tested. Each gate returns `false` *before* the budget
+      tiers, so a withheld or no-op action consumes no budget; all of them are silent (no
+      `failed` row). `16_authority_gate` (authority/budget silent), `21_value_validation`
+      (validation silent), `19_activation` (no-op silent).
+- [x] **Budget arithmetic & windows.**
+      **Disposition:** cited-safe + **COR-002**. Per-relation rate limit via `EXISTS` on a
+      recent `applied` row; per-cycle (`>=`) join scoped to `p_tick_id`; per-day (`>=`)
+      from `governor_metrics.applied_actions_last_day`. All three tiers exercised by
+      `16_authority_gate`. A direct out-of-cycle `apply()` bypasses `control_tick`'s
+      advisory lock → **COR-002** (by-design; the live budget checks still bound the blast
+      radius).
+- [x] **Baseline / rollback integrity.**
+      **Disposition:** cited-safe, tested. Baseline captured on first touch (the `NOT FOUND`
+      branch); the `ON CONFLICT` update touches only `current_value` / `set_at_snapshot` /
+      `av_count_at_apply`, never `baseline_explicit` / `baseline_value`; `revert_kind`
+      (`SET`/`RESET`) and `revert_value` derive from `baseline_explicit`. `05_loop`
+      (no-explicit-baseline ⇒ RESET).
+- [x] **Exception completeness.**
+      **Disposition:** cited-safe, with a Phase-3 note. Only `lock_not_available` and
+      `insufficient_privilege` are caught; each records a `failed` row and returns `false`.
+      SEC-002 closes the one realistic other path (a bad value is refused *before* the
+      `EXECUTE`). A residual `ALTER` error (a value `float8in` accepts but the reloption
+      parser rejects) aborts and **cleanly rolls back** the `control_tick` txn — fail-closed,
+      and reachable only by a `decision_log` tamper (same boundary as SEC-002). The live
+      lock-timeout exception path is exercised only via *seeded* failure rows (`13`, `18`),
+      not an end-to-end lock contention → **Phase 3 coverage gap** (see traceability).
+- [x] **No-op / stale-window.**
+      **Disposition:** cited-safe, tested. The single live re-read
+      (`effective_reloption(v_live, …)`) is the sole arbiter and downgrades `adjust → no-op`
+      when the live value already equals the proposal — the same code path, covered by
+      `19_activation`.
+- [x] **Concurrency.**
+      **Disposition:** cited-safe + **COR-002**, with one narrow race deferred to Phase 2.
+      `control_tick` is serialized against itself by `pg_advisory_xact_lock`; loop-ordering
+      (F7) addresses the `observe_tick` race. The live re-read catches the human-`ALTER` race
+      **only when the human set exactly the proposal** (the no-op arbiter compares for
+      equality). A human value set between this cycle's `plan()` and `apply()` that *differs*
+      from the proposal, on a relation `plan()` classified `adjust`, **is overwritten this
+      cycle** — `apply()` consults neither `actuator_state` nor `manage_user_owned`. The
+      window is sub-second and COR-001 protects the human change on the *next* cycle, so it
+      self-heals; full concurrency/interleaving treatment (including this within-cycle race
+      and direct out-of-cycle `apply()`, the latter **COR-002**) is **Phase 2 FMEA** surface.
+- [x] **Idempotency / re-entrancy.**
+      **Disposition:** cited-safe, tested. Replaying a decision after success is a no-op (the
+      live re-read sees the value already applied); a rapid second `apply()` is blocked by
+      the per-relation `min_interval`; `decision_log.applied` is set on success.
+      `19_activation` (no-op), `16_authority_gate` (min_interval).
 
 ## Findings
 
@@ -124,7 +174,7 @@ Stages 1–6 are the caller (`control_tick()`); stages 7–17 are the actuator
 | COR-001 | High | Confirmed | `pgfc_govern/install.sql:713`, `:750`, `:694-705` | The ownership guard cannot tell the governor's own prior actuation from a human's setting, so continuous control and "never overwrite a human's setting" are mutually exclusive. | Verified | [#66](https://github.com/dventimisupabase/pg_flight_controller/issues/66) |
 | SEC-001 | Low | Confirmed | `pgfc_govern/install.sql:898-899`, `:997` | SECURITY INVOKER is a sound least-privilege posture (cited safe); residual: the intended cron/role identity is undocumented and no function pins `SET search_path`. | Verified | [#68](https://github.com/dventimisupabase/pg_flight_controller/issues/68) |
 | SEC-002 | Low | Confirmed | `pgfc_govern/install.sql:997` | `apply()` interpolates `v_prop` into the `ALTER TABLE` with `%s` (not cast/validated); safe today because the value is a computed numeric, un-hardened against a crafted `decision_log` row. | Verified | [#69](https://github.com/dventimisupabase/pg_flight_controller/issues/69) |
-| COR-002 | Low | Confirmed | `pgfc_govern/install.sql:935-938`, `:1084` | The authority gate reads the last-written `governor_state` singleton, so a direct out-of-cycle `apply()` would act on stale health state. Likely by-design (`control_tick` is the sole sanctioned caller). | Triaged | — |
+| COR-002 | Low | Confirmed | `pgfc_govern/install.sql:935-938`, `:1084` | The authority gate reads the last-written `governor_state` singleton, so a direct out-of-cycle `apply()` would act on stale health state. Likely by-design (`control_tick` is the sole sanctioned caller). | Won't-fix | — |
 
 <!-- Prose for each finding goes here, keyed by ID. -->
 
@@ -316,7 +366,7 @@ applies.
 
 ### COR-002 — Authority gate reads the last-written `governor_state` (stale out of cycle)
 
-**Severity:** Low · **Confidence:** Confirmed · **Status:** Triaged (likely Won't-fix / by-design)
+**Severity:** Low · **Confidence:** Confirmed · **Status:** Won't-fix (by-design; documented)
 
 The authority gate reads the singleton health state rather than recomputing it
 (`pgfc_govern/install.sql:935-938`):
@@ -343,6 +393,12 @@ sole sanctioned entrypoint** (and that `apply()` must not be called directly), o
 cheap freshness assertion. Final disposition (Won't-fix vs. Accepted) is the author's call;
 recorded here per the charter rather than filed as an issue.
 
+**Disposition: Won't-fix (by-design).** The recomputation alternative is rejected for the
+reasons above (per-relation `evaluate_health()` churn). The documentation half of the
+recommendation is taken: the operating guide's "Schedule" section states that
+`control_tick()` is the sole sanctioned entrypoint and that `apply()` is internal. No code
+change; no issue filed.
+
 ## Traceability (seed)
 
 The `apply()` path is the enforcement point for these invariants; this phase confirms
@@ -350,17 +406,22 @@ each holds in code and is backed by a test. (Filled during the review.)
 
 | Invariant / mechanism | Enforced at | Test | Findings |
 |---|---|---|---|
-| Inv 1 — never wait on locks | `apply()` stage 15 (`lock_timeout`, non-blocking) | *tbd* | |
-| Inv 3 — never reduce freeze safety | `plan()` freeze floor (refusal to tighten is safe) | *tbd* | |
-| Inv 4 — never exceed mutation budgets | `apply()` stage 12 (three tiers) | `16_authority_gate` | |
-| Inv 6 — every action explainable | `apply()` audit writes (stages 16–17) | *tbd* | |
-| F4 — authority gate | `apply()` stage 8 | `16_authority_gate` | |
+| Inv 1 — never wait on locks | `apply()` stage 15 (`lock_timeout`, non-blocking) | `13`/`18` (seeded failure rows → metrics/taxonomy); **live lock-timeout path untested → Phase 3 gap** | — |
+| Inv 3 — never reduce freeze safety | `plan()` freeze floor (refusal to tighten is safe) | `04_plan` (freeze floor → `sf_min`) | — |
+| Inv 4 — never exceed mutation budgets | `apply()` stage 12 (three tiers) | `16_authority_gate` | COR-002 |
+| Inv 6 — every action explainable | `apply()` audit writes (stages 16–17) | `05_loop`, `19_activation` (applied + baseline/revert); `16`/`21` (refusals not misrecorded) | — |
+| F4 — authority gate | `apply()` stage 8 | `16_authority_gate` | — |
+| Ownership guard | `plan()` `suppressed:user_owned` | `04_plan`, `19_activation` | COR-001 |
+| Value validation (DDL splice) | `apply()` (post-no-op, pre-budget) | `21_value_validation` | SEC-002 |
+| Object resolution / privilege | all plpgsql `SET search_path`; `SECURITY INVOKER` | `22_search_path` | SEC-001 |
 
 ## Exit criteria
 
-Per the charter, plus specific to this phase:
+Per the charter, plus specific to this phase — **all met:**
 
-- Both checklists fully dispositioned (cited-safe or finding).
-- `/security-review` output reconciled into the Findings table.
-- The traceability seed above completed for the `apply()` path.
-- All `Critical`/`High` findings `Verified` or `Won't-fix` (with rationale).
+- [x] Both checklists fully dispositioned (cited-safe or finding).
+- [x] `/security-review` output reconciled into the Findings table (SEC-001/002, COR-001/002).
+- [x] The traceability seed above completed for the `apply()` path (one Phase-3 coverage gap
+      recorded: the live lock-timeout path).
+- [x] All `Critical`/`High` findings `Verified` or `Won't-fix` (with rationale) — COR-001
+      (the only High) is Verified.
