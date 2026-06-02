@@ -178,8 +178,12 @@ about, tested, and gated independently, and the safe half can be run on its own.
 
 ### 3.2 The control loop and its two cadences
 
-The loop is the OODA cycle — **observe → orient → decide → act** — closed by a verify step.
-It runs as **two independent cadences**, not one:
+The loop is the OODA cycle — **observe → orient → decide → act** — intended to be closed by
+a verify step. That verify step is **a no-op stub today** (see [G1](#g1-control-loop-ooda)):
+the loop is closed *through the plant* — the next `observe()`/`estimate()` sees the effect
+of prior actuations — but it does **not yet attribute outcomes to the actions that caused
+them**, so claims about the control law's convergence are not yet instrumented (see
+[§7](#7-open-questions--feedback-wanted)). It runs as **two independent cadences**, not one:
 
 - **Fast loop — `observe_tick` (~1 min):** `observe()` → `classify()` → `estimate()`.
   Read-only; refreshes the picture and the per-relation hidden-state estimates. Never
@@ -691,7 +695,39 @@ The point of the RFC. Aggregated here, and surfaced per-subsystem in [§5](#5-su
 - **FMEA-001 — partition recycling: create/drop vs. a fixed `TRUNCATE` ring**
   ([O2](#o2-storage-and-retention),
   [detail](../fortification/02-failure-theory.md#fmea-001--partition-recycling-uses-createdrop-not-a-fixed-truncate-ring)).
-- *(More to come as subsystem sections and the fortification phases produce them.)*
+
+**From the first external review** (recorded against the
+[Phase 1 finding schema](../fortification/01-security-correctness-apply.md#findings)):
+
+- **COR-001 — the ownership guard conflates governor-set with user-set.** `plan()` derives
+  "user-owned" from live reloptions without consulting `actuator_state`, so the governor
+  cannot tell its own prior actuation from a human's. The consequence: continuous control
+  (§1) and "never overwrite a human's setting" (§2.4) are mutually exclusive in the shipped
+  code. *(High;
+  [detail](../fortification/01-security-correctness-apply.md#cor-001--the-ownership-guard-conflates-set-by-the-governor-with-set-by-a-user).)*
+- **SEC-001 / SEC-002 / COR-002** — defense-in-depth dispositions of the `apply()` path
+  (privilege/role model + `search_path`, the `v_prop` interpolation, the authority gate's
+  state freshness); all Low under the `SECURITY INVOKER` trust model. *(See the
+  [Phase 1 findings](../fortification/01-security-correctness-apply.md#findings).)*
+
+**Strategic questions the RFC does not yet confront** (raised by the review; answers wanted):
+
+- **Is the scale factor the right control surface, and how often is it the binding
+  constraint?** The one knob the governor turns changes only *when* autovacuum fires — not
+  how fast (cost limits) nor whether it may run. The RFC concedes (§2.5,
+  [G5](#g5-diagnostics)) that `io_limited` and `inhibited` tables cannot be helped by it. So
+  in what fraction of real bloat incidents is the scale factor actually the limiting factor,
+  rather than an inhibitor, an I/O ceiling, or `cost_limit`/`cost_delay`? If most are the
+  latter, the system's real output is its diagnostics, and the RFC should say so.
+- **What end-to-end evidence is there that *active control* helps?** Advisory-by-default
+  (§3.4) plus the verify no-op ([§3.2](#32-the-control-loop-and-its-two-cadences)) means the
+  act path is off by default *and* unvalidated in closed loop when on. Is there a backtest,
+  simulation, or worked case showing actuation improves outcomes without harm — or is "act"
+  currently asserted rather than demonstrated?
+- **Until `verify()` attributes outcomes, how is the control law's convergence/stability
+  established?** §1 and the concepts lean on control theory and state estimation, but the
+  component that would measure whether actions achieve their predicted effect is a stub. What
+  evidence supports the convergence claim today?
 
 ## 8. How this RFC is maintained
 
