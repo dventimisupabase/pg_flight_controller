@@ -34,7 +34,7 @@ spine):
 
 | Phase | Title | Status |
 |---|---|---|
-| 1 | Security + correctness — `apply()` path | Not started |
+| 1 | Security + correctness — `apply()` path | In progress |
 | 2 | Failure theory (FMEA) | Not started |
 | 3 | Test hardening | Not started |
 | 4 | Review process | Not started |

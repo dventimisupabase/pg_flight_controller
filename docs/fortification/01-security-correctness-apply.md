@@ -1,6 +1,6 @@
 # Phase 1 — Security + correctness of the `apply()` path
 
-**Status:** Not started · **Lead surface:** the actuation chain
+**Status:** In progress · **Lead surface:** the actuation chain
 `control_tick() → plan() → apply()` in `pgfc_govern/install.sql`.
 
 The only place the system mutates the catalog. Everything else observes, estimates,
