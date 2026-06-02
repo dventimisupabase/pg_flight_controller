@@ -122,6 +122,9 @@ Stages 1–6 are the caller (`control_tick()`); stages 7–17 are the actuator
 | ID | Sev | Conf | Evidence | Summary | Status | Link |
 |---|---|---|---|---|---|---|
 | COR-001 | High | Confirmed | `pgfc_govern/install.sql:713`, `:750`, `:694-705` | The ownership guard cannot tell the governor's own prior actuation from a human's setting, so continuous control and "never overwrite a human's setting" are mutually exclusive. | Accepted | [#66](https://github.com/dventimisupabase/pg_flight_controller/issues/66) |
+| SEC-001 | Low | Confirmed | `pgfc_govern/install.sql:898-899`, `:997` | SECURITY INVOKER is a sound least-privilege posture (cited safe); residual: the intended cron/role identity is undocumented and no function pins `SET search_path`. | Accepted | [#68](https://github.com/dventimisupabase/pg_flight_controller/issues/68) |
+| SEC-002 | Low | Confirmed | `pgfc_govern/install.sql:997` | `apply()` interpolates `v_prop` into the `ALTER TABLE` with `%s` (not cast/validated); safe today because the value is a computed numeric, un-hardened against a crafted `decision_log` row. | Accepted | [#69](https://github.com/dventimisupabase/pg_flight_controller/issues/69) |
+| COR-002 | Low | Confirmed | `pgfc_govern/install.sql:935-938`, `:1084` | The authority gate reads the last-written `governor_state` singleton, so a direct out-of-cycle `apply()` would act on stale health state. Likely by-design (`control_tick` is the sole sanctioned caller). | Triaged | — |
 
 <!-- Prose for each finding goes here, keyed by ID. -->
 
@@ -200,6 +203,100 @@ on the following cycle, and that a post-touch human change *is* protected when
 item above, which asks whether `apply()` can be reached directly to *bypass* the guard.
 COR-001 is a correctness defect in the guard's own logic in `plan()`: the guard misfires
 even when reached normally.
+
+### SEC-001 — Privilege model undocumented; functions do not pin `SET search_path`
+
+**Severity:** Low · **Confidence:** Confirmed · **Status:** Accepted
+
+Dispositions the Security-checklist items **Privilege model**, **`SECURITY DEFINER`
+exposure**, and **`search_path` safety** — most as *cited-safe*, with a Low residual.
+
+**Cited safe.** No function in either extension is `SECURITY DEFINER` (`grep -nE
+"SECURITY DEFINER|search_path|GRANT|REVOKE"` over both `install.sql` files returns
+nothing); `apply()` is a plain `SECURITY INVOKER` function (`pgfc_govern/install.sql:898-899`).
+This is a sound least-privilege posture: the caller runs the `ALTER TABLE` with their own
+rights and must already hold `ALTER` on the relation, so `apply()` confers no authority a
+direct `ALTER TABLE` would not. The schema objects the path touches are schema-qualified
+(`pgfc_govern.`, `pgfc_observe.`), and the bare references that remain (`pg_class`,
+`pg_stat_progress_vacuum`, `pg_stat_all_tables`, `format`, `now`, `count`) resolve through
+`pg_catalog`, which is searched ahead of a mutable `search_path` in any normal
+configuration — so a hostile `search_path` does not hijack them as built.
+
+**Residual (Low).** Two gaps, both defense-in-depth:
+
+1. The intended execution identity is undocumented. Production drives the loop via
+   `pg_cron` (RFC §3.2), but neither the RFC nor the install scripts state *which role*
+   owns the cron jobs, what privileges it needs, or why the design is `SECURITY INVOKER`
+   rather than a privilege-confined `SECURITY DEFINER`. For an autonomous catalog actuator,
+   that role/privilege model should be explicit, not implied.
+2. No function carries `SET search_path = pgfc_govern, pgfc_observe, pg_catalog`. This is
+   harmless under `SECURITY INVOKER` today, but it is fragile: if any path function is later
+   wrapped `SECURITY DEFINER` (a natural step toward least-privilege deployment), the absent
+   pinned `search_path` becomes a real injection surface for the dynamic `ALTER TABLE`
+   (`pgfc_govern/install.sql:997`). It also aligns with Supabase's
+   `function_search_path_mutable` linter.
+
+**Recommendation.** Document the intended cron/role identity and least privilege in the RFC
+and operating guide; add `SET search_path` to the control-path functions as defense-in-depth
+ahead of any future `SECURITY DEFINER` posture.
+
+### SEC-002 — `apply()` interpolates `v_prop` into the `ALTER TABLE` without a cast
+
+**Severity:** Low · **Confidence:** Confirmed · **Status:** Accepted
+
+Dispositions the Security-checklist **Dynamic SQL** item for `v_prop`. The mutation
+(`pgfc_govern/install.sql:997`) is:
+
+```sql
+EXECUTE format('ALTER TABLE %s SET (%I = %s)', p_relid::regclass, v_act, v_prop);
+```
+
+`%s` for `p_relid::regclass` and `%I` for the actuator name are safe (regclass, and an
+identifier-quoted literal constant). `v_prop` is interpolated raw with `%s`. Traced back,
+`v_prop` is `decision_log.proposed_value`, written by `plan()` as `sf_target::text`
+(`pgfc_govern/install.sql:766`), where `sf_target` is the output of `snap_sf()` — a bounded
+`double precision`. So **as built it is a clean numeric string and not injectable**, and the
+`SECURITY INVOKER` posture (SEC-001) means the caller could `ALTER` the table anyway.
+
+**Residual (Low).** The safety rests entirely on the provenance of a row in a writable
+table. A hand-inserted or corrupted `decision_log.proposed_value` (a row with
+`decision = 'adjust'` and a crafted `proposed_value`) would be interpolated verbatim into
+DDL. This is defense-in-depth, not a live exploit.
+
+**Recommendation.** Validate/cast `v_prop` to `double precision` before interpolation (e.g.
+interpolate `v_prop::double precision`, or parse-and-range-check against `[sf_min, sf_max]`)
+so a non-numeric `proposed_value` fails closed rather than reaching the catalog. Note: `%L`
+is **not** the right fix — it would render `SET (... = '0.1')` (a quoted string literal),
+which is not a valid reloption value; the value must remain an unquoted numeric.
+
+### COR-002 — Authority gate reads the last-written `governor_state` (stale out of cycle)
+
+**Severity:** Low · **Confidence:** Confirmed · **Status:** Triaged (likely Won't-fix / by-design)
+
+The authority gate reads the singleton health state rather than recomputing it
+(`pgfc_govern/install.sql:935-938`):
+
+```sql
+SELECT state INTO v_state FROM pgfc_govern.governor_state;
+IF v_state IN ('diagnostic', 'emergency', 'disabled') THEN RETURN false; END IF;
+```
+
+So `apply()` gates on whatever `evaluate_health()` last wrote. A direct, out-of-cycle
+`apply()` call would therefore act on a possibly-stale health state. (This is the mechanism
+behind RFC G4 Q1.)
+
+**Why this is likely by-design, not a defect.** In the sanctioned flow, `control_tick()` —
+the only intended entrypoint — calls `evaluate_health()` immediately before the apply loop
+(`pgfc_govern/install.sql:1084`), so the state is fresh. `apply()` is not a public
+interface, and even with a stale state the live Invariant-4 budget checks
+(`pgfc_govern/install.sql:951-981`) bound the blast radius. Recomputing health inside
+`apply()` would also re-run `evaluate_health()` per relation per cycle, which is wasteful and
+could itself introduce mid-cycle state churn.
+
+**Recommendation.** Leave the behavior as-is and **document that `control_tick()` is the
+sole sanctioned entrypoint** (and that `apply()` must not be called directly), or add a
+cheap freshness assertion. Final disposition (Won't-fix vs. Accepted) is the author's call;
+recorded here per the charter rather than filed as an issue.
 
 ## Traceability (seed)
 
