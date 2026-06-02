@@ -64,7 +64,7 @@ Modes worked and found to **fail safe** as built (the reassuring half of the ana
 | FMEA-003 | Medium | Confirmed | `pgfc_govern/install.sql:2025`, `:1171`, `:1143-1191` | Control-loop errors are invisible: `tick_log.error` is never written and a hard error rolls the tick row back, so the tick-error breaker is structurally dead and a wedged `control_tick` keeps the governor `normal`. | Accepted | [#84](https://github.com/dventimisupabase/pg_flight_controller/issues/84) |
 | FMEA-004 | Medium | Confirmed | `pgfc_observe/install.sql` (`retain`/`drop_empty_partitions`/`_ensure_partition`, no `lock_timeout`) | Storage-maintenance DDL takes `ACCESS EXCLUSIVE` with no bounded `lock_timeout` — an Invariant-1 gap outside the `apply()` path. | Accepted | [#81](https://github.com/dventimisupabase/pg_flight_controller/issues/81) |
 | FMEA-005 | Medium | Confirmed | `pgfc_govern/install.sql:1176-1180`, `:1143-1191` | No per-relation error isolation: one uncaught error in `apply()` aborts the whole cycle (all relations roll back), deterministically and — per FMEA-003 — invisibly. | Accepted | [#82](https://github.com/dventimisupabase/pg_flight_controller/issues/82) |
-| FMEA-006 | Low | Confirmed | `pgfc_govern/install.sql:993-994` | `apply()` overwrites a within-cycle human `ALTER` whose value differs from the proposal — it re-checks neither `actuator_state` nor `manage_user_owned`. Self-heals next cycle (COR-001). | Accepted | [#83](https://github.com/dventimisupabase/pg_flight_controller/issues/83) |
+| FMEA-006 | Low | Confirmed | `pgfc_govern/install.sql:993-994` | `apply()` overwrote a human `ALTER` (made after the planning snapshot) whose value differs from the proposal — it re-checked neither `actuator_state` nor `manage_user_owned`. | Verified | [#83](https://github.com/dventimisupabase/pg_flight_controller/issues/83) |
 | FMEA-007 | Low | Confirmed | `pgfc_govern/install.sql:1150` | `control_tick` takes a **blocking** advisory lock (not `try`) *before* `evaluate_health()`, so under cadence pressure ticks queue (each holding a backend) and F6 load-shedding cannot shed them. | Won't-fix (by-design) | — |
 
 ### FMEA-001 — Partition recycling uses create/drop, not a fixed `TRUNCATE` ring
@@ -157,18 +157,28 @@ but the per-relation loop has no isolation, so one poison relation denies actuat
 **Recommendation:** wrap each `apply()` (or each relation) in a `BEGIN … EXCEPTION WHEN
 others` subtransaction that records the failure and continues.
 
-### FMEA-006 — `apply()` can overwrite a within-cycle human `ALTER`
+### FMEA-006 — `apply()` can overwrite a human `ALTER` made after the planning snapshot
 
-**Severity:** Low · **Confidence:** Confirmed · **Status:** Accepted ([#83](https://github.com/dventimisupabase/pg_flight_controller/issues/83))
+**Severity:** Low · **Confidence:** Confirmed · **Status:** Verified (fixed in [#83](https://github.com/dventimisupabase/pg_flight_controller/issues/83))
 
-Carried from the Phase 1 Concurrency disposition. `apply()`'s no-op gate returns false only
+Carried from the Phase 1 Concurrency disposition. `apply()`'s no-op gate returned false only
 when the live value **equals** the proposal (`v_cur IS NOT DISTINCT FROM v_prop`,
-`pgfc_govern/install.sql:993-994`); it re-checks neither `actuator_state` nor
-`manage_user_owned`. A human value set between this cycle's `plan()` and `apply()` that
-*differs* from the proposal, on a relation `plan()` classified `adjust`, is overwritten this
-cycle; COR-001's guard (in `plan()`) only protects it next cycle. **Narrow** (sub-second;
-self-heals). **Recommendation:** an `apply()`-side ownership re-check just before mutating,
-mirroring COR-001 at the actuation point.
+`pgfc_govern/install.sql:993-994`); it re-checked neither `actuator_state` nor
+`manage_user_owned`. A human value set after the snapshot `plan()` planned against — anywhere
+in the **observe → apply** window (snapshot age + control cadence, i.e. minutes, not the
+sub-second `plan → apply` gap), on a relation `plan()` classified `adjust` — was overwritten
+that cycle; COR-001's guard (in `plan()`) only protected it the *next* cycle.
+
+**Resolution.** `apply()` now mirrors COR-001's `sf_user_set` predicate against the **live**
+reloption, just before the budget tiers: the governor owns the live value only when it has a
+baseline row, *introduced* the option (`baseline_explicit = false`), and the live value still
+equals what it last set (`current_value`). Any other explicit live value is user-owned and —
+unless `manage_user_owned` — refused **silently** (the same posture as the other pre-mutation
+gates). The `actuator_state` read is shared with the baseline capture, preserving the
+never-overwrite-baseline semantics. Regression test `pgfc_govern/tests/23_apply_ownership.sql`:
+a post-plan human change is refused and preserved (the prover — red pre-fix), while a
+governor-owned relation still actuates (continuous control) and `manage_user_owned = true`
+still takes ownership.
 
 ### FMEA-007 — `control_tick` takes a blocking advisory lock before evaluating health
 
@@ -195,7 +205,7 @@ Failure modes attach to the invariants/mechanisms they stress (extends the Phase
 | F1 — self-monitoring metrics | FMEA-003 (`tick_errors_last_day` structurally 0) | Finding |
 | F2 — health-state machine | worst-of under conflicting signals | Cited-safe |
 | F6 — load shedding | FMEA-007 (lock wait precedes health eval) | Won't-fix |
-| F7 — active-control activation | FMEA-002 (standby), FMEA-005 (poison relation), FMEA-006 (within-cycle race) | Findings |
+| F7 — active-control activation | FMEA-002 (standby), FMEA-005 (poison relation), FMEA-006 (post-snapshot human race) | FMEA-006 **Verified** (#83); 002/005 open |
 
 ## Exit criteria
 
