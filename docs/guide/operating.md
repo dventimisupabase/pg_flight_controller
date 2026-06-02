@@ -280,6 +280,12 @@ SELECT cron.schedule('pgfc_observe_gc',     '23 4 1 * *',  $$SELECT pgfc_observe
 SELECT cron.schedule('pgfc_govern_retain',  '17 3 * * *',  $$SELECT pgfc_govern.retain()$$);
 ```
 
+`pgfc_govern.control_tick()` is the **sole sanctioned entrypoint** for a control cycle: it
+takes the advisory lock, evaluates health, plans, and then actuates under the full safety
+net. The functions beneath it — `plan()`, and especially `apply()` — are **internal** and
+must not be called directly; calling `apply()` out of cycle would act on a stale health
+state and bypass the serialization `control_tick()` provides.
+
 The high-volume telemetry tables (`snapshots`, `relation_samples`) are **daily
 `RANGE` partitioned** on an `int4` epoch-day key, and retention is whole-partition
 rotation — never row-by-row `DELETE` — so it reclaims space instantly and leaves zero

@@ -34,9 +34,9 @@ spine):
 
 | Phase | Title | Status |
 |---|---|---|
-| 1 | Security + correctness — `apply()` path | In progress |
+| 1 | Security + correctness — `apply()` path | **Complete** — COR-001 (High) / SEC-001 / SEC-002 Verified; COR-002 Won't-fix (by-design) |
 | 2 | Failure theory (FMEA) | Not started |
-| 3 | Test hardening | Not started |
+| 3 | Test hardening | Not started (carries the Phase-1 live lock-timeout coverage gap) |
 | 4 | Review process | Not started |
 
 ## Where findings go
