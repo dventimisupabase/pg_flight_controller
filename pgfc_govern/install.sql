@@ -924,6 +924,10 @@ DECLARE
     v_act   text := 'autovacuum_vacuum_scale_factor';
     v_dec   text;
     v_prop  text;
+    -- SEC-002 (#69): range-check locals for the value spliced into the ALTER TABLE.
+    v_prop_num double precision;
+    v_sf_min   double precision := pgfc_govern._param('sf_min')::double precision;
+    v_sf_max   double precision := pgfc_govern._param('sf_max')::double precision;
     v_live  text[];
     v_cur   text;
     v_relname text;
@@ -970,6 +974,29 @@ BEGIN
 
     v_cur := pgfc_observe.effective_reloption(v_live, v_act);       -- live ground truth
     IF v_cur IS NOT DISTINCT FROM v_prop THEN RETURN false; END IF; -- no-op vs live
+
+    -- SEC-002 (#69): defense-in-depth on the value spliced into the ALTER TABLE below.
+    -- v_prop is governor-computed (snap_sf()'s bounded grid output, written as
+    -- decision_log.proposed_value), but decision_log is writable -- a hand-inserted or
+    -- corrupted 'adjust' row could carry non-numeric or out-of-range text that format('%s')
+    -- would interpolate verbatim into the DDL (a reloption injection). Parse it in a scoped
+    -- sub-block so a bad cast fails closed rather than aborting the whole control_tick
+    -- (WHEN others because invalid syntax and out-of-range raise different SQLSTATEs, and
+    -- pg_input_is_valid() is PG16+ while we support PG15), then range-check against
+    -- [sf_min, sf_max]. A bad value is refused SILENTLY, exactly like the gates above -- the
+    -- decision_log row is the audit trail, and recording it 'failed' would feed the
+    -- failed-action breaker. NaN/+Inf fail the upper bound and -Inf the lower (PostgreSQL
+    -- sorts NaN above every real), so non-finite values are refused too. A validated v_prop
+    -- is a finite numeric in-range, so the original text below is injection-safe to splice
+    -- and stays byte-identical to actuator_state.current_value (the COR-001 round-trip).
+    BEGIN
+        v_prop_num := v_prop::double precision;
+    EXCEPTION WHEN others THEN
+        v_prop_num := NULL;
+    END;
+    IF v_prop_num IS NULL OR NOT (v_prop_num BETWEEN v_sf_min AND v_sf_max) THEN
+        RETURN false;
+    END IF;
 
     -- Invariant 4 — never exceed mutation budgets (Phase 1.7 F4). The three-tier cap from
     -- appendix F "Authority Limiting", enforced at the single actuation chokepoint. Values

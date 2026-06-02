@@ -123,7 +123,7 @@ Stages 1–6 are the caller (`control_tick()`); stages 7–17 are the actuator
 |---|---|---|---|---|---|---|
 | COR-001 | High | Confirmed | `pgfc_govern/install.sql:713`, `:750`, `:694-705` | The ownership guard cannot tell the governor's own prior actuation from a human's setting, so continuous control and "never overwrite a human's setting" are mutually exclusive. | Verified | [#66](https://github.com/dventimisupabase/pg_flight_controller/issues/66) |
 | SEC-001 | Low | Confirmed | `pgfc_govern/install.sql:898-899`, `:997` | SECURITY INVOKER is a sound least-privilege posture (cited safe); residual: the intended cron/role identity is undocumented and no function pins `SET search_path`. | Accepted | [#68](https://github.com/dventimisupabase/pg_flight_controller/issues/68) |
-| SEC-002 | Low | Confirmed | `pgfc_govern/install.sql:997` | `apply()` interpolates `v_prop` into the `ALTER TABLE` with `%s` (not cast/validated); safe today because the value is a computed numeric, un-hardened against a crafted `decision_log` row. | Accepted | [#69](https://github.com/dventimisupabase/pg_flight_controller/issues/69) |
+| SEC-002 | Low | Confirmed | `pgfc_govern/install.sql:997` | `apply()` interpolates `v_prop` into the `ALTER TABLE` with `%s` (not cast/validated); safe today because the value is a computed numeric, un-hardened against a crafted `decision_log` row. | Verified | [#69](https://github.com/dventimisupabase/pg_flight_controller/issues/69) |
 | COR-002 | Low | Confirmed | `pgfc_govern/install.sql:935-938`, `:1084` | The authority gate reads the last-written `governor_state` singleton, so a direct out-of-cycle `apply()` would act on stale health state. Likely by-design (`control_tick` is the sole sanctioned caller). | Triaged | — |
 
 <!-- Prose for each finding goes here, keyed by ID. -->
@@ -252,7 +252,7 @@ ahead of any future `SECURITY DEFINER` posture.
 
 ### SEC-002 — `apply()` interpolates `v_prop` into the `ALTER TABLE` without a cast
 
-**Severity:** Low · **Confidence:** Confirmed · **Status:** Accepted
+**Severity:** Low · **Confidence:** Confirmed · **Status:** Verified (fixed in [#69](https://github.com/dventimisupabase/pg_flight_controller/issues/69))
 
 Dispositions the Security-checklist **Dynamic SQL** item for `v_prop`. The mutation
 (`pgfc_govern/install.sql:997`) is:
@@ -278,6 +278,21 @@ interpolate `v_prop::double precision`, or parse-and-range-check against `[sf_mi
 so a non-numeric `proposed_value` fails closed rather than reaching the catalog. Note: `%L`
 is **not** the right fix — it would render `SET (... = '0.1')` (a quoted string literal),
 which is not a valid reloption value; the value must remain an unquoted numeric.
+
+**Resolution.** `apply()` now parses `v_prop` to a number in a scoped sub-block (so a bad
+cast fails closed instead of aborting `control_tick` — `WHEN others`, since invalid syntax
+and out-of-range raise different SQLSTATEs, and `pg_input_is_valid()` is PG16+ while we
+support PG15) and range-checks it against `[sf_min, sf_max]` before the mutation. A bad
+value is refused **silently**, like the other pre-mutation gates — the `decision_log` row
+is the audit trail, and recording it `failed` would feed the failed-action breaker. The
+*validated* original `v_prop` text is then spliced (not the parsed double), keeping the
+catalog value byte-identical to `actuator_state.current_value` — the equality COR-001's
+ownership guard depends on. Regression test `pgfc_govern/tests/21_value_validation.sql`
+drives a crafted `proposed_value = '0.05, autovacuum_enabled = false'` (a DDL-valid
+reloption injection that, pre-fix, silently disabled autovacuum on the table) plus
+non-numeric, out-of-range, and `NaN` payloads through `apply()` directly, asserting each is
+refused with nothing actuated and no `failed` row, while a legitimate in-range value still
+applies.
 
 ### COR-002 — Authority gate reads the last-written `governor_state` (stale out of cycle)
 
