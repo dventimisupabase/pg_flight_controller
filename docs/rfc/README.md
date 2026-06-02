@@ -3,7 +3,7 @@
 > **Status:** Draft outline (for review). **Audience:** reviewers and commenters.
 > **Purpose:** a single, navigable account of the system *as built*, organized so a
 > reviewer can drill from the name down to the code and climb back up from any object to
-> its purpose — and know exactly what feedback is wanted.
+> its purpose.
 
 This is a **Request for Comments** — it exists to be reviewed, not to teach or to archive.
 
@@ -13,6 +13,19 @@ This is a **Request for Comments** — it exists to be reviewed, not to teach or
 - It is **not** the user guides (getting started, operating, concepts, reference). Those
   serve operators. This serves reviewers: it foregrounds rationale, alternatives, and open
   questions, and it links *down* to the guides and reference rather than restating them.
+
+> **How to review this — please challenge the premises, not just the details.** This
+> document argues for a particular design, and an argued document tends to make its own
+> choices feel settled. They are not. The questions it raises (the *"For review"* notes in
+> §2, the *"Feedback wanted"* blocks in §5, and [§7](#7-open-questions--feedback-wanted))
+> are a **starting point, not a boundary** — they are the questions the authors already know
+> to ask, which by definition cannot include their own blind spots. The most useful comments
+> may be the ones that reject a framing this RFC treats as given: that the autovacuum scale
+> factor is the right control surface, that this should be modeled as a control loop at all,
+> that the workload taxonomy carves reality at its joints, that "safe before effective" is
+> even achievable for an autonomous catalog actuator. Where the authors already know the
+> ground is soft — what is unbuilt, unproven, or unvalidated — [§7](#7-open-questions--feedback-wanted)
+> says so plainly; treat that list as incomplete too.
 
 ## How to read this
 
@@ -66,11 +79,22 @@ not to tune autovacuum once, but to keep the database **self-stabilizing** as th
 changes. The design draws on control theory and state estimation — not machine learning.
 
 At a glance, two cooperating extensions — `pgfc_observe` (read-only telemetry) and
-`pgfc_govern` (the control loop) — run an **observe → estimate → decide → act** feedback
-cycle. It is **advisory by default**: out of the box it recommends and diagnoses but changes
-nothing. Active control is opt-in and runs under a self-protection net, on the principle that
-an autonomous actuator on a live production catalog must be **safe and explainable before it
-is effective**.
+`pgfc_govern` (the control loop) — run an **observe → estimate → decide → act** cycle. It is
+**advisory by default**: out of the box it recommends and diagnoses but changes nothing.
+Active control is opt-in and runs under a self-protection net, on the principle that an
+autonomous actuator on a live production catalog must be **safe and explainable before it is
+effective**.
+
+This rests on several bets the RFC has **not yet proven**, and a reviewer should hold them at
+arm's length: that the scale factor is a control surface worth steering (it changes only
+*when* autovacuum fires, and §2.5/[G5](#g5-diagnostics) concede whole classes of stuck tables
+it cannot help); that per-relation maintenance state can be usefully estimated from sampled
+statistics; and that *active* control, once enabled, improves outcomes rather than merely
+adding risk. The latter is currently **unvalidated end to end** — the loop's outcome-attribution
+step is a stub ([§3.2](#32-the-control-loop-and-its-two-cadences)), so the convergence and
+stability the "control theory" framing implies are asserted, not measured. The parts that are
+demonstrably real today are *observe*, *estimate*, and *diagnose*; *act* is the unproven claim.
+[§7](#7-open-questions--feedback-wanted) collects these candidly.
 
 ↳ Refine into [concepts](#2-concepts-and-principles).
 
@@ -85,18 +109,26 @@ the [concepts guide](../guide/concepts.md), linked per concept rather than resta
 PostgreSQL exposes per-table autovacuum knobs (scale factors, thresholds) as static
 configuration you set once and hope stays appropriate. pg_flight_controller reframes them as
 **actuator positions** a supervisory loop moves to hold a desired *outcome* as the workload
-shifts. It never runs `VACUUM` — it changes *when* autovacuum fires. **For review:** the
-whole value proposition rests on this reframing — that steering setpoints, not performing
-maintenance, is the right control surface.
+shifts. It never runs `VACUUM` — it changes *when* autovacuum fires. **For review (premise):**
+the whole value proposition rests on this reframing. Is it sound? Steering *when* autovacuum
+fires is a strictly weaker lever than steering *how* it runs (cost limits, worker counts) or
+*whether* it runs — and it does nothing for a table autovacuum already wants to vacuum but
+cannot finish. Is the scale factor the right control surface, a sufficient one, or merely the
+one that happens to be safe to touch?
 → [guide](../guide/concepts.md#autovacuum-settings-are-actuator-positions); it takes
 architectural shape in [§3](#3-architecture).
 
 ### 2.2 The control loop (OODA)
 
-The system is a feedback loop — **observe** the database, **orient** (estimate hidden state,
-classify the workload), **decide** a setpoint, **act**, and **verify** — drawn from control
-theory and state estimation, not machine learning. **For review:** whether the loop's inputs
-are sufficient and whether the feedback (`verify`) genuinely closes.
+The system is framed as a feedback loop — **observe** the database, **orient** (estimate
+hidden state, classify the workload), **decide** a setpoint, **act**, and (intended) **verify**
+— borrowing the vocabulary of control theory and state estimation, not machine learning.
+**For review (premise):** is "feedback loop" the right model, or aspirational labelling? The
+`verify` stage that would close the loop is a no-op stub today, so nothing yet measures
+whether an action achieved its predicted effect; the loop closes only *through the plant*
+(later observations see the result). Does borrowing control-theory language commit the design
+to guarantees (convergence, stability) it does not yet earn — and are the loop's inputs even
+sufficient to support them?
 → [guide](../guide/concepts.md#the-loop-observe--estimate--decide--act); the cadences are
 [§3.2](#32-the-control-loop-and-its-two-cadences).
 
@@ -106,17 +138,27 @@ Operators express **intent as outcomes** — how clean a kind of table should be
 raw parameters. Each relation is assigned a **workload class** with a target dead-tuple
 fraction template; the control law derives the setpoint as roughly *template ÷
 aggressiveness*, clamped to a safe range and snapped to a discrete grid (a deadband that
-suppresses churn). **For review:** the classification taxonomy and the control law's
-stability — does it converge, and are the clamps and grid right?
+suppresses churn). **For review (premise):** should the control law take this form at all?
+*template ÷ aggressiveness* is a particular, unjustified choice of transfer function; the
+workload classes are a fixed taxonomy that may not fit real tables; and "intent as outcomes"
+assumes operators think in dead-tuple fractions rather than, say, latency or bloat budget.
+Beyond *does it converge* — is a scalar per-class target the right way to express intent, and
+is grid-snapping a deadband or a source of limit cycles?
 → [workload classes](../guide/concepts.md#workload-classes),
 [what it steers](../guide/concepts.md#what-it-steers-the-dead-tuple-fraction).
 
 ### 2.4 Act rarely: cost, deadband, and the gates
 
 Moving a setpoint has cost — an MVCC catalog write and a behavior change — so the system is
-built to act sparingly: a deadband (no-op suppression), an ownership guard (never overwrite a
-human's or another system's setting), and rate/budget limits. **For review:** whether these
-gates are sufficient to keep catalog churn and actuation pressure bounded.
+built to act sparingly: a deadband (no-op suppression), an *intended* ownership guard
+(meant never to overwrite a human's or another system's setting), and rate/budget limits.
+**For review (premise + enforcement):** the ownership guard is stated here as a settled
+property, but the as-built review already found it does not hold continuously — the governor
+cannot distinguish its own prior change from a human's
+([COR-001](../fortification/01-security-correctness-apply.md#findings)). So the deeper
+questions: are these the *right* gates, is "act rarely" actually a safety property or just a
+cost heuristic, and which other stated guarantees in this RFC are claims rather than
+enforced facts?
 → [movement has cost](../guide/concepts.md#movement-has-cost-so-act-rarely),
 [advisory by default](../guide/concepts.md#advisory-by-default); enforced in
 [§3.4](#34-advisory-by-default-active-control-under-the-self-protection-net) and
@@ -128,8 +170,12 @@ When a table is not keeping up, more aggressiveness often cannot help — the ca
 external inhibitor (a long transaction or a replication slot pinning the xmin horizon) or an
 I/O limit. Rather than escalate blindly, the governor **diagnoses the cause** (`config` /
 `io_limited` / `inhibited`) and names it, using **removability horizons** to identify who
-pins the horizon. **For review:** whether the saturation taxonomy is correct and complete,
-and whether "diagnose, don't escalate" is honored consistently.
+pins the horizon. **For review (premise):** is a three-way cause taxonomy the right shape, or
+a false trichotomy that will misclassify the messy real cases (multiple simultaneous causes,
+or causes outside the three)? And note the strategic implication: if "diagnose, don't
+escalate" is the *right* response to a large share of stuck tables, then the system's primary
+value is its diagnostics, not its actuation — is that the honest characterization of what
+pg_flight_controller is?
 → [diagnose, don't escalate](../guide/concepts.md#diagnose-dont-escalate),
 [removability horizons](../guide/concepts.md#removability-horizons); the subsystem is
 [G5](#g5-diagnostics).
@@ -137,11 +183,14 @@ and whether "diagnose, don't escalate" is honored consistently.
 ### 2.6 Safety first: an explicit theory of failure
 
 An autonomous actuator on a live catalog must be safe before it is effective. The system
-holds **six safety invariants** — never wait on locks; never disable autovacuum; never
-reduce freeze safety; never exceed mutation budgets; never escalate without evidence; every
-action explainable — and makes every change **reversible** (a captured pre-governor baseline
-plus revert). **For review:** whether the invariants are actually enforced where claimed —
-the core of the fortification review.
+*aims* to hold **six safety invariants** — never wait on locks; never disable autovacuum;
+never reduce freeze safety; never exceed mutation budgets; never escalate without evidence;
+every action explainable — and to make every change **reversible** (a captured pre-governor
+baseline plus revert). **For review (premise + enforcement):** two separate questions, and
+the RFC has tended to assume the first. (1) Are these the *right* six — is the set complete,
+are any in tension, and is "safe before effective" even an achievable bar for an autonomous
+catalog actuator, or a slogan? (2) Are they actually enforced where claimed? The fortification
+review treats (2) as open, not given; COR-001 is one place a claimed property did not hold.
 → [safety first](../guide/concepts.md#safety-first); architectural framing in
 [§3.6](#36-safety-invariants-as-architectural-constraints); enforcement under
 [G4](#g4-self-protection-f1-f7).
@@ -172,9 +221,11 @@ The system is two PostgreSQL extensions, each owning a schema, split by role:
   enabled.
 
 The boundary is a one-way dependency: govern depends on observe; observe knows nothing of
-govern. That separation is load-bearing, not cosmetic — the risky half can be reasoned
-about, tested, and gated independently, and the safe half can be run on its own.
-(↳ [Modules](#4-modules) details each side.)
+govern. The intended payoff is that the risky half can be reasoned about, tested, and gated
+independently, and the safe half can be run on its own. Whether the split is drawn in the
+right place — whether anything genuinely risky has leaked onto the observe side, and whether
+the cross-schema reads keep it honest — is for a reviewer to check, not to take on the
+strength of the diagram. (↳ [Modules](#4-modules) details each side.)
 
 ### 3.2 The control loop and its two cadences
 
@@ -238,9 +289,12 @@ Two architectural facts set the risk posture:
   self-monitoring metrics, and `apply()` consults it as an authority gate — refusing or
   limiting actuation when the governor is degraded, when circuit breakers trip, when it
   detects itself oscillating, or under database stress (load shedding). A three-tier
-  mutation budget caps blast radius. The principle: *the governor must govern itself before
-  it governs PostgreSQL.* (→ [G4 Self-protection](#g4-self-protection-f1-f7); the apply path
-  is the subject of fortification [Phase 1](../fortification/01-security-correctness-apply.md).)
+  mutation budget caps blast radius. The intended principle is *the governor should govern
+  itself before it governs PostgreSQL* — but a self-assessing actuator can also be wrong about
+  its own health, and the gate is only as good as the metrics feeding `evaluate_health()` and
+  the assumption that the sanctioned path is the only way to reach `apply()`. Whether
+  self-protection is genuine safety or a comforting story is exactly what fortification
+  [Phase 1](../fortification/01-security-correctness-apply.md) is testing. (→ [G4 Self-protection](#g4-self-protection-f1-f7).)
 
 ### 3.5 Cross-cutting patterns
 
@@ -263,12 +317,16 @@ here rather than rediscovering per subsystem:
 
 ### 3.6 Safety invariants as architectural constraints
 
-Cutting across every subsystem are six invariants the system *holds* rather than re-decides
-per change: never wait on locks; never disable autovacuum; never reduce freeze safety; never
-exceed mutation budgets; never escalate without evidence; every action must be explainable.
-They are not a subsystem — they are constraints the Act stage and the loop are built to
-satisfy, and they are the backbone of the fortification review's traceability.
-(→ [Concepts](#2-concepts-and-principles) for what each means; enforced across
+Cutting across every subsystem are six invariants the system is *built to hold* rather than
+re-decide per change: never wait on locks; never disable autovacuum; never reduce freeze
+safety; never exceed mutation budgets; never escalate without evidence; every action must be
+explainable. They are not a subsystem — they are constraints the Act stage and the loop are
+meant to satisfy. Whether they actually hold in code is the question the fortification review
+exists to answer, not an assumption this RFC is entitled to; they are its traceability
+backbone precisely because each must be checked. (COR-001 concerns a *different* stated
+guarantee — the ownership guard, not one of these six — and the fact that it did not hold as
+written is the reason none of the six should be taken on faith either.)
+(→ [Concepts](#2-concepts-and-principles) for what each means; checked across
 [G1](#g1-control-loop-ooda) and [G4](#g4-self-protection-f1-f7).)
 
 ↑ [Concepts](#2-concepts-and-principles) · ↳ [Modules](#4-modules)
@@ -347,6 +405,13 @@ Each subsystem is a stub to be filled with **Responsibility**, **Role**, **Objec
 full per-object docs live in the generated reference
 ([observe](../reference/pgfc_observe.md), [govern](../reference/pgfc_govern.md)).
 
+> **On the "Feedback wanted" blocks.** Most are framed as *confirm-or-deny* checks on a
+> design that is presumed sound ("is X correct and complete?"). Read past that framing. The
+> more valuable question is often *should X exist, in this form, at all?* — and a "yes, looks
+> right" answer to a narrow question should not be mistaken for endorsement of the premise
+> behind it. Where a subsystem's premise itself is contestable, a **Premise** line names it;
+> the absence of one is not evidence the premise is settled.
+
 ### O1. Collection
 
 - **Responsibility:** Collect one telemetry snapshot per run — a header row plus
@@ -364,6 +429,10 @@ full per-object docs live in the generated reference
   ([O3](#o3-derived-state-and-readers)) and the rollup tiers
   ([O2](#o2-storage-and-retention)) consume what `observe()` wrote — the filtered, sparse set
   propagates downstream rather than being re-filtered.
+- **Premise:** change-triggered sparse sampling assumes "no change in the signature" means
+  "nothing worth recording happened." Is a polled, change-coalesced snapshot the right sensing
+  model, or does it alias fast transients (a table that churns and settles between ticks) the
+  controller would need to see? Is ~1 minute a defensible sampling period or an untuned guess?
 - **Feedback wanted:** (1) the change test is a full-row `IS DISTINCT FROM` over the dense
   signature — is any governance-relevant field omitted, such that a meaningful change is
   coalesced and a sample skipped? (2) after a crash the UNLOGGED cache is empty, so the next
@@ -420,6 +489,11 @@ full per-object docs live in the generated reference
 - **Consumers / cross-links:** read by operators and by the governor; `maintenance_debt`
   itself uses `effective_reloption()` to resolve per-relation thresholds, and
   `effective_reloption` is consumed cross-module by govern's planning.
+- **Premise:** reconstructing dense per-relation state by carrying the last sample forward
+  assumes a relation's unobserved state is well-approximated by its last observed one. For a
+  change-coalesced sparse log that is close to circular — the estimate the controller trusts
+  is only as good as the sampling in O1. Is carry-forward the right interpolation, or should
+  gaps be treated as unknown rather than unchanged?
 - **Feedback wanted:** is the sparse→dense carry-forward (latest sample ≤ snapshot) the
   reconstruction reviewers expect, including for relations whose last change predates the
   target snapshot? Is live freeze-age recomputation consistent with what the governor plans
@@ -501,6 +575,11 @@ full per-object docs live in the generated reference
   [O3](#o3-derived-state-and-readers); the `action_history` it writes is consumed by
   [G4](#g4-self-protection-f1-f7) (oscillation/failure/budget signals) and pruned by
   [G6](#g6-storage-retention-and-self-maintenance).
+- **Premise:** the pipeline assumes catalog state sampled on one cadence and actuated on
+  another is a sound basis for closed-loop control. But the loop has no outcome feedback
+  (`verify` is a stub), so it cannot tell whether its last move helped — it is effectively
+  open-loop control dressed as closed-loop. Should `apply()` exist at all before `verify()`
+  does? And is a single scalar actuator per relation enough to claim "control"?
 - **Feedback wanted:** (1) is the `apply()` path correct and safe at the security boundary —
   argument handling, the live-vs-proposed no-op check, the `pg_stat_progress_vacuum` skip, and
   ownership of user-set reloptions (the focus of fortification
@@ -528,6 +607,11 @@ full per-object docs live in the generated reference
 - **Consumers / cross-links:** read by [G1](#g1-control-loop-ooda), which reads
   `aggressiveness`, `manage_user_owned`, and `n_sustain` to scale class targets and gate
   suppression during a control tick.
+- **Premise:** "intent as outcomes" assumes operators can and want to express maintenance
+  goals as per-class dead-tuple fractions scaled by a single `aggressiveness` knob. Is that
+  the right vocabulary, or do operators actually reason in terms of an SLO, a bloat budget, or
+  a maintenance window — and is one global policy the right scoping unit when different tables
+  plainly want different regimes?
 - **Feedback wanted:** is "intent as outcomes" expressive enough, or will operators need a
   richer target vocabulary than scalar aggressiveness plus per-class templates? Does a single
   `default` policy suffice, or should the design admit multiple named/scoped policies (and how
@@ -586,6 +670,12 @@ full per-object docs live in the generated reference
   *degraded-level only* (degraded still actuates, "one step from suspension"); only
   failure-driven breakers and the F5/F6 signals reach `diagnostic`, where the gate suspends
   actuation. `disabled` is operator-forced only.
+- **Premise:** the whole subsystem assumes a controller can reliably assess its *own* health
+  from its own telemetry and step back when sick — but a degraded controller is precisely the
+  one least able to judge itself, and a health-state machine with worst-wins composition is
+  one specific design among many (a watchdog, an external supervisor, a kill-switch). Is
+  self-protection the right model, or does safety for an autonomous catalog actuator belong
+  *outside* the actuator?
 - **Feedback wanted:** (1) can the authority gate be bypassed — a direct `apply()` out of cycle
   (it reads whatever `evaluate_health()` last wrote), or crafted `action_history` skewing the
   rate limit / reversal count? (2) is the worst-of composition free of self-amplifying loops —
@@ -613,6 +703,12 @@ full per-object docs live in the generated reference
   reconciler each cycle. Governor-scope findings such as `control_oscillation` are owned by
   [G4](#g4-self-protection-f1-f7); the saturation reconciler is scoped to leave that class
   untouched.
+- **Premise:** the design treats `config` / `io_limited` / `inhibited` as mutually exclusive,
+  discriminable causes. Real stuck tables may have several at once, or a cause outside the
+  three; a forced single label may mislead more than it helps. And if diagnosis is the right
+  answer often enough, it implies the honest framing of the product (see §2.5): is
+  pg_flight_controller a *controller* that occasionally diagnoses, or a *diagnostic* that
+  occasionally actuates?
 - **Feedback wanted:** is the three-way saturation taxonomy (`config` / `io_limited` /
   `inhibited`) complete and correctly discriminated? Is the open/auto-resolve reconciliation
   churn-free — stable findings rather than a fresh row per tick? Are the inhibitor attributions
@@ -690,44 +786,72 @@ cannot drift. Consumer / cross-edges are not catalog-derivable and stay hand-aut
 
 ## 7. Open questions / feedback wanted
 
-The point of the RFC. Aggregated here, and surfaced per-subsystem in [§5](#5-subsystems).
+This is the point of the RFC, and deliberately its most candid section. It gathers what the
+authors already know is unsettled — but the list is **not a perimeter**. The most useful
+comment may be one that adds a row nobody thought to write, or that rejects a premise the rest
+of the document treats as given (see the reviewing-stance note at the top, and the **Premise**
+lines throughout [§5](#5-subsystems)). Silence on a topic here means only that the authors did
+not flag it — not that it is sound.
+
+### What is unbuilt or unvalidated
+
+Stated plainly, so a reviewer need not reverse-engineer it:
+
+- **The loop does not yet close.** `verify()` is a no-op stub
+  ([§3.2](#32-the-control-loop-and-its-two-cadences), [G1](#g1-control-loop-ooda)) — nothing
+  measures whether an action achieved its predicted effect. The system reacts to the *state*
+  it re-observes, not to the *outcome* of what it did.
+- **Active control is unproven end to end.** No backtest, simulation, or worked case in this
+  RFC shows that enabling actuation improves maintenance outcomes without causing harm.
+  "Advisory by default" is honest about this — and it is why the riskiest capability is the
+  least-evidenced one.
+- **The control-theory claims are not earned yet.** Convergence and stability are asserted by
+  analogy, not instrumented or proven, and cannot be until `verify()` supplies outcome
+  attribution.
+- **What *is* demonstrable today** is the read-only half — observe, estimate, diagnose. The
+  firmest ground is there; the softest is in *act*.
+
+### Premises we are least sure about
+
+Each is argued at its subsystem (the **Premise** lines in [§5](#5-subsystems)); collected here
+so the architectural bets are visible in one place:
+
+- **Control surface** — is the scale factor worth steering at all, given it changes only
+  *when* autovacuum fires and cannot help I/O- or inhibitor-bound tables?
+  ([§2.1](#21-autovacuum-settings-as-actuator-positions), [O1](#o1-collection))
+- **Is this even a control loop**, or aspirational labelling over a scheduled heuristic
+  adjuster? ([§2.2](#22-the-control-loop-ooda), [G1](#g1-control-loop-ooda))
+- **The control law's form** — *template ÷ aggressiveness*, clamped and grid-snapped, is one
+  unjustified transfer function among many.
+  ([§2.3](#23-policy-as-outcomes-workload-classes-and-the-control-law))
+- **Intent vocabulary and policy scope** — dead-tuple fractions and one global policy may not
+  be how operators think or what real fleets need. ([G2](#g2-policy-and-intent))
+- **The saturation trichotomy** — `config` / `io_limited` / `inhibited` may be a false
+  trichotomy for messy, multi-cause reality.
+  ([§2.5](#25-diagnose-dont-escalate), [G5](#g5-diagnostics))
+- **Self-protection from within** — a sick controller judging its own health may be the wrong
+  place to put safety; an external supervisor is an unexplored alternative.
+  ([G4](#g4-self-protection-f1-f7))
+- **Controller or diagnostic?** If "diagnose, don't escalate" is the right answer often
+  enough, the honest product may be the diagnostics, with actuation a minor adjunct.
+
+### Findings from review (fortification)
+
+Recorded against the
+[Phase 1 finding schema](../fortification/01-security-correctness-apply.md#findings):
 
 - **FMEA-001 — partition recycling: create/drop vs. a fixed `TRUNCATE` ring**
   ([O2](#o2-storage-and-retention),
   [detail](../fortification/02-failure-theory.md#fmea-001--partition-recycling-uses-createdrop-not-a-fixed-truncate-ring)).
-
-**From the first external review** (recorded against the
-[Phase 1 finding schema](../fortification/01-security-correctness-apply.md#findings)):
-
-- **COR-001 — the ownership guard conflates governor-set with user-set.** `plan()` derives
-  "user-owned" from live reloptions without consulting `actuator_state`, so the governor
-  cannot tell its own prior actuation from a human's. The consequence: continuous control
-  (§1) and "never overwrite a human's setting" (§2.4) are mutually exclusive in the shipped
-  code. *(High;
-  [detail](../fortification/01-security-correctness-apply.md#cor-001--the-ownership-guard-conflates-set-by-the-governor-with-set-by-a-user).)*
+- **COR-001 (High) — the ownership guard conflates governor-set with user-set.** `plan()`
+  derives "user-owned" from live reloptions without consulting `actuator_state`, so the
+  governor cannot tell its own prior actuation from a human's; continuous control (§1) and
+  "never overwrite a human's setting" (§2.4) are mutually exclusive in the shipped code.
+  *([detail](../fortification/01-security-correctness-apply.md#cor-001--the-ownership-guard-conflates-set-by-the-governor-with-set-by-a-user).)*
 - **SEC-001 / SEC-002 / COR-002** — defense-in-depth dispositions of the `apply()` path
   (privilege/role model + `search_path`, the `v_prop` interpolation, the authority gate's
   state freshness); all Low under the `SECURITY INVOKER` trust model. *(See the
   [Phase 1 findings](../fortification/01-security-correctness-apply.md#findings).)*
-
-**Strategic questions the RFC does not yet confront** (raised by the review; answers wanted):
-
-- **Is the scale factor the right control surface, and how often is it the binding
-  constraint?** The one knob the governor turns changes only *when* autovacuum fires — not
-  how fast (cost limits) nor whether it may run. The RFC concedes (§2.5,
-  [G5](#g5-diagnostics)) that `io_limited` and `inhibited` tables cannot be helped by it. So
-  in what fraction of real bloat incidents is the scale factor actually the limiting factor,
-  rather than an inhibitor, an I/O ceiling, or `cost_limit`/`cost_delay`? If most are the
-  latter, the system's real output is its diagnostics, and the RFC should say so.
-- **What end-to-end evidence is there that *active control* helps?** Advisory-by-default
-  (§3.4) plus the verify no-op ([§3.2](#32-the-control-loop-and-its-two-cadences)) means the
-  act path is off by default *and* unvalidated in closed loop when on. Is there a backtest,
-  simulation, or worked case showing actuation improves outcomes without harm — or is "act"
-  currently asserted rather than demonstrated?
-- **Until `verify()` attributes outcomes, how is the control law's convergence/stability
-  established?** §1 and the concepts lean on control theory and state estimation, but the
-  component that would measure whether actions achieve their predicted effect is a stub. What
-  evidence supports the convergence claim today?
 
 ## 8. How this RFC is maintained
 
