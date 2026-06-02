@@ -121,9 +121,85 @@ Stages 1–6 are the caller (`control_tick()`); stages 7–17 are the actuator
 
 | ID | Sev | Conf | Evidence | Summary | Status | Link |
 |---|---|---|---|---|---|---|
-| *none yet* | | | | | | |
+| COR-001 | High | Confirmed | `pgfc_govern/install.sql:713`, `:750`, `:694-705` | The ownership guard cannot tell the governor's own prior actuation from a human's setting, so continuous control and "never overwrite a human's setting" are mutually exclusive. | Accepted | [#66](https://github.com/dventimisupabase/pg_flight_controller/issues/66) |
 
 <!-- Prose for each finding goes here, keyed by ID. -->
+
+### COR-001 — The ownership guard conflates "set by the governor" with "set by a user"
+
+**Severity:** High · **Confidence:** Confirmed · **Status:** Accepted
+
+**What the system promises.** RFC §2.4 lists "an ownership guard — never overwrite a
+human's or another system's setting" as one of the gates that keep actuation safe, and the
+`policy.manage_user_owned` column comment states the contract precisely
+(`pgfc_govern/install.sql:84`):
+
+> `false: never overwrite a reloption set by a user/other system **first**; true: take ownership.`
+
+The word *first* is a temporal claim: the guard is meant to protect a setting that
+pre-existed the governor's involvement.
+
+**What the code does.** The guard is evaluated in `plan()`. The "is this user-owned?"
+signal is computed live from the relation's current reloptions, with no reference to who
+set them (`pgfc_govern/install.sql:713`):
+
+```sql
+(pgfc_observe.effective_reloption(reloptions,'autovacuum_vacuum_scale_factor') IS NOT NULL)
+    AS sf_user_set
+```
+
+and drives the suppression branch (`pgfc_govern/install.sql:750`):
+
+```sql
+WHEN NOT v_manage AND sf_user_set THEN 'suppressed:user_owned'
+```
+
+`plan()`'s source CTE joins `relation_class`, `relation_estimate`,
+`current_relation_state`, and `snapshots` (`pgfc_govern/install.sql:694-705`) — it never
+joins `actuator_state`, so it has no knowledge of what the governor itself previously set.
+`sf_user_set` therefore means only "an explicit scale-factor reloption exists right now,"
+not "a user set it." But the governor's own actuation sets exactly that reloption
+(`pgfc_govern/install.sql:997`, `ALTER TABLE … SET (autovacuum_vacuum_scale_factor = …)`).
+
+**The consequence.** Once the governor actuates a relation a single time, `sf_user_set`
+becomes true for that relation permanently, and with the default policy
+(`manage_user_owned = false`) every subsequent cycle resolves to
+`suppressed:user_owned` — the governor suppresses its *own* prior change as though a human
+had made it. So:
+
+- With `manage_user_owned = false` (the default), active control degrades to **at most one
+  actuation per relation, ever** — not the continuous, self-stabilizing loop the abstract
+  (§1) sells.
+- The only way to restore continuous control is `manage_user_owned = true`, which by the
+  same column comment "lets the governor overwrite user/other-system reloptions" — i.e. it
+  turns the human-protection guard *off*, and the governor will then clobber a human's
+  manual `ALTER TABLE` made after first touch.
+
+The two stated properties — keep the database self-stabilizing (§1) and never overwrite a
+human's setting (§2.4) — are **mutually exclusive in the shipped code.** This is latent
+under the shipped default only because `advisory_only = true` keeps `apply()` from firing;
+it becomes load-bearing the instant active control is enabled, which is precisely the
+regime fortification exists to harden.
+
+**Why it is fixable cleanly.** The signal the contract needs already exists.
+`actuator_state.baseline_explicit` (`pgfc_govern/install.sql:176`) records whether the
+relation carried the reloption *before* the governor's first touch — that is the literal
+"set by a user first" fact the guard should test. The defect is that `plan()` consults the
+cruder live `sf_user_set` instead. A correct guard suppresses only when the setting is
+explicit **and** the governor did not set it — roughly: there is no `actuator_state` row
+for the relation, or its `baseline_explicit` is true.
+
+**Recommendation.** In `plan()`, cross-check `sf_user_set` against `actuator_state` so the
+governor recognizes its own prior actuations and only treats a setting as user-owned when
+the baseline shows it pre-existed (or no governor baseline exists). Add a regression test
+asserting that a relation the governor itself set is *not* classified `suppressed:user_owned`
+on the following cycle, and that a post-touch human change *is* protected when
+`manage_user_owned = false`.
+
+**Relationship to the checklists.** Distinct from the Security-checklist "Ownership guard"
+item above, which asks whether `apply()` can be reached directly to *bypass* the guard.
+COR-001 is a correctness defect in the guard's own logic in `plan()`: the guard misfires
+even when reached normally.
 
 ## Traceability (seed)
 
