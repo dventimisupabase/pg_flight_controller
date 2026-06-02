@@ -75,10 +75,13 @@ example
 
 ## Testing
 
+We practice **Test-Driven Development (TDD)**: write the failing test first, run it and watch it fail for the right reason, then write the code that makes it pass. Add a regression test with every bug fix.
+
 Run tests with:
 
 ```bash
-./test.sh
+./test.sh        # all supported versions (15 16 17 18)
+./test.sh 17     # a single version (fast dev loop)
 ```
 
 Tests are distributed across extension subdirectories:

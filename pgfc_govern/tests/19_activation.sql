@@ -10,7 +10,7 @@
 --      changed the value to the proposal between observe and apply.
 -- Plus: activation is now a supported state, not "experimental" — validate_parameters() says so.
 BEGIN;
-SELECT plan(9);
+SELECT plan(10);
 
 -- ── live path: the flag flip actuates under the full F1–F6 safety net ───────────────
 CREATE TABLE public.act_t (id int);
@@ -33,6 +33,24 @@ SELECT is(pgfc_observe.effective_reloption(
 SELECT is((SELECT count(*) FROM pgfc_govern.action_history
             WHERE relid = 'public.act_t'::regclass AND status = 'applied'),
           1::bigint, 'live: an applied action_history row was recorded');
+
+-- COR-001 (#66): the ownership guard end-to-end, through the real cross-cycle round-trip.
+-- plan() reads reloptions from the observed snapshot, not the live catalog, so the bug
+-- only bites a CYCLE LATER: actuate now (real ALTER TABLE above), then a fresh observe
+-- captures the governor-set reloption into a new snapshot, and the next plan() would —
+-- pre-fix — suppress the governor's OWN prior change as if a human had made it, degrading
+-- active control to one touch per relation. The fix recognizes it via actuator_state
+-- (current_value equals what the catalog now reads back), so the decision must NOT be
+-- suppressed:user_owned. (cur == target after the actuation, so the right decision is hold.)
+SELECT pgfc_govern.observe_tick();   -- new snapshot now captures act_t's governor-set reloption
+UPDATE pgfc_govern.relation_class SET kind = 'queue' WHERE relid = 'public.act_t'::regclass;
+SELECT pgfc_govern.plan(
+    (SELECT max(tick_id) FROM pgfc_govern.tick_log),
+    (SELECT max(snapshot_id) FROM pgfc_govern.relation_estimate));
+SELECT isnt((SELECT decision FROM pgfc_govern.decision_log
+              WHERE relid = 'public.act_t'::regclass ORDER BY decision_id DESC LIMIT 1),
+            'suppressed:user_owned',
+            'live round-trip: the governor does not suppress its OWN prior actuation (COR-001 #66)');
 
 -- ── apply() stale-window downgrade (recorded hazard, earmarked "add it when apply() goes live") ──
 -- plan() proposes an adjust; before apply runs, a human sets the live reloption to exactly
