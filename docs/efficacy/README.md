@@ -5,6 +5,9 @@ A work stream that asks whether pg_flight_controller solves a **real problem** a
 not for correctness but for *utility*. This directory is the system of record for that
 question.
 
+Umbrella tracking issue:
+[#73](https://github.com/dventimisupabase/pg_flight_controller/issues/73).
+
 > **Why this is separate from fortification.** The
 > [fortification](../fortification/README.md) stream asks *"is the system safe and correct
 > as built?"* — that an autonomous actuator does only what it is meant to and fails safe.
