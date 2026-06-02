@@ -122,7 +122,7 @@ Stages 1–6 are the caller (`control_tick()`); stages 7–17 are the actuator
 | ID | Sev | Conf | Evidence | Summary | Status | Link |
 |---|---|---|---|---|---|---|
 | COR-001 | High | Confirmed | `pgfc_govern/install.sql:713`, `:750`, `:694-705` | The ownership guard cannot tell the governor's own prior actuation from a human's setting, so continuous control and "never overwrite a human's setting" are mutually exclusive. | Verified | [#66](https://github.com/dventimisupabase/pg_flight_controller/issues/66) |
-| SEC-001 | Low | Confirmed | `pgfc_govern/install.sql:898-899`, `:997` | SECURITY INVOKER is a sound least-privilege posture (cited safe); residual: the intended cron/role identity is undocumented and no function pins `SET search_path`. | Accepted | [#68](https://github.com/dventimisupabase/pg_flight_controller/issues/68) |
+| SEC-001 | Low | Confirmed | `pgfc_govern/install.sql:898-899`, `:997` | SECURITY INVOKER is a sound least-privilege posture (cited safe); residual: the intended cron/role identity is undocumented and no function pins `SET search_path`. | Verified | [#68](https://github.com/dventimisupabase/pg_flight_controller/issues/68) |
 | SEC-002 | Low | Confirmed | `pgfc_govern/install.sql:997` | `apply()` interpolates `v_prop` into the `ALTER TABLE` with `%s` (not cast/validated); safe today because the value is a computed numeric, un-hardened against a crafted `decision_log` row. | Verified | [#69](https://github.com/dventimisupabase/pg_flight_controller/issues/69) |
 | COR-002 | Low | Confirmed | `pgfc_govern/install.sql:935-938`, `:1084` | The authority gate reads the last-written `governor_state` singleton, so a direct out-of-cycle `apply()` would act on stale health state. Likely by-design (`control_tick` is the sole sanctioned caller). | Triaged | — |
 
@@ -216,7 +216,10 @@ protected under `manage_user_owned = false`.
 
 ### SEC-001 — Privilege model undocumented; functions do not pin `SET search_path`
 
-**Severity:** Low · **Confidence:** Confirmed · **Status:** Accepted
+**Severity:** Low · **Confidence:** Confirmed · **Status:** Verified (fixed in [#68](https://github.com/dventimisupabase/pg_flight_controller/issues/68))
+
+> The "Cited safe" grep below describes the **reviewed baseline** (v0.1.0); see the
+> Resolution at the end of this finding for what changed.
 
 Dispositions the Security-checklist items **Privilege model**, **`SECURITY DEFINER`
 exposure**, and **`search_path` safety** — most as *cited-safe*, with a Low residual.
@@ -249,6 +252,23 @@ configuration — so a hostile `search_path` does not hijack them as built.
 **Recommendation.** Document the intended cron/role identity and least privilege in the RFC
 and operating guide; add `SET search_path` to the control-path functions as defense-in-depth
 ahead of any future `SECURITY DEFINER` posture.
+
+**Resolution.** Both residuals closed in [#68](https://github.com/dventimisupabase/pg_flight_controller/issues/68).
+(1) The operating guide now documents the execution identity and least privilege — the cron
+role needs `USAGE`/`EXECUTE` on both schemas, write access to their tables, and (for active
+control only) `ALTER` on the governed tables, since `apply()` is `SECURITY INVOKER` and
+mutates with the caller's own rights; the guide states why `SECURITY INVOKER` is preferred
+over a confined `SECURITY DEFINER` (revoking the role's `ALTER` instantly and verifiably
+disables actuation). (2) Every **plpgsql** function in both extensions now pins an explicit
+`SET search_path` (`pgfc_govern, pgfc_observe, pg_catalog` for govern; `pgfc_observe,
+pg_catalog` for observe). Scope note: SQL-language functions are deliberately left unpinned —
+a `SET` clause blocks planner inlining, and the hot helpers (`effective_reloption`,
+`snap_sf`) back the incident-analysis views; plpgsql is never inlined, so pinning it is
+perf-neutral. This is broader than the finding's literal "control-path functions" so the
+invariant is CI-enforceable. Regression test `pgfc_govern/tests/22_search_path.sql` asserts
+no plpgsql function in either schema leaves `search_path` mutable, and drives a full
+`observe_tick → control_tick → apply` cycle under an **empty** caller `search_path` to prove
+the path resolves its own objects regardless of the caller.
 
 ### SEC-002 — `apply()` interpolates `v_prop` into the `ALTER TABLE` without a cast
 
