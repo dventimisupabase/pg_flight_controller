@@ -106,7 +106,9 @@ COMMENT ON TABLE pgfc_govern.policy_history IS
   'Append-only audit of policy changes (insert/update/delete); retained indefinitely. [subsystem:G2]';
 
 CREATE OR REPLACE FUNCTION pgfc_govern._log_policy_change()
-RETURNS trigger LANGUAGE plpgsql AS $fn$
+RETURNS trigger LANGUAGE plpgsql
+    SET search_path = pgfc_govern, pgfc_observe, pg_catalog
+AS $fn$
 BEGIN
     INSERT INTO pgfc_govern.policy_history (policy_name, operation, old_row, new_row)
     VALUES (coalesce(NEW.policy_name, OLD.policy_name),
@@ -337,7 +339,9 @@ COMMENT ON FUNCTION pgfc_govern.ewma(double precision, double precision, double 
 -- the column's native type. A CI "registry up to date" gate (P3) will then make it
 -- impossible for a control literal to exist outside the registry.
 CREATE OR REPLACE FUNCTION pgfc_govern._param(p_name text)
-RETURNS text IMMUTABLE LANGUAGE plpgsql AS $fn$
+RETURNS text IMMUTABLE LANGUAGE plpgsql
+    SET search_path = pgfc_govern, pgfc_observe, pg_catalog
+AS $fn$
 DECLARE v text;
 BEGIN
     SELECT default_value INTO v FROM pgfc_govern._parameter_registry()
@@ -352,7 +356,9 @@ COMMENT ON FUNCTION pgfc_govern._param(text) IS
   'Read a governed parameter''s value from the registry (Phase 1.6 P2); the control logic single-sources its constants through this. [subsystem:G3]';
 
 CREATE OR REPLACE FUNCTION pgfc_govern._sf_grid()
-RETURNS double precision[] IMMUTABLE LANGUAGE plpgsql AS $fn$
+RETURNS double precision[] IMMUTABLE LANGUAGE plpgsql
+    SET search_path = pgfc_govern, pgfc_observe, pg_catalog
+AS $fn$
 BEGIN
     RETURN pgfc_govern._param('sf_grid')::double precision[];
 END
@@ -361,7 +367,9 @@ COMMENT ON FUNCTION pgfc_govern._sf_grid() IS
   'Scale-factor quantization grid, read from the registry (Phase 1.6 P2). [subsystem:G1]';
 
 CREATE OR REPLACE FUNCTION pgfc_govern._class_target(p_kind text)
-RETURNS double precision IMMUTABLE LANGUAGE plpgsql AS $fn$
+RETURNS double precision IMMUTABLE LANGUAGE plpgsql
+    SET search_path = pgfc_govern, pgfc_observe, pg_catalog
+AS $fn$
 BEGIN
     RETURN pgfc_govern._param('target_' || p_kind)::double precision;
 END
@@ -373,7 +381,9 @@ COMMENT ON FUNCTION pgfc_govern._class_target(text) IS
 -- indicators from pgfc_observe.maintenance_debt (no re-derivation of thresholds) and
 -- raw samples only for cross-snapshot deltas. Returns rows written.
 CREATE OR REPLACE FUNCTION pgfc_govern.estimate(p_snapshot_id bigint)
-RETURNS integer LANGUAGE plpgsql AS $fn$
+RETURNS integer LANGUAGE plpgsql
+    SET search_path = pgfc_govern, pgfc_observe, pg_catalog
+AS $fn$
 DECLARE
     v_tau     double precision := pgfc_govern._param('ewma_tau')::double precision;   -- rate EWMA time constant (s)
     v_effa    double precision := pgfc_govern._param('ewma_effa')::double precision;  -- effectiveness/peak EWMA weight
@@ -547,7 +557,9 @@ COMMENT ON FUNCTION pgfc_govern.estimate(bigint) IS
 -- classify(): assign each relation a workload class (with a signal floor + hysteresis)
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE OR REPLACE FUNCTION pgfc_govern.classify(p_snapshot_id bigint)
-RETURNS integer LANGUAGE plpgsql AS $fn$
+RETURNS integer LANGUAGE plpgsql
+    SET search_path = pgfc_govern, pgfc_observe, pg_catalog
+AS $fn$
 DECLARE
     v_floor bigint  := pgfc_govern._param('classify_floor')::bigint;  -- min recent writes before classifying on fractions
     v_large real    := pgfc_govern._param('classify_large')::real;    -- reltuples above which an idle relation is 'archive'
@@ -674,7 +686,9 @@ COMMENT ON FUNCTION pgfc_govern.snap_sf(double precision) IS
   'Snap a scale factor to the nearest value on the bounded quantization grid (_sf_grid). [subsystem:G1]';
 
 CREATE OR REPLACE FUNCTION pgfc_govern.plan(p_tick_id bigint, p_snapshot_id bigint)
-RETURNS integer LANGUAGE plpgsql AS $fn$
+RETURNS integer LANGUAGE plpgsql
+    SET search_path = pgfc_govern, pgfc_observe, pg_catalog
+AS $fn$
 DECLARE
     v_sf_min     double precision := pgfc_govern._param('sf_min')::double precision;
     v_sf_max     double precision := pgfc_govern._param('sf_max')::double precision;
@@ -852,7 +866,9 @@ COMMENT ON FUNCTION pgfc_govern._findings(bigint) IS
 -- resolve open findings whose condition has cleared. Keeps active_diagnostics from
 -- filling with one duplicate row per control cycle.
 CREATE OR REPLACE FUNCTION pgfc_govern._reconcile_diagnostics(p_snapshot_id bigint)
-RETURNS void LANGUAGE plpgsql AS $fn$
+RETURNS void LANGUAGE plpgsql
+    SET search_path = pgfc_govern, pgfc_observe, pg_catalog
+AS $fn$
 BEGIN
     -- open new findings (dedup against unresolved ones)
     INSERT INTO pgfc_govern.diagnostics (relid, severity, inhibitor_class, evidence, recommendation)
@@ -919,7 +935,9 @@ COMMENT ON FUNCTION pgfc_govern._failure_class(text) IS
   'Failure taxonomy (Phase 1.7 F6): map a recorded failure_reason to its appendix-F category (observation/decision/actuation/resource/safety). Single source of the mapping; apply() stamps action_history.failure_class through it. IMMUTABLE pure lookup; NULL for an unknown reason. [subsystem:G4]';
 
 CREATE OR REPLACE FUNCTION pgfc_govern.apply(p_tick_id bigint, p_relid oid)
-RETURNS boolean LANGUAGE plpgsql AS $fn$
+RETURNS boolean LANGUAGE plpgsql
+    SET search_path = pgfc_govern, pgfc_observe, pg_catalog
+AS $fn$
 DECLARE
     v_act   text := 'autovacuum_vacuum_scale_factor';
     v_dec   text;
@@ -1107,7 +1125,9 @@ COMMENT ON FUNCTION pgfc_govern.verify(bigint) IS
 
 -- Fast loop (~1 min): observe + classify + estimate. Never actuates.
 CREATE OR REPLACE FUNCTION pgfc_govern.observe_tick()
-RETURNS bigint LANGUAGE plpgsql AS $fn$
+RETURNS bigint LANGUAGE plpgsql
+    SET search_path = pgfc_govern, pgfc_observe, pg_catalog
+AS $fn$
 DECLARE v_snap bigint;
 BEGIN
     v_snap := pgfc_observe.observe();
@@ -1121,7 +1141,9 @@ COMMENT ON FUNCTION pgfc_govern.observe_tick() IS
 
 -- Control loop (~5 min): plan + (apply, only if not advisory_only) + verify.
 CREATE OR REPLACE FUNCTION pgfc_govern.control_tick()
-RETURNS bigint LANGUAGE plpgsql AS $fn$
+RETURNS bigint LANGUAGE plpgsql
+    SET search_path = pgfc_govern, pgfc_observe, pg_catalog
+AS $fn$
 DECLARE
     v_tick bigint; v_snap bigint; v_adv boolean; v_applied integer := 0; r record;
 BEGIN
@@ -1254,7 +1276,9 @@ CREATE OR REPLACE FUNCTION pgfc_govern.retain(
     keep_diagnostics interval DEFAULT '365 days',
     keep_transitions interval DEFAULT '180 days')
 RETURNS TABLE(relation text, deleted bigint)
-LANGUAGE plpgsql AS $fn$
+LANGUAGE plpgsql
+    SET search_path = pgfc_govern, pgfc_observe, pg_catalog
+AS $fn$
 BEGIN
     -- 1. Actions first (child of decision_log).
     RETURN QUERY
@@ -1385,7 +1409,9 @@ CREATE OR REPLACE FUNCTION pgfc_govern.degrade(
     keep_diagnostics   interval DEFAULT '30 days',
     keep_actions       interval DEFAULT '30 days')
 RETURNS TABLE(step integer, level text, action text, bytes_after bigint)
-LANGUAGE plpgsql AS $fn$
+LANGUAGE plpgsql
+    SET search_path = pgfc_govern, pgfc_observe, pg_catalog
+AS $fn$
 DECLARE
     v_budget bigint := COALESCE(p_budget_bytes,
                                 (SELECT budget_bytes FROM pgfc_govern.storage_config));
@@ -1923,7 +1949,9 @@ COMMENT ON FUNCTION pgfc_govern._oscillating_relations() IS
 -- the saturation reconciler, which is scoped NOT to touch this class. No magic numbers (the
 -- window comes through _param), so it stays clean under the drift gate that scans it.
 CREATE OR REPLACE FUNCTION pgfc_govern._reconcile_oscillation()
-RETURNS void LANGUAGE plpgsql AS $fn$
+RETURNS void LANGUAGE plpgsql
+    SET search_path = pgfc_govern, pgfc_observe, pg_catalog
+AS $fn$
 BEGIN
     INSERT INTO pgfc_govern.diagnostics (relid, severity, inhibitor_class, evidence, recommendation)
     SELECT o.relid, 'critical', 'control_oscillation',
@@ -2106,7 +2134,9 @@ COMMENT ON VIEW pgfc_govern.failure_taxonomy IS
 -- is operator-forced only (F3).
 CREATE OR REPLACE FUNCTION pgfc_govern.evaluate_health()
 RETURNS pgfc_govern.governor_health_state
-LANGUAGE plpgsql AS $fn$
+LANGUAGE plpgsql
+    SET search_path = pgfc_govern, pgfc_observe, pg_catalog
+AS $fn$
 DECLARE
     m          record;
     v_lag      numeric;
@@ -2248,7 +2278,9 @@ CREATE OR REPLACE FUNCTION pgfc_govern.force_state(
     p_state  pgfc_govern.governor_health_state,
     p_reason text)
 RETURNS pgfc_govern.governor_health_state
-LANGUAGE plpgsql AS $fn$
+LANGUAGE plpgsql
+    SET search_path = pgfc_govern, pgfc_observe, pg_catalog
+AS $fn$
 BEGIN
     IF p_state = 'normal' THEN
         RAISE EXCEPTION 'cannot force the normal state (a force only adds caution); use clear_forced_state() to release a hold';
@@ -2268,7 +2300,9 @@ COMMENT ON FUNCTION pgfc_govern.force_state(pgfc_govern.governor_health_state, t
 -- Idempotent — clearing when no hold is set is a no-op that simply re-evaluates.
 CREATE OR REPLACE FUNCTION pgfc_govern.clear_forced_state(p_reason text DEFAULT NULL)
 RETURNS pgfc_govern.governor_health_state
-LANGUAGE plpgsql AS $fn$
+LANGUAGE plpgsql
+    SET search_path = pgfc_govern, pgfc_observe, pg_catalog
+AS $fn$
 BEGIN
     UPDATE pgfc_govern.governor_state
        SET operator_forced = NULL,

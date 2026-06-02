@@ -850,7 +850,10 @@ Recorded against the
   *([detail](../fortification/01-security-correctness-apply.md#cor-001--the-ownership-guard-conflates-set-by-the-governor-with-set-by-a-user).)*
 - **SEC-001 / SEC-002 / COR-002** — defense-in-depth dispositions of the `apply()` path
   (privilege/role model + `search_path`, the `v_prop` interpolation, the authority gate's
-  state freshness); all Low under the `SECURITY INVOKER` trust model. *(See the
+  state freshness); all Low under the `SECURITY INVOKER` trust model. SEC-001 and SEC-002 are
+  fixed: the cron role/privilege model is documented in the operating guide ("Which role runs
+  the loop"), every plpgsql function pins an explicit `search_path`, and `apply()` validates
+  its proposed value before the `ALTER TABLE`. *(See the
   [Phase 1 findings](../fortification/01-security-correctness-apply.md#findings).)*
 
 ## 8. How this RFC is maintained

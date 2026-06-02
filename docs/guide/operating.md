@@ -344,6 +344,38 @@ UPDATE pgfc_observe.collection_policy
 The filters apply at collection, so rollups and the `pgfc_govern` views inherit the
 filtered set automatically.
 
+### Which role runs the loop
+
+`pg_cron` executes each job as the role that owns it (by default, whoever called
+`cron.schedule`). The loop is not pure DML — it maintains its own storage with DDL:
+`observe_tick()` runs `CREATE TABLE … PARTITION OF` for each new day, `retain()` runs
+`TRUNCATE`, and `drop_empty_partitions()` runs `DROP TABLE`. Those need *ownership* of the
+partitioned telemetry tables, not table grants.
+
+- **Simplest (recommended): own the extension objects.** Run the cron jobs as the role that
+  installed the extensions — it owns the `pgfc_observe`/`pgfc_govern` tables, so the partition
+  DDL, all reads/writes, and `EXECUTE` on the functions are covered with no extra grants.
+- **A more confined role** must additionally be granted `USAGE` on both schemas, `EXECUTE` on
+  their functions, read/write (`SELECT`/`INSERT`/`UPDATE`) on their tables, **and ownership of
+  the partitioned parent tables plus `TRUNCATE`** (for the `CREATE PARTITION OF` / `TRUNCATE` /
+  `DROP` above) — otherwise the first partition roll or nightly `retain()` fails.
+- For **active control** (`advisory_only = false`), the role additionally needs the right to
+  run the `ALTER TABLE` that `apply()` issues — i.e. ownership of, or membership in the owning
+  role of, each governed table.
+
+`apply()` is `SECURITY INVOKER` by design: it mutates the catalog with the **caller's** own
+rights, so it can never confer authority a direct `ALTER TABLE` would not. The practical
+payoff is verifiable least privilege — revoke the cron role's `ALTER` on a table (`\dp`) and
+the governor instantly and completely loses the ability to change it. (A `SECURITY DEFINER`
+actuator would invert this, acting with the definer's rights regardless of the caller; if you
+ever adopt that posture, confine it and keep the pinned `search_path` below.)
+
+Every plpgsql function in both extensions pins an explicit `SET search_path` (`pgfc_govern,
+pgfc_observe, pg_catalog` in `pgfc_govern`; `pgfc_observe, pg_catalog` in `pgfc_observe`), so
+object resolution never depends on the caller's `search_path` — defense-in-depth that also
+forecloses a `search_path` injection surface should any function later become
+`SECURITY DEFINER`.
+
 ## Watch the governor's own footprint
 
 A system that watches the database every minute is a storage liability of its own, so

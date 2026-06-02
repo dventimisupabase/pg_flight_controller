@@ -506,7 +506,9 @@ COMMENT ON FUNCTION pgfc_observe.removability_horizons() IS
 -- makes it race-safe if two observe() runs overlap at a day boundary.
 CREATE OR REPLACE FUNCTION pgfc_observe._ensure_partition(
     p_day integer DEFAULT pgfc_observe._epoch_day(now()))
-RETURNS void LANGUAGE plpgsql AS $fn$
+RETURNS void LANGUAGE plpgsql
+    SET search_path = pgfc_observe, pg_catalog
+AS $fn$
 DECLARE
     v_suffix text := to_char(to_timestamp(p_day * 86400) AT TIME ZONE 'UTC', 'YYYYMMDD');
 BEGIN
@@ -570,7 +572,9 @@ COMMENT ON FUNCTION pgfc_observe._partition_inventory() IS
 -- observe()); this serves the rollup parents, whose keys are days (1m) or months (1h/1d).
 CREATE OR REPLACE FUNCTION pgfc_observe._ensure_part(
     p_parent text, p_key integer, p_span text)
-RETURNS void LANGUAGE plpgsql AS $fn$
+RETURNS void LANGUAGE plpgsql
+    SET search_path = pgfc_observe, pg_catalog
+AS $fn$
 DECLARE
     v_suffix text := CASE p_span
         WHEN 'day'   THEN to_char(to_timestamp(p_key * 86400) AT TIME ZONE 'UTC', 'YYYYMMDD')
@@ -627,7 +631,9 @@ COMMENT ON FUNCTION pgfc_observe._rollup_inventory() IS
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE OR REPLACE FUNCTION pgfc_observe.observe()
 RETURNS bigint   -- the new snapshot_id
-LANGUAGE plpgsql AS $fn$
+LANGUAGE plpgsql
+    SET search_path = pgfc_observe, pg_catalog
+AS $fn$
 DECLARE
     v_snapshot_id bigint;
     v_day         integer := pgfc_observe._epoch_day(now());
@@ -928,7 +934,9 @@ COMMENT ON FUNCTION pgfc_observe.current_relation_state(bigint) IS
 -- each tier's unit so a partial coarse bucket is always recomputed in full.
 CREATE OR REPLACE FUNCTION pgfc_observe.rollup(p_lookback interval DEFAULT '3 days')
 RETURNS bigint   -- total rows upserted across the three tiers
-LANGUAGE plpgsql AS $fn$
+LANGUAGE plpgsql
+    SET search_path = pgfc_observe, pg_catalog
+AS $fn$
 DECLARE
     v_total bigint := 0;
     v_n     bigint;
@@ -1036,7 +1044,9 @@ COMMENT ON FUNCTION pgfc_observe.rollup(interval) IS
 -- source table, bucket unit, and partition-key function.
 CREATE OR REPLACE FUNCTION pgfc_observe._rollup_coarsen(
     p_dst text, p_src text, p_unit text, p_lookback interval)
-RETURNS bigint LANGUAGE plpgsql AS $fn$
+RETURNS bigint LANGUAGE plpgsql
+    SET search_path = pgfc_observe, pg_catalog
+AS $fn$
 DECLARE
     v_n bigint;
 BEGIN
@@ -1131,7 +1141,9 @@ RETURNS TABLE (
     max_vacuum_count bigint, max_autovacuum_count bigint,
     max_analyze_count bigint, max_autoanalyze_count bigint,
     avg_total_size_bytes double precision, max_total_size_bytes bigint)
-LANGUAGE plpgsql STABLE AS $fn$
+LANGUAGE plpgsql STABLE
+    SET search_path = pgfc_observe, pg_catalog
+AS $fn$
 DECLARE
     v_tbl text := CASE p_tier WHEN '1m' THEN 'rollup_1m'
                               WHEN '1h' THEN 'rollup_1h'
@@ -1356,7 +1368,9 @@ COMMENT ON FUNCTION pgfc_observe._parameter_registry() IS
 -- already-empty shell is skipped, so the count reflects partitions that held data.
 CREATE OR REPLACE FUNCTION pgfc_observe.retain(keep interval DEFAULT '3 days')
 RETURNS bigint   -- number of partitions truncated (that had data)
-LANGUAGE plpgsql AS $fn$
+LANGUAGE plpgsql
+    SET search_path = pgfc_observe, pg_catalog
+AS $fn$
 DECLARE
     v_cutoff integer := pgfc_observe._epoch_day(now() - keep);
     v_count  bigint := 0;
@@ -1382,7 +1396,9 @@ COMMENT ON FUNCTION pgfc_observe.retain(interval) IS
 -- destroys live data — a not-yet-truncated old partition is left for retain()).
 CREATE OR REPLACE FUNCTION pgfc_observe.drop_empty_partitions(keep interval DEFAULT '30 days')
 RETURNS bigint   -- number of empty partitions dropped
-LANGUAGE plpgsql AS $fn$
+LANGUAGE plpgsql
+    SET search_path = pgfc_observe, pg_catalog
+AS $fn$
 DECLARE
     v_cutoff integer := pgfc_observe._epoch_day(now() - keep);
     v_count  bigint := 0;
@@ -1416,7 +1432,9 @@ CREATE OR REPLACE FUNCTION pgfc_observe.rollup_retain(
     keep_1h interval DEFAULT '90 days',
     keep_1d interval DEFAULT '365 days')
 RETURNS bigint   -- number of rollup partitions dropped
-LANGUAGE plpgsql AS $fn$
+LANGUAGE plpgsql
+    SET search_path = pgfc_observe, pg_catalog
+AS $fn$
 DECLARE
     v_count bigint := 0;
     r       record;
