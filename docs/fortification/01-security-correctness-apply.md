@@ -121,7 +121,7 @@ Stages 1–6 are the caller (`control_tick()`); stages 7–17 are the actuator
 
 | ID | Sev | Conf | Evidence | Summary | Status | Link |
 |---|---|---|---|---|---|---|
-| COR-001 | High | Confirmed | `pgfc_govern/install.sql:713`, `:750`, `:694-705` | The ownership guard cannot tell the governor's own prior actuation from a human's setting, so continuous control and "never overwrite a human's setting" are mutually exclusive. | Accepted | [#66](https://github.com/dventimisupabase/pg_flight_controller/issues/66) |
+| COR-001 | High | Confirmed | `pgfc_govern/install.sql:713`, `:750`, `:694-705` | The ownership guard cannot tell the governor's own prior actuation from a human's setting, so continuous control and "never overwrite a human's setting" are mutually exclusive. | Verified | [#66](https://github.com/dventimisupabase/pg_flight_controller/issues/66) |
 | SEC-001 | Low | Confirmed | `pgfc_govern/install.sql:898-899`, `:997` | SECURITY INVOKER is a sound least-privilege posture (cited safe); residual: the intended cron/role identity is undocumented and no function pins `SET search_path`. | Accepted | [#68](https://github.com/dventimisupabase/pg_flight_controller/issues/68) |
 | SEC-002 | Low | Confirmed | `pgfc_govern/install.sql:997` | `apply()` interpolates `v_prop` into the `ALTER TABLE` with `%s` (not cast/validated); safe today because the value is a computed numeric, un-hardened against a crafted `decision_log` row. | Accepted | [#69](https://github.com/dventimisupabase/pg_flight_controller/issues/69) |
 | COR-002 | Low | Confirmed | `pgfc_govern/install.sql:935-938`, `:1084` | The authority gate reads the last-written `governor_state` singleton, so a direct out-of-cycle `apply()` would act on stale health state. Likely by-design (`control_tick` is the sole sanctioned caller). | Triaged | — |
@@ -130,7 +130,7 @@ Stages 1–6 are the caller (`control_tick()`); stages 7–17 are the actuator
 
 ### COR-001 — The ownership guard conflates "set by the governor" with "set by a user"
 
-**Severity:** High · **Confidence:** Confirmed · **Status:** Accepted
+**Severity:** High · **Confidence:** Confirmed · **Status:** Verified (fixed in [#66](https://github.com/dventimisupabase/pg_flight_controller/issues/66))
 
 **What the system promises.** RFC §2.4 lists "an ownership guard — never overwrite a
 human's or another system's setting" as one of the gates that keep actuation safe, and the
@@ -203,6 +203,16 @@ on the following cycle, and that a post-touch human change *is* protected when
 item above, which asks whether `apply()` can be reached directly to *bypass* the guard.
 COR-001 is a correctness defect in the guard's own logic in `plan()`: the guard misfires
 even when reached normally.
+
+**Resolution.** `plan()` now `LEFT JOIN`s `actuator_state` and derives `sf_user_set` as
+"an explicit setting the governor is not responsible for." The governor owns the live value
+only when it has a baseline row, *introduced* the option (`baseline_explicit = false`, i.e.
+not user-set-first), **and** the live value still equals what it last set
+(`current_value`) — so it recognizes its own prior actuation (continuous control restored)
+while still protecting both a pre-existing user setting and a human `ALTER TABLE` made after
+first touch. Regression tests in `pgfc_govern/tests/04_plan.sql`: a governor-set relation is
+*not* `suppressed:user_owned` on the following cycle, and a post-touch human change *is*
+protected under `manage_user_owned = false`.
 
 ### SEC-001 — Privilege model undocumented; functions do not pin `SET search_path`
 

@@ -697,11 +697,19 @@ BEGIN
                sn.def_vac_scale_factor, sn.def_vac_threshold,
                sn.oldest_xmin_owner, sn.oldest_xmin_owner_detail,
                re.saturation_cause, re.freeze_debt, re.mxid_freeze_debt,
-               re.vacuum_debt_ratio, re.effectiveness
+               re.vacuum_debt_ratio, re.effectiveness,
+               -- COR-001 (#66): the governor's own actuation history for this relation, so
+               -- the ownership guard below can tell its own prior change from a human's.
+               -- baseline_explicit IS NULL means "no governor row" (never touched).
+               ast.baseline_explicit AS ast_baseline_explicit,
+               ast.current_value     AS ast_current_value
         FROM pgfc_govern.relation_class rc
         JOIN pgfc_govern.relation_estimate re ON re.relid = rc.relid
         JOIN pgfc_observe.current_relation_state(p_snapshot_id) rs ON rs.relid = rc.relid
         JOIN pgfc_observe.snapshots sn ON sn.snapshot_id = p_snapshot_id
+        LEFT JOIN pgfc_govern.actuator_state ast
+               ON ast.relid = rc.relid
+              AND ast.actuator = 'autovacuum_vacuum_scale_factor'
     ),
     tgt AS (
         SELECT *,
@@ -710,8 +718,23 @@ BEGIN
                      def_vac_scale_factor) AS cur_sf,
             COALESCE(pgfc_observe.effective_reloption(reloptions,'autovacuum_vacuum_threshold')::bigint,
                      def_vac_threshold)    AS cur_base,
-            (pgfc_observe.effective_reloption(reloptions,'autovacuum_vacuum_scale_factor') IS NOT NULL)
-                                           AS sf_user_set,
+            -- COR-001 (#66): "user-owned" means an explicit setting the GOVERNOR is not
+            -- responsible for -- the column comment's "set by a user/other system first".
+            -- A bare "an explicit value exists now" test conflates the governor's own prior
+            -- actuation with a human's, freezing active control to one touch per relation.
+            -- The governor owns the live value only when it has a baseline row, it
+            -- INTRODUCED the option (baseline_explicit = false, not user-set-first), and the
+            -- live value still equals what it last set (no human ALTER since). Comparison is
+            -- text IS NOT DISTINCT FROM, matching apply()'s no-op arbiter.
+            (
+                pgfc_observe.effective_reloption(reloptions,'autovacuum_vacuum_scale_factor') IS NOT NULL
+                AND NOT (
+                    ast_baseline_explicit IS NOT NULL          -- governor has touched it
+                    AND NOT ast_baseline_explicit              -- and introduced the option (not user-first)
+                    AND pgfc_observe.effective_reloption(reloptions,'autovacuum_vacuum_scale_factor')
+                        IS NOT DISTINCT FROM ast_current_value -- and no human changed it since
+                )
+            )                              AS sf_user_set,
             (freeze_debt > v_freeze_thr OR COALESCE(mxid_freeze_debt,0) > v_freeze_thr)
                                            AS freeze_stress,
             (oldest_xmin_owner IS NOT NULL AND oldest_xmin_owner <> 'none')
