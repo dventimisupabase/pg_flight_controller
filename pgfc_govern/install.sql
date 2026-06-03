@@ -1368,6 +1368,10 @@ LANGUAGE plpgsql
     SET search_path = pgfc_govern, pgfc_observe, pg_catalog
 AS $fn$
 BEGIN
+    -- FMEA-002 (daily-job follow-up): idle on a read-only standby — these are all DELETEs, so a
+    -- nightly prune on a replica would error; no-op (return no rows) instead, resuming on promotion.
+    IF pgfc_observe._is_standby() THEN RETURN; END IF;
+
     -- 1. Actions first (child of decision_log).
     RETURN QUERY
     WITH d AS (DELETE FROM pgfc_govern.action_history
@@ -1516,6 +1520,10 @@ DECLARE
     v_step   integer := 0;
     v_far    interval := '1000 years';   -- "do not touch this tier" sentinel window
 BEGIN
+    -- FMEA-002 (daily-job follow-up): idle on a read-only standby — degrade() prunes (writes), so
+    -- on a replica it would error once over budget; no-op (return no rows), resume on promotion.
+    IF pgfc_observe._is_standby() THEN RETURN; END IF;
+
     -- No cap configured: nothing to enforce. Return no rows (a clean no-op).
     IF v_budget IS NULL THEN
         RETURN;
