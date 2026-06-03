@@ -1160,6 +1160,10 @@ RETURNS bigint LANGUAGE plpgsql
 AS $fn$
 DECLARE v_snap bigint;
 BEGIN
+    -- FMEA-002: idle on a read-only standby (resumes on promotion). First statement, before any
+    -- write. observe() guards too, but classify/estimate/evaluate_health write govern tables.
+    IF pgfc_observe._is_standby() THEN RETURN NULL; END IF;
+
     v_snap := pgfc_observe.observe();
     PERFORM pgfc_govern.classify(v_snap);
     PERFORM pgfc_govern.estimate(v_snap);
@@ -1189,6 +1193,11 @@ AS $fn$
 DECLARE
     v_tick bigint; v_snap bigint; v_adv boolean; v_applied integer := 0; r record;
 BEGIN
+    -- FMEA-002: idle on a read-only standby (resumes on promotion). First statement, before even
+    -- the advisory lock — a standby must not write tick_log / governor_state. After a failover the
+    -- demoted primary idles here while the promoted node's loops take over.
+    IF pgfc_observe._is_standby() THEN RETURN NULL; END IF;
+
     PERFORM pg_advisory_xact_lock(hashtext('pgfc_govern.control_tick'));  -- no overlap
 
     -- Govern itself before it governs PostgreSQL: refresh the health state from the

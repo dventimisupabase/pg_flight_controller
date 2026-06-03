@@ -10,6 +10,7 @@ From any object: its **home subsystem** is the heading it sits under, and its **
 
 - [`pgfc_observe.collection_policy`](pgfc_observe.md#pgfc_observecollection_policy) — table
 - [`pgfc_observe.relation_last_state`](pgfc_observe.md#pgfc_observerelation_last_state) — table
+- [`pgfc_observe._is_standby`](pgfc_observe.md#pgfc_observe_is_standby--boolean) — function
 - [`pgfc_observe.observe`](pgfc_observe.md#pgfc_observeobserve--bigint) — function
 
 ## [O2. Storage and retention](../rfc/README.md#o2-storage-and-retention)

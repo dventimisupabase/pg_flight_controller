@@ -60,7 +60,7 @@ Modes worked and found to **fail safe** as built (the reassuring half of the ana
 | ID | Sev | Conf | Evidence | Summary | Status | Link |
 |---|---|---|---|---|---|---|
 | FMEA-001 | Medium | Confirmed | `pgfc_observe/install.sql:~509`, `:~1397` | Telemetry uses create/drop daily partitions, churning the system catalogs, where the lineage used a fixed `TRUNCATE` ring (zero churn). | Accepted (adopt the ring) | [#79](https://github.com/dventimisupabase/pg_flight_controller/issues/79) |
-| FMEA-002 | Medium | Confirmed | both `install.sql` (no `pg_is_in_recovery`) | No standby guard: the loops error every tick on a read-only replica; fail-safe but noisy and a post-failover footgun. | Accepted | [#80](https://github.com/dventimisupabase/pg_flight_controller/issues/80) |
+| FMEA-002 | Medium | Confirmed | both `install.sql` (no `pg_is_in_recovery`) | No standby guard: the loops error every tick on a read-only replica; fail-safe but noisy and a post-failover footgun. | Verified | [#80](https://github.com/dventimisupabase/pg_flight_controller/issues/80) |
 | FMEA-003 | Medium | Confirmed | `pgfc_govern/install.sql:2025`, `:1171`, `:1143-1191` | Control-loop errors are invisible: `tick_log.error` is never written and a hard error rolls the tick row back, so the tick-error breaker is structurally dead and a wedged `control_tick` keeps the governor `normal`. | Verified | [#84](https://github.com/dventimisupabase/pg_flight_controller/issues/84) |
 | FMEA-004 | Medium | Confirmed | `pgfc_observe/install.sql` (`retain`/`drop_empty_partitions`/`_ensure_partition`, no `lock_timeout`) | Storage-maintenance DDL took `ACCESS EXCLUSIVE` with no bounded `lock_timeout` — an Invariant-1 gap outside the `apply()` path. | Verified | [#81](https://github.com/dventimisupabase/pg_flight_controller/issues/81) |
 | FMEA-005 | Medium | Confirmed | `pgfc_govern/install.sql:1176-1180`, `:1143-1191` | No per-relation error isolation: one uncaught error in `apply()` aborted the whole cycle (all relations rolled back), deterministically and — per FMEA-003 — invisibly. | Verified | [#82](https://github.com/dventimisupabase/pg_flight_controller/issues/82) |
@@ -103,7 +103,7 @@ principle-and-lineage inconsistency, no safety consequence.
 
 ### FMEA-002 — No standby guard; the loops error every tick on a replica
 
-**Severity:** Medium · **Confidence:** Confirmed · **Status:** Accepted ([#80](https://github.com/dventimisupabase/pg_flight_controller/issues/80))
+**Severity:** Medium · **Confidence:** Confirmed · **Status:** Verified (fixed in [#80](https://github.com/dventimisupabase/pg_flight_controller/issues/80))
 
 Neither extension checks `pg_is_in_recovery()`. `observe_tick()` and `control_tick()` both
 write, so on a read-only standby every cron tick raises `cannot execute … in a read-only
@@ -112,6 +112,38 @@ are continuous, invisible to the governor's own health model (FMEA-003), and a p
 footgun: the demoted old primary errors forever while a promoted standby that carries the
 cron jobs silently begins actuating. **Recovery/recommendation:** an early
 `pg_is_in_recovery()` no-op guard so the loops idle on a standby and resume on promotion.
+
+**Resolution.** A single base-layer seam, `pgfc_observe._is_standby()` (wraps
+`pg_catalog.pg_is_in_recovery()`), is now the **first statement** of `observe()`,
+`observe_tick()`, and `control_tick()`: `IF pgfc_observe._is_standby() THEN RETURN NULL; END
+IF;`. In `observe()` it sits ahead of `_ensure_partition()`'s DDL; in `control_tick()` ahead of
+even the advisory lock — so a standby takes no lock and writes nothing, and the loops resume
+automatically on promotion. The check is single-sourced in `pgfc_observe` (the independent base
+layer) so an observe-only install is covered and `pgfc_govern` reuses it cross-schema — the same
+"small helper, single-sourced" move as FMEA-004's `_maintenance_lock_timeout()`. Scope is the
+three high-frequency loops the finding names; the daily maintenance writers (`retain` /
+`drop_empty_partitions` / `rollup`, `govern.retain`) also error on a standby but only once a day
+— noted as a small follow-up, not folded in here.
+
+**Interaction with the FMEA-003 heartbeat.** On a steady standby both loops no-op, so
+`evaluate_health()` never runs and `control_loop_lag` is never evaluated — no false alarm; a
+never-primary standby has an empty `tick_log` (NULL lag) regardless. The one edge is a
+*demoted-then-repromoted* node: its `control_loop_lag` is stale at promotion, so the first
+post-promotion `observe_tick()` writes an `emergency` transition, then a `normal` one once the
+first control cycle completes (≤ one control cadence later). That `emergency → normal` pair is
+honest and self-healing — a just-promoted node genuinely has not run a cycle yet, and caution is
+the safe direction — not flapping. Recorded here so a reader of `state_transitions` does not
+mistake it for one.
+
+**Testability.** The seam lets a test simulate a standby without a real replica:
+`CREATE OR REPLACE FUNCTION pgfc_observe._is_standby() … SELECT true` inside a rolled-back
+transaction, then assert each loop returns `NULL` and writes nothing (and runs normally with the
+seam at its default). `pgfc_observe/tests/14_standby_guard.sql` and
+`pgfc_govern/tests/26_standby_guard.sql` assert **both** directions in one file — because earlier
+tests in the session have already warmed the loops' plans, the standby direction proves a
+redefinition of the inlined seam propagates through the plan cache, not just that a cold call
+returns the stub. Red pre-fix (no guard → the loops run and return an id). A true in-recovery
+replica is out of unit-test reach; that end-to-end path is Phase-3 / harness coverage.
 
 ### FMEA-003 — Control-loop errors are invisible to the health model
 
@@ -275,7 +307,7 @@ Failure modes attach to the invariants/mechanisms they stress (extends the Phase
 | F1 — self-monitoring metrics | FMEA-003 (`tick_errors_last_day` structurally 0; no control-loop heartbeat) | FMEA-003 **Verified** (#84) — `control_loop_lag` heartbeat, observe↔control mutual watchdog |
 | F2 — health-state machine | worst-of under conflicting signals | Cited-safe |
 | F6 — load shedding | FMEA-007 (lock wait precedes health eval) | Won't-fix |
-| F7 — active-control activation | FMEA-002 (standby), FMEA-005 (poison relation), FMEA-006 (post-snapshot human race) | FMEA-005/006 **Verified** (#82/#83); 002 open |
+| F7 — active-control activation | FMEA-002 (standby), FMEA-005 (poison relation), FMEA-006 (post-snapshot human race) | FMEA-002/005/006 **Verified** (#80/#82/#83) |
 
 ## Exit criteria
 

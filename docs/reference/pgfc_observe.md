@@ -317,6 +317,12 @@ Whole UTC calendar months since 1970-01 — the int4 monthly RANGE partition key
 
 **Subsystem:** O2
 
+### `pgfc_observe._is_standby() → boolean`
+
+True on a read-only standby (wraps pg_is_in_recovery()). The observe/control loops guard on it to idle on a replica and resume on promotion (FMEA-002).
+
+**Subsystem:** O1
+
 ### `pgfc_observe._maintenance_lock_timeout() → text`
 
 Bounded txn-local lock_timeout for the maintenance DDL (FMEA-004, Invariant 1).

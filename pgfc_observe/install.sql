@@ -646,6 +646,19 @@ $fn$;
 COMMENT ON FUNCTION pgfc_observe._rollup_inventory() IS
   'Child partitions of the rollup tables with int key, span, decoded range, est. rows, and size. [subsystem:O2]';
 
+-- FMEA-002: a read-only standby cannot mutate the catalog, so the collection/control loops
+-- (observe() here; observe_tick()/control_tick() in pgfc_govern, cross-schema) guard on this and
+-- idle (no-op) on a replica instead of erroring every cron tick — resuming automatically on
+-- promotion. Single-sourced in this base layer so an observe-only install is covered and govern
+-- reuses it. STABLE, not IMMUTABLE: recovery state ends on promotion. The pg_catalog-qualified
+-- call never depends on the caller's search_path.
+CREATE OR REPLACE FUNCTION pgfc_observe._is_standby()
+RETURNS boolean LANGUAGE sql STABLE AS $$
+    SELECT pg_catalog.pg_is_in_recovery()
+$$;
+COMMENT ON FUNCTION pgfc_observe._is_standby() IS
+  'True on a read-only standby (wraps pg_is_in_recovery()). The observe/control loops guard on it to idle on a replica and resume on promotion (FMEA-002). [subsystem:O1]';
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- observe(): collect one snapshot (header + per-relation samples)
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -659,6 +672,11 @@ DECLARE
     v_day         integer := pgfc_observe._epoch_day(now());
     v_tat_expr    text;   -- total_autovacuum_time: real column on PG18+, else NULL
 BEGIN
+    -- FMEA-002: idle on a read-only standby — the first statement, ahead of _ensure_partition's
+    -- DDL (a standby physically cannot mutate the catalog, so without this every cron tick
+    -- errors). Resumes automatically on promotion.
+    IF pgfc_observe._is_standby() THEN RETURN NULL; END IF;
+
     -- Make sure today's partition exists before either insert (O(1), idempotent).
     PERFORM pgfc_observe._ensure_partition(v_day);
 
