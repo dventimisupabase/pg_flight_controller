@@ -1203,10 +1203,47 @@ BEGIN
     PERFORM pgfc_govern.plan(v_tick, v_snap);
 
     IF NOT v_adv THEN
-        FOR r IN SELECT relid FROM pgfc_govern.decision_log
-                 WHERE tick_id = v_tick AND decision = 'adjust'
+        -- Per-relation error isolation (FMEA-005, #82). apply() catches only
+        -- lock_not_available / insufficient_privilege; ANY other uncaught error (a corrupted
+        -- lock_timeout making set_config throw, a future actuator's DDL error) would otherwise
+        -- abort this whole single-transaction cycle — rolling back EVERY relation's change,
+        -- deterministically every cycle and (FMEA-003) invisibly. Atomicity is the right
+        -- default for a multi-actuator batch, but the per-relation loop must not let one poison
+        -- relation deny actuation to all. Select the columns the failure record needs up front
+        -- (apply()'s own computation is discarded on rollback), then wrap each apply() in its
+        -- own subtransaction.
+        FOR r IN SELECT relid, decision_id, actuator, proposed_value
+                   FROM pgfc_govern.decision_log
+                  WHERE tick_id = v_tick AND decision = 'adjust'
         LOOP
-            IF pgfc_govern.apply(v_tick, r.relid) THEN v_applied := v_applied + 1; END IF;
+            BEGIN
+                IF pgfc_govern.apply(v_tick, r.relid) THEN v_applied := v_applied + 1; END IF;
+            EXCEPTION WHEN others THEN
+                -- The BEGIN block's implicit savepoint has rolled back, undoing the entire
+                -- apply() attempt for THIS relation — including a half-completed one whose inner
+                -- ALTER block already released its own savepoint (so only a savepoint taken
+                -- before the apply() call can unwind the ALTER). We are now back in control_tick's
+                -- transaction with NO savepoint beneath us, so this recording INSERT must never
+                -- itself throw — every value it references is non-throwing: batch_seq nextval,
+                -- the loop row's own decision_log columns (decision_id satisfies the FK, written
+                -- by plan() earlier in this txn and not rolled back), a relname lookup that yields
+                -- NULL if the relation vanished, and a COALESCE-guarded NOT NULL new_value.
+                -- failure_class is stamped 'actuation' DIRECTLY rather than via _failure_class:
+                -- the category is structural — the error arose in the actuation loop — not
+                -- derivable from open-ended error text (SQLSTATE/SQLERRM, recorded as the reason
+                -- so the failure is visible, not the silent denial of FMEA-003). So it surfaces in
+                -- failure_taxonomy's actuation row and feeds the failed-action breaker exactly
+                -- like a lock_timeout: a genuine, repeating actuation failure SHOULD trip it —
+                -- visibly, and self-limiting (the breaker's diagnostic state short-circuits
+                -- apply()'s authority gate before this error path, so it cannot self-amplify).
+                INSERT INTO pgfc_govern.action_history
+                  (batch_id, decision_id, relid, relname, actuator, new_value,
+                   status, failure_reason, failure_class, budget_consumed)
+                VALUES (nextval('pgfc_govern.batch_seq'), r.decision_id, r.relid,
+                        (SELECT relname FROM pg_class WHERE oid = r.relid),
+                        r.actuator, COALESCE(r.proposed_value, '(unknown)'),
+                        'failed', SQLSTATE || ': ' || SQLERRM, 'actuation', false);
+            END;
         END LOOP;
     END IF;
 

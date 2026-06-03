@@ -151,16 +151,18 @@ Stages 1–6 are the caller (`control_tick()`); stages 7–17 are the actuator
       when the live value already equals the proposal — the same code path, covered by
       `19_activation`.
 - [x] **Concurrency.**
-      **Disposition:** cited-safe + **COR-002** + **FMEA-006** (closed). `control_tick` is
+      **Disposition:** cited-safe + **COR-002** + **FMEA-005/006** (closed). `control_tick` is
       serialized against itself by `pg_advisory_xact_lock`; loop-ordering (F7) addresses the
       `observe_tick` race. The no-op re-read catches a human-`ALTER` race **only when the human
       set exactly the proposal**; a human value set after the planning snapshot that *differs*
       from the proposal was originally overwritten that cycle — now closed by **FMEA-006**
       ([#83](https://github.com/dventimisupabase/pg_flight_controller/issues/83)): `apply()`
       re-checks ownership against the live value and refuses unless `manage_user_owned`. The
-      remaining interleavings (direct out-of-cycle `apply()` bypassing the advisory lock, and
-      one poison relation aborting the whole cycle) are **COR-002** and **FMEA-005** — the
-      Phase 2 FMEA surface.
+      remaining interleaving — a direct out-of-cycle `apply()` bypassing the advisory lock — is
+      **COR-002**; one poison relation aborting the whole cycle is now closed by **FMEA-005**
+      ([#82](https://github.com/dventimisupabase/pg_flight_controller/issues/82)): each `apply()`
+      runs in its own subtransaction, so a poison relation's error is isolated and recorded
+      rather than rolling back the cycle.
 - [x] **Idempotency / re-entrancy.**
       **Disposition:** cited-safe, tested. Replaying a decision after success is a no-op (the
       live re-read sees the value already applied); a rapid second `apply()` is blocked by
