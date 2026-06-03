@@ -23,6 +23,7 @@ From any object: its **home subsystem** is the heading it sits under, and its **
 - [`pgfc_observe._ensure_partition`](pgfc_observe.md#pgfc_observe_ensure_partitionp_day-integer--void) — function
 - [`pgfc_observe._epoch_day`](pgfc_observe.md#pgfc_observe_epoch_dayts-timestamp-with-time-zone--integer) — function
 - [`pgfc_observe._epoch_month`](pgfc_observe.md#pgfc_observe_epoch_monthts-timestamp-with-time-zone--integer) — function
+- [`pgfc_observe._maintenance_lock_timeout`](pgfc_observe.md#pgfc_observe_maintenance_lock_timeout--text) — function
 - [`pgfc_observe._month_start`](pgfc_observe.md#pgfc_observe_month_startk-integer--timestamp-with-time-zone) — function
 - [`pgfc_observe._partition_inventory`](pgfc_observe.md#pgfc_observe_partition_inventory--tableparent-text-partition-text-day-integer-range_start-timestamp-with-time-zone-range_end-timestamp-with-time-zone-approx_rows-bigint-size_bytes-bigint) — function
 - [`pgfc_observe._rollup_coarsen`](pgfc_observe.md#pgfc_observe_rollup_coarsenp_dst-text-p_src-text-p_unit-text-p_lookback-interval--bigint) — function

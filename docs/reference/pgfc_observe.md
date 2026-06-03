@@ -317,6 +317,12 @@ Whole UTC calendar months since 1970-01 — the int4 monthly RANGE partition key
 
 **Subsystem:** O2
 
+### `pgfc_observe._maintenance_lock_timeout() → text`
+
+Bounded txn-local lock_timeout for the maintenance DDL (FMEA-004, Invariant 1).
+
+**Subsystem:** O2
+
 ### `pgfc_observe._month_start(k integer) → timestamp with time zone`
 
 UTC instant at the start of epoch-month k (inverse of _epoch_month).

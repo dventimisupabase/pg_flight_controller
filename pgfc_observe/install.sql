@@ -85,6 +85,21 @@ $$;
 COMMENT ON FUNCTION pgfc_observe._telemetry_reloptions() IS
   'Static autovacuum reloptions string applied to every telemetry/rollup partition (S6). [subsystem:O2]';
 
+-- Bounded lock-wait for the maintenance DDL (FMEA-004, Invariant 1 "never wait on locks").
+-- Every recurring maintenance function (partition CREATE / TRUNCATE / DROP, all ACCESS
+-- EXCLUSIVE) sets this txn-local before acquiring the lock, so it can never wait unboundedly
+-- behind a long reader/writer of a telemetry partition; a timeout is a normal skip-and-retry.
+-- Generous next to apply()'s 100ms (pgfc_govern): off-peak partition GC can afford to wait a
+-- couple of seconds for a transient reader of the governor's own tables, whereas user-facing
+-- actuation must never block. Single-sourced here (mirrors _telemetry_reloptions) so observe
+-- stays independent of pgfc_govern's registry.
+CREATE OR REPLACE FUNCTION pgfc_observe._maintenance_lock_timeout()
+RETURNS text IMMUTABLE LANGUAGE sql AS $$
+    SELECT '5s'
+$$;
+COMMENT ON FUNCTION pgfc_observe._maintenance_lock_timeout() IS
+  'Bounded txn-local lock_timeout for the maintenance DDL (FMEA-004, Invariant 1). [subsystem:O2]';
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Destructive recreate  (Phase 1.5 S2 — one-time; see header)
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -512,6 +527,9 @@ AS $fn$
 DECLARE
     v_suffix text := to_char(to_timestamp(p_day * 86400) AT TIME ZONE 'UTC', 'YYYYMMDD');
 BEGIN
+    -- FMEA-004: bound the lock wait (the CREATE PARTITION OF takes ACCESS EXCLUSIVE on the
+    -- parent). A timeout propagates → observe() skips this run and retries next minute.
+    PERFORM set_config('lock_timeout', pgfc_observe._maintenance_lock_timeout(), true);
     BEGIN
         EXECUTE format(
             'CREATE TABLE IF NOT EXISTS pgfc_observe.snapshots_p%s '
@@ -581,6 +599,8 @@ DECLARE
         WHEN 'month' THEN to_char(pgfc_observe._month_start(p_key) AT TIME ZONE 'UTC', 'YYYYMM')
     END;
 BEGIN
+    -- FMEA-004: bound the lock wait (CREATE PARTITION OF takes ACCESS EXCLUSIVE on the parent).
+    PERFORM set_config('lock_timeout', pgfc_observe._maintenance_lock_timeout(), true);
     EXECUTE format(
         'CREATE TABLE IF NOT EXISTS pgfc_observe.%I PARTITION OF pgfc_observe.%I '
         'FOR VALUES FROM (%s) TO (%s) WITH (%s)',
@@ -1377,14 +1397,23 @@ DECLARE
     v_has    boolean;
     r        record;
 BEGIN
+    -- FMEA-004 (Invariant 1): bound the lock wait. The EXISTS probe (AccessShare) and the
+    -- TRUNCATE (ACCESS EXCLUSIVE) both acquire locks, so both sit inside the per-partition
+    -- subtransaction: a partition busy under a long reader/writer is SKIPPED (not counted,
+    -- retried next run) instead of waiting forever or aborting the whole run's truncates.
+    PERFORM set_config('lock_timeout', pgfc_observe._maintenance_lock_timeout(), true);
     FOR r IN SELECT partition, day FROM pgfc_observe._partition_inventory()
              WHERE day < v_cutoff LOOP
-        EXECUTE format('SELECT EXISTS (SELECT 1 FROM pgfc_observe.%I)', r.partition)
-            INTO v_has;
-        IF v_has THEN
-            EXECUTE format('TRUNCATE TABLE pgfc_observe.%I', r.partition);
-            v_count := v_count + 1;
-        END IF;
+        BEGIN
+            EXECUTE format('SELECT EXISTS (SELECT 1 FROM pgfc_observe.%I)', r.partition)
+                INTO v_has;
+            IF v_has THEN
+                EXECUTE format('TRUNCATE TABLE pgfc_observe.%I', r.partition);
+                v_count := v_count + 1;
+            END IF;
+        EXCEPTION WHEN lock_not_available THEN
+            NULL;   -- partition busy; skip, retry next run
+        END;
     END LOOP;
     RETURN v_count;
 END
@@ -1405,14 +1434,21 @@ DECLARE
     v_has    boolean;
     r        record;
 BEGIN
+    -- FMEA-004 (Invariant 1): bound the lock wait; skip a busy partition (EXISTS probe and
+    -- DROP both inside the per-partition subtransaction). See retain() for the rationale.
+    PERFORM set_config('lock_timeout', pgfc_observe._maintenance_lock_timeout(), true);
     FOR r IN SELECT partition, day FROM pgfc_observe._partition_inventory()
              WHERE day < v_cutoff LOOP
-        EXECUTE format('SELECT EXISTS (SELECT 1 FROM pgfc_observe.%I)', r.partition)
-            INTO v_has;
-        IF NOT v_has THEN
-            EXECUTE format('DROP TABLE pgfc_observe.%I', r.partition);
-            v_count := v_count + 1;
-        END IF;
+        BEGIN
+            EXECUTE format('SELECT EXISTS (SELECT 1 FROM pgfc_observe.%I)', r.partition)
+                INTO v_has;
+            IF NOT v_has THEN
+                EXECUTE format('DROP TABLE pgfc_observe.%I', r.partition);
+                v_count := v_count + 1;
+            END IF;
+        EXCEPTION WHEN lock_not_available THEN
+            NULL;   -- partition busy; skip, retry next run
+        END;
     END LOOP;
     RETURN v_count;
 END
@@ -1440,13 +1476,20 @@ DECLARE
     r       record;
     v_keep  interval;
 BEGIN
+    -- FMEA-004 (Invariant 1): bound the lock wait; skip a busy partition (the DROP takes
+    -- ACCESS EXCLUSIVE). The window check is a pure computation, so only the DROP is guarded.
+    PERFORM set_config('lock_timeout', pgfc_observe._maintenance_lock_timeout(), true);
     FOR r IN SELECT parent, partition, range_end FROM pgfc_observe._rollup_inventory() LOOP
         v_keep := CASE r.parent WHEN 'rollup_1m' THEN keep_1m
                                 WHEN 'rollup_1h' THEN keep_1h
                                 WHEN 'rollup_1d' THEN keep_1d END;
         IF r.range_end <= now() - v_keep THEN
-            EXECUTE format('DROP TABLE pgfc_observe.%I', r.partition);
-            v_count := v_count + 1;
+            BEGIN
+                EXECUTE format('DROP TABLE pgfc_observe.%I', r.partition);
+                v_count := v_count + 1;
+            EXCEPTION WHEN lock_not_available THEN
+                NULL;   -- partition busy; skip, retry next run
+            END;
         END IF;
     END LOOP;
     RETURN v_count;
