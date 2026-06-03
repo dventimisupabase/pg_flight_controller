@@ -44,13 +44,14 @@ SELECT is((SELECT category FROM pgfc_observe._parameter_registry()
            WHERE parameter_name = 'telemetry_av_threshold'),
           'implementation_convenience', 'telemetry_av_threshold is categorised as implementation convenience');
 
--- Override semantics: a tunable retention default points at its config home.
+-- Override semantics: the ring's slot count is a FIXED code constant (FMEA-001), not a
+-- runtime override, and names its single-source home.
 SELECT is((SELECT override_allowed FROM pgfc_observe._parameter_registry()
-           WHERE parameter_name = 'retain_raw_days'),
-          true, 'retain_raw_days is operator-overridable');
+           WHERE parameter_name = 'ring_slots'),
+          false, 'ring_slots is a fixed code constant, not operator-overridable');
 SELECT is((SELECT config_ref FROM pgfc_observe._parameter_registry()
-           WHERE parameter_name = 'retain_raw_days'),
-          'retain() argument', 'retain_raw_days names its override home');
+           WHERE parameter_name = 'ring_slots'),
+          '_ring_slots()', 'ring_slots names its single-source home');
 
 SELECT * FROM finish();
 ROLLBACK;

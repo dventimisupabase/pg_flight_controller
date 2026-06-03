@@ -1,48 +1,53 @@
--- Retention is whole-partition rotation (S2): tier-1 retain() TRUNCATEs out-of-window
--- partitions; tier-2 drop_empty_partitions() DROPs the empty shells that remain.
+-- Raw retention is the fixed TRUNCATE-rotated ring (S2 / FMEA-001): rotate_ring() recycles
+-- the slot rolling off — TRUNCATE, never DROP — so out-of-window data is swept while the
+-- in-window days are kept, with ZERO catalog churn. The window is (slots-1) days, and the
+-- boundary is inclusive (the oldest in-window day is retained).
 BEGIN;
-SELECT plan(8);
+SELECT plan(6);
 
-SELECT has_function('pgfc_observe', 'retain', ARRAY['interval'],
-                    'retain(interval) exists');
-SELECT has_function('pgfc_observe', 'drop_empty_partitions', ARRAY['interval'],
-                    'drop_empty_partitions(interval) exists');
+SELECT has_function('pgfc_observe', 'rotate_ring', ARRAY['integer'],
+                    'rotate_ring(interval) exists');
 
--- An out-of-window day (~40d ago) and its partition. Today's partition already exists
--- from install, so the recent rows route there.
-SELECT pgfc_observe._ensure_partition(pgfc_observe._epoch_day(now() - interval '40 days'));
+-- Set up two days in their slots: one rolling OFF (d0-slots, strictly out of the window)
+-- and one at the in-window boundary (d0-(slots-1), which must be KEPT).
+DO $setup$
+DECLARE
+    d0   integer := pgfc_observe._epoch_day(now());
+    n    integer := pgfc_observe._ring_slots();
+    v_id bigint;
+BEGIN
+    -- rolling off: day d0-n lands in slot (d0-n)%n and is older than the (n-1)-day window.
+    INSERT INTO pgfc_observe.snapshots (slot, collected_day, collected_at, server_version_num)
+    VALUES (((d0 - n) % n)::smallint, d0 - n, to_timestamp((d0 - n)::bigint * 86400), 170000)
+    RETURNING snapshot_id INTO v_id;
+    INSERT INTO pgfc_observe.relation_samples (slot, snapshot_id, collected_day, relid, schemaname, relname)
+    VALUES (((d0 - n) % n)::smallint, v_id, d0 - n, 1::oid, 'public', 'stale_t');
+    -- in-window boundary: day d0-(n-1) lands in its slot and must survive the rotation.
+    INSERT INTO pgfc_observe.snapshots (slot, collected_day, collected_at, server_version_num)
+    VALUES (((d0 - (n - 1)) % n)::smallint, d0 - (n - 1),
+            to_timestamp((d0 - (n - 1))::bigint * 86400), 170000)
+    RETURNING snapshot_id INTO v_id;
+    INSERT INTO pgfc_observe.relation_samples (slot, snapshot_id, collected_day, relid, schemaname, relname)
+    VALUES (((d0 - (n - 1)) % n)::smallint, v_id, d0 - (n - 1), 2::oid, 'public', 'fresh_t');
+END
+$setup$;
 
--- One snapshot + sample in the old partition, one in today's.
-INSERT INTO pgfc_observe.snapshots (collected_day, collected_at, server_version_num)
-VALUES (pgfc_observe._epoch_day(now() - interval '40 days'),
-        now() - interval '40 days', 170000);
-INSERT INTO pgfc_observe.relation_samples (snapshot_id, collected_day, relid, schemaname, relname)
-VALUES ((SELECT max(snapshot_id) FROM pgfc_observe.snapshots),
-        pgfc_observe._epoch_day(now() - interval '40 days'), 1, 'public', 'old_t');
+-- Rotate for today: TRUNCATE the slot rolling off; keep the in-window day.
+SELECT cmp_ok(pgfc_observe.rotate_ring(pgfc_observe._epoch_day(now())), '>=', 1::bigint,
+              'rotate_ring truncates the slot rolling off (it held out-of-window data)');
+SELECT is((SELECT count(*) FROM pgfc_observe.relation_samples WHERE relname = 'stale_t'),
+          0::bigint, 'the rolling-off day is swept (older than the (slots-1)-day window)');
+SELECT is((SELECT count(*) FROM pgfc_observe.relation_samples WHERE relname = 'fresh_t'),
+          1::bigint, 'the oldest in-window day is kept (the window boundary is inclusive)');
 
-INSERT INTO pgfc_observe.snapshots (server_version_num) VALUES (170000);   -- today (defaults)
-INSERT INTO pgfc_observe.relation_samples (snapshot_id, relid, schemaname, relname)
-VALUES ((SELECT max(snapshot_id) FROM pgfc_observe.snapshots), 2, 'public', 'new_t');
+-- Idempotent: nothing stale remains, so a second rotation for the same day truncates nothing.
+SELECT is(pgfc_observe.rotate_ring(pgfc_observe._epoch_day(now())), 0::bigint,
+          'a second rotation for the same day is a no-op (no needless churn)');
 
--- Tier 1: TRUNCATE the two old partitions (snapshots + relation_samples); keep today.
-SELECT is(pgfc_observe.retain('14 days'), 2::bigint,
-          'retain() truncates the two out-of-window partitions that held data');
-SELECT is((SELECT count(*) FROM pgfc_observe.relation_samples WHERE relname = 'old_t'),
-          0::bigint, 'old relation_samples truncated away');
-SELECT is((SELECT count(*) FROM pgfc_observe.relation_samples WHERE relname = 'new_t'),
-          1::bigint, 'in-window samples are kept');
-
--- Tier 1 leaves the empty shell behind (zero-bloat, instant reclaim, no DDL churn).
-SELECT isnt((SELECT count(*) FROM pgfc_observe._partition_inventory()
-             WHERE day = pgfc_observe._epoch_day(now() - interval '40 days')),
-            0::bigint, 'truncated old partition shells still exist after retain()');
-
--- Tier 2: DROP the now-empty old shells; the populated current-day partitions stay.
-SELECT is(pgfc_observe.drop_empty_partitions('30 days'), 2::bigint,
-          'drop_empty_partitions() drops the two empty old shells');
-SELECT is((SELECT count(*) FROM pgfc_observe._partition_inventory()
-           WHERE day = pgfc_observe._epoch_day(now() - interval '40 days')),
-          0::bigint, 'old partition shells are gone after tier-2 GC');
+-- Zero catalog churn: rotation never creates or drops a partition — the ring is fixed.
+SELECT is((SELECT count(*) FROM pgfc_observe._partition_inventory()),
+          (2 * pgfc_observe._ring_slots())::bigint,
+          'the ring partition set is unchanged after rotation (zero catalog churn)');
 
 SELECT * FROM finish();
 ROLLBACK;

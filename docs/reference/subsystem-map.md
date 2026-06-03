@@ -21,20 +21,19 @@ From any object: its **home subsystem** is the heading it sits under, and its **
 - [`pgfc_observe.rollup_1m`](pgfc_observe.md#pgfc_observerollup_1m) — table
 - [`pgfc_observe.snapshots`](pgfc_observe.md#pgfc_observesnapshots) — table
 - [`pgfc_observe._ensure_part`](pgfc_observe.md#pgfc_observe_ensure_partp_parent-text-p_key-integer-p_span-text--void) — function
-- [`pgfc_observe._ensure_partition`](pgfc_observe.md#pgfc_observe_ensure_partitionp_day-integer--void) — function
 - [`pgfc_observe._epoch_day`](pgfc_observe.md#pgfc_observe_epoch_dayts-timestamp-with-time-zone--integer) — function
 - [`pgfc_observe._epoch_month`](pgfc_observe.md#pgfc_observe_epoch_monthts-timestamp-with-time-zone--integer) — function
 - [`pgfc_observe._maintenance_lock_timeout`](pgfc_observe.md#pgfc_observe_maintenance_lock_timeout--text) — function
 - [`pgfc_observe._month_start`](pgfc_observe.md#pgfc_observe_month_startk-integer--timestamp-with-time-zone) — function
-- [`pgfc_observe._partition_inventory`](pgfc_observe.md#pgfc_observe_partition_inventory--tableparent-text-partition-text-day-integer-range_start-timestamp-with-time-zone-range_end-timestamp-with-time-zone-approx_rows-bigint-size_bytes-bigint) — function
+- [`pgfc_observe._partition_inventory`](pgfc_observe.md#pgfc_observe_partition_inventory--tableparent-text-partition-text-slot-integer-approx_rows-bigint-size_bytes-bigint) — function
+- [`pgfc_observe._ring_slots`](pgfc_observe.md#pgfc_observe_ring_slots--integer) — function
 - [`pgfc_observe._rollup_coarsen`](pgfc_observe.md#pgfc_observe_rollup_coarsenp_dst-text-p_src-text-p_unit-text-p_lookback-interval--bigint) — function
 - [`pgfc_observe._rollup_inventory`](pgfc_observe.md#pgfc_observe_rollup_inventory--tableparent-text-partition-text-part_key-integer-span-text-range_start-timestamp-with-time-zone-range_end-timestamp-with-time-zone-approx_rows-bigint-size_bytes-bigint) — function
 - [`pgfc_observe._telemetry_reloptions`](pgfc_observe.md#pgfc_observe_telemetry_reloptions--text) — function
 - [`pgfc_observe.current_rollup`](pgfc_observe.md#pgfc_observecurrent_rollupp_tier-text-p_as_of-timestamp-with-time-zone--tablebucket_start-timestamp-with-time-zone-relid-oid-schemaname-name-relname-name-sample_count-integer-avg_dead_tup-double-precision-max_dead_tup-bigint-avg_live_tup-double-precision-max_live_tup-bigint-avg_mod_since_analyze-double-precision-max_mod_since_analyze-bigint-avg_reltuples-double-precision-max_reltuples-bigint-max_relfrozenxid_age-bigint-max_relminmxid_age-bigint-max_n_tup_ins-bigint-max_n_tup_upd-bigint-max_n_tup_del-bigint-max_vacuum_count-bigint-max_autovacuum_count-bigint-max_analyze_count-bigint-max_autoanalyze_count-bigint-avg_total_size_bytes-double-precision-max_total_size_bytes-bigint) — function
-- [`pgfc_observe.drop_empty_partitions`](pgfc_observe.md#pgfc_observedrop_empty_partitionskeep-interval--bigint) — function
-- [`pgfc_observe.retain`](pgfc_observe.md#pgfc_observeretainkeep-interval--bigint) — function
 - [`pgfc_observe.rollup`](pgfc_observe.md#pgfc_observerollupp_lookback-interval--bigint) — function
 - [`pgfc_observe.rollup_retain`](pgfc_observe.md#pgfc_observerollup_retainkeep_1m-interval-keep_1h-interval-keep_1d-interval--bigint) — function
+- [`pgfc_observe.rotate_ring`](pgfc_observe.md#pgfc_observerotate_ringp_day-integer--bigint) — function
 
 ## [O3. Derived state and readers](../rfc/README.md#o3-derived-state-and-readers)
 
@@ -115,7 +114,7 @@ From any object: its **home subsystem** is the heading it sits under, and its **
 
 - [`pgfc_govern.storage_config`](pgfc_govern.md#pgfc_governstorage_config) — table
 - [`pgfc_govern.self_health`](pgfc_govern.md#pgfc_governself_health) — view
-- [`pgfc_govern.degrade`](pgfc_govern.md#pgfc_governdegradep_budget_bytes-bigint-keep_raw-interval-keep_rollup_fine-interval-keep_rollup_coarse-interval-keep_diagnostics-interval-keep_actions-interval--tablestep-integer-level-text-action-text-bytes_after-bigint) — function
+- [`pgfc_govern.degrade`](pgfc_govern.md#pgfc_governdegradep_budget_bytes-bigint-keep_rollup_fine-interval-keep_rollup_coarse-interval-keep_diagnostics-interval-keep_actions-interval--tablestep-integer-level-text-action-text-bytes_after-bigint) — function
 - [`pgfc_govern.retain`](pgfc_govern.md#pgfc_governretainkeep_decisions-interval-keep_actions-interval-keep_ticks-interval-keep_diagnostics-interval-keep_transitions-interval--tablerelation-text-deleted-bigint) — function
 - [`pgfc_govern.storage_budget`](pgfc_govern.md#pgfc_governstorage_budget--tableschema_name-text-relation-text-bytes-bigint-dead_tuples-bigint) — function
 

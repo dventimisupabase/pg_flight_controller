@@ -6,7 +6,7 @@
 -- (those belong to retain()/rollup_retain(), tested elsewhere). Static autovacuum
 -- reloptions on the govern audit/state tables are asserted too.
 BEGIN;
-SELECT plan(26);
+SELECT plan(27);
 
 -- ── schema surface ───────────────────────────────────────────────────────────
 SELECT has_table('pgfc_govern', 'storage_config', 'storage_config table exists');
@@ -70,7 +70,7 @@ SELECT is((SELECT level FROM pgfc_govern.degrade(0) ORDER BY step DESC LIMIT 1),
 SELECT is((SELECT action FROM pgfc_govern.degrade(0) WHERE level = 'policy'),
           'preserved', 'policy is preserved, never pruned');
 SELECT is((SELECT action FROM pgfc_govern.degrade(0) WHERE level = 'raw'),
-          'pruned', 'raw is actually pruned when over budget');
+          'swept', 'raw is force-swept when over budget (the ring is bounded; FMEA-001)');
 
 -- raw must come strictly before policy in the prune order.
 SELECT ok((SELECT step FROM pgfc_govern.degrade(0) WHERE level = 'raw')
@@ -84,27 +84,33 @@ SELECT ok(EXISTS (SELECT 1 FROM pgfc_govern.policy_history
                   WHERE policy_name = 's6_degrade_pol'),
           'policy_history is never pruned by degrade');
 
--- ── graceful short-circuit: prune raw, re-measure, STOP (the S6 exit criterion) ─
+-- ── graceful short-circuit: shed an early level, re-measure, STOP (the S6 exit bar) ─
 -- The two cases above are degenerate extremes (everything prunes / everything skips);
--- neither exercises the path that DEFINES graceful degradation — shed the cheapest
--- level, find we are now under budget, and leave the rest untouched. Make raw the
--- dominant chunk (a fat 5-day-old partition degrade will drop), then set a budget that
--- is satisfiable ONLY after raw is shed. degrade() is captured once into a temp table
--- so every level is read from the same single invocation.
-SELECT pgfc_observe._ensure_partition(pgfc_observe._epoch_day(now() - interval '5 days'));
-INSERT INTO pgfc_observe.relation_samples (snapshot_id, collected_day, relid, schemaname, relname)
-SELECT 1, pgfc_observe._epoch_day(now() - interval '5 days'), g, 'public', 'r' || g
+-- neither exercises the path that DEFINES graceful degradation — shed an early level,
+-- find we are now under budget, and leave the rest untouched. Raw can no longer be the
+-- lever (FMEA-001: the ring is bounded by construction — it is force-swept but holds no
+-- in-window-sheddable bulk), so make the FINE ROLLUP tier the dominant chunk: a fat
+-- 10-day-old rollup_1m partition that step 2 will DROP. Set a budget just below the
+-- current footprint, satisfiable once that chunk is shed. degrade() is captured once into
+-- a temp table so every level is read from the same single invocation.
+SELECT pgfc_observe._ensure_part('rollup_1m', pgfc_observe._epoch_day(now() - interval '10 days'), 'day');
+INSERT INTO pgfc_observe.rollup_1m
+    (bucket_part, bucket_start, relid, schemaname, relname, sample_count)
+SELECT pgfc_observe._epoch_day(now() - interval '10 days'),
+       now() - interval '10 days', g, 'public', 'r' || g, 1
 FROM generate_series(1, 5000) g;
 
 CREATE TEMP TABLE s6_graceful AS
 SELECT * FROM pgfc_govern.degrade(
     (SELECT sum(bytes)::bigint - 1 FROM pgfc_govern.storage_budget()));  -- just below current
 
-SELECT is((SELECT action FROM s6_graceful WHERE level = 'raw'), 'pruned',
-          'graceful: the dominant raw level is pruned');
-SELECT is((SELECT action FROM s6_graceful WHERE level = 'rollups_fine'),
+SELECT is((SELECT action FROM s6_graceful WHERE level = 'raw'), 'swept',
+          'graceful: raw is force-swept (bounded ring) and frees nothing on its own');
+SELECT is((SELECT action FROM s6_graceful WHERE level = 'rollups_fine'), 'pruned',
+          'graceful: the dominant fine-rollup level is pruned');
+SELECT is((SELECT action FROM s6_graceful WHERE level = 'rollups_coarse'),
           'skipped:under_budget',
-          'graceful: once raw drops us under budget, later levels are skipped (the S6 exit bar)');
+          'graceful: once fine rollups drop us under budget, later levels are skipped (the S6 exit bar)');
 
 -- Budget report accuracy: a plain table's reported bytes equals pg_total_relation_size.
 SELECT is((SELECT bytes FROM pgfc_govern.storage_budget()

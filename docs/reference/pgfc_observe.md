@@ -59,13 +59,14 @@ UNLOGGED last-observed state per relation: the change-signature cache for sparse
 
 ### pgfc_observe.relation_samples
 
-Per-relation observed state for one snapshot. reloptions is the governor rollback baseline. Daily RANGE partitioned on collected_day.
+Per-relation observed state for one snapshot. reloptions is the governor rollback baseline. LIST-partitioned into the fixed ring by slot, the collected_day modulo the ring slot count (FMEA-001).
 
 **Subsystem:** O2
 
 | Column | Type | Description |
 | --- | --- | --- |
 | `snapshot_id` | `bigint` |  |
+| `slot` | `smallint` |  |
 | `collected_day` | `integer` |  |
 | `relid` | `oid` |  |
 | `schemaname` | `name` |  |
@@ -200,13 +201,14 @@ Per-relation 1-minute aggregate of raw samples (S4). Daily RANGE partitioned; ~7
 
 ### pgfc_observe.snapshots
 
-Header row per observe() run: timestamp + cluster/GUC + cluster load signals (client_backends/max_connections — the F6 load-shedding stress input) + pg_class health + xmin horizons. Daily RANGE partitioned on collected_day.
+Header row per observe() run: timestamp + cluster/GUC + cluster load signals (client_backends/max_connections — the F6 load-shedding stress input) + pg_class health + xmin horizons. LIST-partitioned into the fixed ring by slot, the collected_day modulo the ring slot count (FMEA-001).
 
 **Subsystem:** O2
 
 | Column | Type | Description |
 | --- | --- | --- |
 | `snapshot_id` | `bigint` |  |
+| `slot` | `smallint` |  |
 | `collected_day` | `integer` |  |
 | `collected_at` | `timestamp with time zone` |  |
 | `datname` | `name` |  |
@@ -279,7 +281,7 @@ Dense current per-relation health (S3): dead/live tuples, freeze ages, and last-
 
 ### pgfc_observe.self_health
 
-One-row self-maintenance summary for pgfc_observe (S6): total bytes, aggregate dead tuples, partition counts, oldest raw partition.
+One-row self-maintenance summary for pgfc_observe (S6): total bytes, aggregate dead tuples, partition counts (raw ring fixed at 2×_ring_slots), oldest retained raw instant.
 
 **Subsystem:** O4
 
@@ -296,12 +298,6 @@ One-row self-maintenance summary for pgfc_observe (S6): total bytes, aggregate d
 ### `pgfc_observe._ensure_part(p_parent text, p_key integer, p_span text) → void`
 
 Create the [p_key, p_key+1) RANGE partition of p_parent if missing (p_span day|month names it). Idempotent/race-safe; used by rollup() (S4).
-
-**Subsystem:** O2
-
-### `pgfc_observe._ensure_partition(p_day integer) → void`
-
-Create the daily partition for p_day (default today) on both telemetry tables if missing; O(1) and race-safe.
 
 **Subsystem:** O2
 
@@ -341,9 +337,15 @@ Provenance registry of pgfc_observe governed constants (Phase 1.6) — an inspec
 
 **Subsystem:** O5
 
-### `pgfc_observe._partition_inventory() → TABLE(parent text, partition text, day integer, range_start timestamp with time zone, range_end timestamp with time zone, approx_rows bigint, size_bytes bigint)`
+### `pgfc_observe._partition_inventory() → TABLE(parent text, partition text, slot integer, approx_rows bigint, size_bytes bigint)`
 
-Child partitions of the telemetry tables with day, decoded range, est. rows, and size.
+Slot partitions of the raw telemetry ring with slot number, est. rows, and size (FMEA-001).
+
+**Subsystem:** O2
+
+### `pgfc_observe._ring_slots() → integer`
+
+Fixed LIST-partition count of the raw-telemetry ring (FMEA-001); raw retention = (_ring_slots()-1) days with daily rotation.
 
 **Subsystem:** O2
 
@@ -377,12 +379,6 @@ Carry-forward latest rollup bucket per relation as-of p_as_of in tier 1m|1h|1d (
 
 **Subsystem:** O2
 
-### `pgfc_observe.drop_empty_partitions(keep interval) → bigint`
-
-Tier-2 GC: DROP empty telemetry partitions older than keep (default 30 days). Returns partitions dropped.
-
-**Subsystem:** O2
-
 ### `pgfc_observe.effective_reloption(reloptions text[], opt text) → text`
 
 Value of storage parameter opt in reloptions, or NULL if not explicitly set.
@@ -401,12 +397,6 @@ Oldest xmin data/catalog removability horizons with attributed owner class.
 
 **Subsystem:** O3
 
-### `pgfc_observe.retain(keep interval) → bigint`
-
-Tier-1 GC: TRUNCATE telemetry partitions older than keep (default 3 days). Returns partitions truncated.
-
-**Subsystem:** O2
-
 ### `pgfc_observe.rollup(p_lookback interval) → bigint`
 
 Cascade raw samples into the 1m/1h/1d rollup tiers (S4). Idempotent (per-PK upsert); run at least once per raw-retention window. Returns rows upserted.
@@ -416,6 +406,12 @@ Cascade raw samples into the 1m/1h/1d rollup tiers (S4). Idempotent (per-PK upse
 ### `pgfc_observe.rollup_retain(keep_1m interval, keep_1h interval, keep_1d interval) → bigint`
 
 Cascading rollup GC (S4): DROP rollup partitions past their per-tier window (1m 7d / 1h 90d / 1d 365d). Returns partitions dropped.
+
+**Subsystem:** O2
+
+### `pgfc_observe.rotate_ring(p_day integer) → bigint`
+
+Advance the fixed ring for p_day (default today): TRUNCATE slots holding out-of-window days; zero catalog churn (FMEA-001). Called by observe() before each insert; also the manual sweep.
 
 **Subsystem:** O2
 

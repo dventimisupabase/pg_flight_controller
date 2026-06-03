@@ -1,46 +1,40 @@
--- S2 partition infrastructure: _ensure_partition() creates the daily partitions and is
--- idempotent; _partition_inventory() reports them with decoded ranges; observe() stamps
--- collected_day and routes the row into the matching daily partition.
+-- Ring structure & routing (FMEA-001): _ring_slots() fixes the slot count; the slot
+-- partitions are created ONCE at install; observe() stamps slot = day % _ring_slots() and
+-- routes each row into its slot partition; _partition_inventory() reports the slots; and
+-- rotate_ring() is idempotent. (15_ring_rotation.sql is the end-to-end zero-churn prover.)
 BEGIN;
 SELECT plan(8);
 
-SELECT has_function('pgfc_observe', '_ensure_partition', ARRAY['integer'],
-                    '_ensure_partition(integer) exists');
-SELECT has_function('pgfc_observe', '_partition_inventory',
-                    '_partition_inventory() exists');
+SELECT has_function('pgfc_observe', '_ring_slots', '_ring_slots() exists');
+SELECT has_function('pgfc_observe', 'rotate_ring', ARRAY['integer'],
+                    'rotate_ring(integer) exists');
 
--- Use a far-future day so we never collide with the install/today partition.
-SELECT pgfc_observe._ensure_partition(pgfc_observe._epoch_day(now() + interval '100 days'));
+-- The ring is a FIXED set of _ring_slots() slot partitions per raw table, created at install.
+SELECT is((SELECT count(*) FROM pgfc_observe._partition_inventory() WHERE parent = 'snapshots'),
+          pgfc_observe._ring_slots()::bigint,
+          'snapshots has _ring_slots() slot partitions at install');
+SELECT is((SELECT count(*) FROM pgfc_observe._partition_inventory() WHERE parent = 'relation_samples'),
+          pgfc_observe._ring_slots()::bigint,
+          'relation_samples has _ring_slots() slot partitions at install');
 
-SELECT is((SELECT count(*) FROM pgfc_observe._partition_inventory()
-           WHERE parent = 'snapshots'
-             AND day = pgfc_observe._epoch_day(now() + interval '100 days')),
-          1::bigint, '_ensure_partition created the snapshots daily partition');
-SELECT is((SELECT count(*) FROM pgfc_observe._partition_inventory()
-           WHERE parent = 'relation_samples'
-             AND day = pgfc_observe._epoch_day(now() + interval '100 days')),
-          1::bigint, '_ensure_partition created the relation_samples daily partition');
+-- _partition_inventory() decodes the LIST bound back to the slot number.
+SELECT is((SELECT slot FROM pgfc_observe._partition_inventory() WHERE partition = 'snapshots_s0'),
+          0, '_partition_inventory decodes the LIST bound -> slot 0');
 
--- Calling it again is a harmless no-op (idempotent / race-safe).
-SELECT lives_ok(
-    $$ SELECT pgfc_observe._ensure_partition(pgfc_observe._epoch_day(now() + interval '100 days')) $$,
-    're-ensuring an existing partition is idempotent');
-
--- The inventory decodes the int4 day back to its UTC range start.
-SELECT is((SELECT range_start FROM pgfc_observe._partition_inventory()
-           WHERE day = pgfc_observe._epoch_day(now() + interval '100 days') LIMIT 1),
-          to_timestamp(pgfc_observe._epoch_day(now() + interval '100 days')::bigint * 86400),
-          '_partition_inventory decodes day -> UTC range_start');
-
--- observe() stamps collected_day with today and routes the header into today's partition.
+-- observe() stamps slot = today % _ring_slots() and routes the header into that slot partition.
 SELECT pgfc_observe.observe();
-SELECT is((SELECT collected_day FROM pgfc_observe.snapshots ORDER BY snapshot_id DESC LIMIT 1),
-          pgfc_observe._epoch_day(now()),
-          'observe() stamps collected_day = today');
+SELECT is((SELECT slot FROM pgfc_observe.snapshots ORDER BY snapshot_id DESC LIMIT 1),
+          (pgfc_observe._epoch_day(now()) % pgfc_observe._ring_slots())::smallint,
+          'observe() stamps slot = today % _ring_slots()');
 SELECT is((SELECT tableoid::regclass::text FROM pgfc_observe.snapshots
             ORDER BY snapshot_id DESC LIMIT 1),
-          'pgfc_observe.snapshots_p' || to_char((now() AT TIME ZONE 'UTC'), 'YYYYMMDD'),
-          'observe() row is routed into today''s partition');
+          'pgfc_observe.snapshots_s'
+            || (pgfc_observe._epoch_day(now()) % pgfc_observe._ring_slots())::text,
+          'observe() row is routed into its slot partition');
+
+-- rotate_ring is idempotent / race-safe (re-running it on a fresh ring changes nothing).
+SELECT lives_ok($$ SELECT pgfc_observe.rotate_ring() $$,
+                're-running rotate_ring is harmless (idempotent)');
 
 SELECT * FROM finish();
 ROLLBACK;

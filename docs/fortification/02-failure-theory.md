@@ -53,13 +53,13 @@ Modes worked and found to **fail safe** as built (the reassuring half of the ana
 | **Upgrade re-run** (`install.sql` re-applied) | `CREATE TABLE IF NOT EXISTS` + additive `ALTER … ADD COLUMN IF NOT EXISTS`; the one-time S2 destructive recreate is guarded by `relkind <> 'p'` (fires once) and only discards disposable telemetry. | `pgfc_observe/install.sql:17-21`, `:98-111`; `pgfc_govern/install.sql:11-14` |
 | **NULL snapshot fields** (boot / pre-feature columns) | `COALESCE` defaults throughout `estimate()`/`plan()`/`governor_metrics`; a NULL newest-estimate snapshot makes `plan()` plan nothing — safe. | `pgfc_govern/install.sql:~709-712`, `:1170` |
 | **Health-state worst-of** (conflicting signals) | Candidate states ranked by the health enum's native order (`DESC` picks the most cautious); the operator force is a one-directional caution floor; serialized under the `control_tick` advisory lock. | `pgfc_govern/install.sql:~2223`, `:2226-2237` |
-| **Partition `DROP` racing an `observe()` write** (data-loss angle) | Safe because `drop_empty_partitions()` targets ~30-day-empty partitions `observe()` is **not** writing — *window separation*, not the `EXISTS`+lock (the `AccessShare` probe and a concurrent `RowExclusive` insert are compatible, so the `EXISTS→DROP` TOCTOU exists but is unreachable). The *lock-wait* angle is a finding (FMEA-004). | `pgfc_observe/install.sql:~1397-1419` |
+| **Ring `TRUNCATE` racing an `observe()` write** (data-loss angle) | Safe by construction (FMEA-001): `rotate_ring()` runs **inside** `observe()`, in the same transaction and before the insert, and `TRUNCATE`s only a slot whose data is out-of-window (`collected_day < p_day-(slots-1)`) — the day being written is never truncated from under the write. A separate caller's `rotate_ring()` touches only out-of-window slots no in-progress `observe()` is writing. The *lock-wait* angle is bounded by FMEA-004's `_maintenance_lock_timeout`. | `pgfc_observe/install.sql` (`rotate_ring`) |
 
 ## Findings
 
 | ID | Sev | Conf | Evidence | Summary | Status | Link |
 |---|---|---|---|---|---|---|
-| FMEA-001 | Medium | Confirmed | `pgfc_observe/install.sql:~509`, `:~1397` | Telemetry uses create/drop daily partitions, churning the system catalogs, where the lineage used a fixed `TRUNCATE` ring (zero churn). | Accepted (adopt the ring) | [#79](https://github.com/dventimisupabase/pg_flight_controller/issues/79) |
+| FMEA-001 | Medium | Confirmed | `pgfc_observe/install.sql:~509`, `:~1397` | Telemetry uses create/drop daily partitions, churning the system catalogs, where the lineage used a fixed `TRUNCATE` ring (zero churn). | Verified | [#79](https://github.com/dventimisupabase/pg_flight_controller/issues/79) |
 | FMEA-002 | Medium | Confirmed | both `install.sql` (no `pg_is_in_recovery`) | No standby guard: the loops error every tick on a read-only replica; fail-safe but noisy and a post-failover footgun. | Verified | [#80](https://github.com/dventimisupabase/pg_flight_controller/issues/80) |
 | FMEA-003 | Medium | Confirmed | `pgfc_govern/install.sql:2025`, `:1171`, `:1143-1191` | Control-loop errors are invisible: `tick_log.error` is never written and a hard error rolls the tick row back, so the tick-error breaker is structurally dead and a wedged `control_tick` keeps the governor `normal`. | Verified | [#84](https://github.com/dventimisupabase/pg_flight_controller/issues/84) |
 | FMEA-004 | Medium | Confirmed | `pgfc_observe/install.sql` (`retain`/`drop_empty_partitions`/`_ensure_partition`, no `lock_timeout`) | Storage-maintenance DDL took `ACCESS EXCLUSIVE` with no bounded `lock_timeout` — an Invariant-1 gap outside the `apply()` path. | Verified | [#81](https://github.com/dventimisupabase/pg_flight_controller/issues/81) |
@@ -69,7 +69,7 @@ Modes worked and found to **fail safe** as built (the reassuring half of the ana
 
 ### FMEA-001 — Partition recycling uses create/drop, not a fixed `TRUNCATE` ring
 
-**Severity:** Medium · **Confidence:** Confirmed · **Status:** Accepted — adopt the ring ([#79](https://github.com/dventimisupabase/pg_flight_controller/issues/79))
+**Severity:** Medium · **Confidence:** Confirmed · **Status:** Verified (fixed in [#79](https://github.com/dventimisupabase/pg_flight_controller/issues/79))
 
 **What.** `pgfc_observe` bounds its high-volume telemetry (`relation_samples`,
 `snapshots`) with daily `RANGE` partitions: `_ensure_partition()` issues
@@ -100,6 +100,33 @@ sequence must **not** reset; the retention window quantizes to `(slots−1) × r
 **Disposition (author's call): adopt the fixed ring** (`#79`), accepting the porting cost
 for zero steady-state catalog churn and consistency with the lineage. `Medium` — a
 principle-and-lineage inconsistency, no safety consequence.
+
+**Resolution.** Adopted the fixed ring. `snapshots`/`relation_samples` are now `LIST`-partitioned
+on `slot smallint = collected_day % _ring_slots()` — a constant set of `_ring_slots()` (8) slot
+partitions created **once** at install; `collected_day` stays a plain column (the BRIN index,
+`rollup()` time-pruning, and human reads still use it). A single `rotate_ring(p_day)` replaces
+`_ensure_partition` / `retain` / `drop_empty_partitions`: it `TRUNCATE`s any slot holding
+out-of-window data (`collected_day < p_day - (slots-1)`), and `observe()` calls it before every
+insert — so recycling is **inline** and there is no `CREATE`/`DROP` in steady state. That is the
+finding's goal: zero dead tuples *and* zero catalog churn. The raw window quantizes to
+`(_ring_slots()-1)` = 7 days — ≥ the prior `retain('3 days')` contract (the governor's control
+memory never shrinks) and aligned with `rollup_1m`'s 7-day tier, leaving margin for `rollup()` to
+aggregate a day before its slot recycles. The four porting constraints are met: the readers join
+on `snapshot_id` and scan the parent, so they did **not** need to become slot-aware (the finding
+over-stated this); sparse carry-forward survives because the window is ≥ the prior one; the global
+`snapshot_id` IDENTITY lives on the parent and a partition `TRUNCATE` never resets it; and
+retention quantizes as noted. Inv-1 lock discipline is preserved — `rotate_ring` sets the bounded
+`_maintenance_lock_timeout`, lets the **current** slot's `TRUNCATE` *propagate* a timeout (so
+`observe()` skips the run rather than mix two days in one slot) and skips a busy non-current slot
+in a subtransaction (retried next run). The upgrade is a one-time destructive recreate (telemetry
+is disposable) guarded on partition strategy (drop unless already `LIST`), so it fires once on the
+Phase-0/`RANGE`→ring transition and is idempotent thereafter. Cross-schema, `pgfc_govern.degrade()`
+becomes a force-sweep at the raw tier — the ring is bounded by construction, so its `keep_raw`
+argument was removed and a budget below the raw floor is now unsatisfiable (documented). Regression
+test `pgfc_observe/tests/15_ring_rotation.sql` is the prover: it drives the calendar 3× the ring
+size and asserts the partition set and `pg_inherits` rows stay constant — zero churn, red on the
+old create/drop model — plus the `(slots-1)`-day retention boundary and the non-resetting
+`snapshot_id`.
 
 ### FMEA-002 — No standby guard; the loops error every tick on a replica
 
@@ -329,4 +356,6 @@ Per the charter — every enumerated mode dispositioned, all `Critical`/`High` m
       005 ([#82](https://github.com/dventimisupabase/pg_flight_controller/issues/82)),
       006 ([#83](https://github.com/dventimisupabase/pg_flight_controller/issues/83));
       FMEA-007 Won't-fix.
-- [ ] The `Medium` findings reach `Fixed`/`Verified` (regression coverage shared with Phase 3).
+- [x] The `Medium` findings reach `Fixed`/`Verified` (regression coverage shared with Phase 3):
+      FMEA-001 (#79), 002 (#80), 003 (#84), 004 (#81), 005 (#82) all Verified; 006 (#83, `Low`)
+      Verified; 007 Won't-fix. Every filed finding is now resolved.

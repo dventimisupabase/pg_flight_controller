@@ -39,14 +39,15 @@ it can't silently fall out of date.)
 
 ## Storage
 
-`snapshots` and `relation_samples` are **daily `RANGE` partitioned** on an `int4`
-epoch-day key (`collected_day`). `observe()` creates each day's partition on demand;
-retention is whole-partition rotation, so it produces zero dead tuples:
+`snapshots` and `relation_samples` are recycled by a **fixed `TRUNCATE`-rotated ring**
+(FMEA-001): a constant set of `LIST`-by-slot partitions created once at install
+(`slot = collected_day % _ring_slots()`). `observe()` calls `rotate_ring()` before each
+insert to `TRUNCATE` the slot rolling off, so retention is whole-partition rotation with zero
+dead tuples *and* zero steady-state catalog churn — no `CREATE`/`DROP` per day. The raw
+window is fixed at `(_ring_slots() - 1)` days (8 slots → 7 days).
 
-- `retain()` (nightly) `TRUNCATE`s partitions older than its window (default 3 days).
-- `drop_empty_partitions()` (monthly) `DROP`s the empty shells (default 30 days).
-
-Inspect partitions with `SELECT * FROM pgfc_observe._partition_inventory()`.
+Inspect the ring slots with `SELECT * FROM pgfc_observe._partition_inventory()`, or force a
+sweep with `SELECT pgfc_observe.rotate_ring()`.
 
 Logging is also **sparse**: `observe()` writes a `relation_samples` row only when a
 relation's observed state changed since its last sample (tracked in the `UNLOGGED`
@@ -78,9 +79,10 @@ Additive-only: new columns are nullable; existing columns are never dropped or
 renamed. Historical rows with `NULL` in a newer column mean "not collected then."
 Re-running `install.sql` upgrades in place.
 
-> **One-time exception (S2).** Adding partitioning could not be done in place, so
-> re-running `install.sql` over a pre-S2 install **destructively recreates** the two
-> telemetry tables (telemetry is disposable). This `DROP ... CASCADE` also drops
+> **One-time exception (S2 / FMEA-001).** A table's partitioning strategy cannot be changed
+> in place, so re-running `install.sql` over a pre-ring install (a Phase-0 ordinary table or
+> the earlier daily-`RANGE` shape) **destructively recreates** the two telemetry tables into
+> the `LIST`-by-slot ring (telemetry is disposable). This `DROP ... CASCADE` also drops
 > dependent cross-schema views such as `pgfc_govern.catalog_health` — re-run
 > `pgfc_govern/install.sql` afterward to restore them.
 

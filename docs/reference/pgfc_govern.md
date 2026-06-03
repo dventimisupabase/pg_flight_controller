@@ -465,9 +465,9 @@ One control cycle: plan, apply (only if not advisory_only), verify.
 
 **Subsystem:** G1
 
-### `pgfc_govern.degrade(p_budget_bytes bigint, keep_raw interval, keep_rollup_fine interval, keep_rollup_coarse interval, keep_diagnostics interval, keep_actions interval) → TABLE(step integer, level text, action text, bytes_after bigint)`
+### `pgfc_govern.degrade(p_budget_bytes bigint, keep_rollup_fine interval, keep_rollup_coarse interval, keep_diagnostics interval, keep_actions interval) → TABLE(step integer, level text, action text, bytes_after bigint)`
 
-Graceful-degrade prune order (S6): shed storage raw→fine→coarse rollups→diagnostics→actions until under budget; policy is never pruned. No-op when no budget is configured. Returns the ordered prune log.
+Graceful-degrade prune order (S6): shed storage raw (force-sweep the fixed ring, FMEA-001) → fine → coarse rollups → diagnostics → actions until under budget; policy is never pruned. No-op when no budget is configured; a budget below the fixed raw-ring floor is unsatisfiable. Returns the ordered prune log.
 
 **Subsystem:** G6
 

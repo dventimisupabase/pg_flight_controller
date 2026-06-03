@@ -1,31 +1,46 @@
--- Schema: the two telemetry tables exist, are daily RANGE partitioned (S2), and
--- carry the expected shape.
+-- Schema: the two telemetry tables exist, are LIST-partitioned into the fixed ring on slot
+-- (S2 / FMEA-001), and carry the expected shape (slot partition key + collected_day plain
+-- column + the observable groups + the relid/BRIN indexes).
 BEGIN;
-SELECT plan(17);
+SELECT plan(22);
 
 SELECT has_table('pgfc_observe', 'snapshots', 'snapshots table exists');
 SELECT has_table('pgfc_observe', 'relation_samples', 'relation_samples table exists');
 
--- S2: both high-volume tables are partitioned parents (relkind 'p').
+-- Both high-volume tables are partitioned parents (relkind 'p') ...
 SELECT is((SELECT relkind::text FROM pg_class WHERE oid = 'pgfc_observe.snapshots'::regclass),
           'p', 'snapshots is a partitioned table');
 SELECT is((SELECT relkind::text FROM pg_class WHERE oid = 'pgfc_observe.relation_samples'::regclass),
           'p', 'relation_samples is a partitioned table');
 
--- PKs lead with the partition key collected_day (required to be in every PK).
-SELECT col_is_pk('pgfc_observe', 'snapshots', ARRAY['collected_day','snapshot_id'],
-                 'snapshots PK is (collected_day, snapshot_id)');
-SELECT col_is_pk('pgfc_observe', 'relation_samples',
-                 ARRAY['collected_day','snapshot_id','relid'],
-                 'relation_samples PK is (collected_day, snapshot_id, relid)');
+-- ... and specifically LIST-partitioned (the fixed ring, FMEA-001), not RANGE.
+SELECT is((SELECT partstrat::text FROM pg_partitioned_table
+           WHERE partrelid = 'pgfc_observe.snapshots'::regclass),
+          'l', 'snapshots is LIST-partitioned (the fixed ring)');
+SELECT is((SELECT partstrat::text FROM pg_partitioned_table
+           WHERE partrelid = 'pgfc_observe.relation_samples'::regclass),
+          'l', 'relation_samples is LIST-partitioned (the fixed ring)');
 
--- The int4 epoch-day partition key on both tables.
+-- PKs lead with the slot partition key (required to be in every PK of a partitioned table).
+SELECT col_is_pk('pgfc_observe', 'snapshots', ARRAY['slot','snapshot_id'],
+                 'snapshots PK is (slot, snapshot_id)');
+SELECT col_is_pk('pgfc_observe', 'relation_samples',
+                 ARRAY['slot','snapshot_id','relid'],
+                 'relation_samples PK is (slot, snapshot_id, relid)');
+
+-- The smallint slot partition key on both tables.
+SELECT has_column('pgfc_observe', 'snapshots', 'slot', 'snapshots has the slot partition key');
+SELECT col_type_is('pgfc_observe', 'snapshots', 'slot', 'smallint', 'slot is smallint');
+SELECT has_column('pgfc_observe', 'relation_samples', 'slot',
+                  'relation_samples has the slot partition key');
+
+-- collected_day stays as a plain column (BRIN index, rollup pruning, human reads).
 SELECT has_column('pgfc_observe', 'snapshots', 'collected_day',
-                  'snapshots has collected_day partition key');
+                  'snapshots keeps collected_day as a plain column');
 SELECT col_type_is('pgfc_observe', 'snapshots', 'collected_day', 'integer',
                    'collected_day is int4');
 SELECT has_column('pgfc_observe', 'relation_samples', 'collected_day',
-                  'relation_samples has collected_day partition key');
+                  'relation_samples keeps collected_day');
 
 -- representative columns from each observable group
 SELECT has_column('pgfc_observe', 'snapshots', 'pg_class_n_dead_tup',
@@ -39,7 +54,7 @@ SELECT col_type_is('pgfc_observe', 'relation_samples', 'reloptions', 'text[]',
 SELECT has_column('pgfc_observe', 'relation_samples', 'total_autovacuum_time',
                   'relation_samples has total_autovacuum_time (PG18+, nullable)');
 
--- Indexes: the relid lookup btree plus the bloat-free BRIN on the partition key.
+-- Indexes: the relid lookup btree plus the bloat-free BRIN on collected_day.
 SELECT has_index('pgfc_observe', 'relation_samples', 'relation_samples_relid_idx',
                  'relation_samples has the (relid, snapshot_id) lookup index');
 SELECT has_index('pgfc_observe', 'snapshots', 'snapshots_collected_day_brin',

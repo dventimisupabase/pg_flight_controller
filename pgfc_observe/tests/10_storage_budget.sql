@@ -15,8 +15,8 @@ SELECT has_view('pgfc_observe', 'self_health', 'self_health view exists');
 
 -- ── static reloptions on every partition ─────────────────────────────────────
 -- Parent reloptions never propagate to children, so the option must be on each child.
--- The bootstrap created today's raw + rollup partitions, and the upgrade block
--- backfills any pre-S6 partitions; assert NONE is missing the static threshold.
+-- Install created the fixed raw ring slots + today's rollup partitions, and the upgrade
+-- block backfills any pre-S6 partitions; assert NONE is missing the static threshold.
 SELECT is((SELECT count(*) FROM pgfc_observe._partition_inventory() pi
            JOIN pg_class c ON c.relname = pi.partition
                           AND c.relnamespace = 'pgfc_observe'::regnamespace
@@ -38,15 +38,12 @@ SELECT is((SELECT count(*) FROM pgfc_observe._rollup_inventory() ri
                              WHERE o LIKE 'autovacuum_vacuum_threshold=%')),
           0::bigint, 'every rollup partition carries a static autovacuum_vacuum_threshold');
 
--- A partition newly created by _ensure_partition() (a future day) also gets them.
-SELECT pgfc_observe._ensure_partition(pgfc_observe._epoch_day(now() + interval '10 days'));
-SELECT ok((SELECT EXISTS (SELECT 1 FROM unnest(c.reloptions) o
-                          WHERE o LIKE 'autovacuum_vacuum_threshold=%')
-           FROM pg_class c
-           WHERE c.relnamespace = 'pgfc_observe'::regnamespace
-             AND c.relname = 'relation_samples_p' ||
-                 to_char((now() + interval '10 days') AT TIME ZONE 'UTC', 'YYYYMMDD')),
-          'a freshly ensured raw partition is created WITH the static reloptions');
+-- The raw ring is a FIXED set of slots created once at install (FMEA-001) — no on-demand
+-- partitions — so assert the ring is exactly _ring_slots() slot partitions per raw table.
+SELECT is((SELECT count(*) FROM pgfc_observe._partition_inventory()
+           WHERE parent = 'snapshots'),
+          pgfc_observe._ring_slots()::bigint,
+          'the snapshots ring is exactly _ring_slots() fixed slot partitions');
 
 -- ── storage_budget() ─────────────────────────────────────────────────────────
 SELECT ok(EXISTS (SELECT 1 FROM pgfc_observe.storage_budget()
@@ -75,8 +72,9 @@ SELECT ok((SELECT dead_tuples FROM pgfc_observe.storage_budget()
 -- ── self_health ──────────────────────────────────────────────────────────────
 SELECT is((SELECT count(*) FROM pgfc_observe.self_health), 1::bigint,
           'self_health is exactly one row');
-SELECT ok((SELECT raw_partitions FROM pgfc_observe.self_health) >= 1,
-          'self_health counts at least the bootstrapped raw partition');
+SELECT is((SELECT raw_partitions FROM pgfc_observe.self_health),
+          (2 * pgfc_observe._ring_slots())::bigint,
+          'self_health counts the fixed ring (2 × _ring_slots() raw partitions)');
 SELECT is((SELECT total_dead_tuples FROM pgfc_observe.self_health),
           (SELECT COALESCE(sum(dead_tuples), 0) FROM pgfc_observe.storage_budget()),
           'self_health.total_dead_tuples agrees with storage_budget()');

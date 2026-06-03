@@ -296,13 +296,12 @@ Run the two loops on separate cadences with `pg_cron` (observe often, act rarely
 SELECT cron.schedule('pgfc_observe', '* * * * *',   $$SELECT pgfc_govern.observe_tick()$$);
 SELECT cron.schedule('pgfc_control', '*/5 * * * *', $$SELECT pgfc_govern.control_tick()$$);
 
--- roll raw samples up into the long-range tiers BEFORE retain() truncates them:
+-- roll raw samples up into the long-range tiers before their slot recycles in the ring:
 SELECT cron.schedule('pgfc_observe_rollup', '2 3 * * *',   $$SELECT pgfc_observe.rollup()$$);
 
--- prune old data so neither schema grows without bound:
-SELECT cron.schedule('pgfc_observe_retain', '7 3 * * *',   $$SELECT pgfc_observe.retain()$$);
+-- the raw ring self-rotates inline in observe_tick() (FMEA-001), so raw needs no GC cron;
+-- prune the rollup tiers and the govern audit tables so neither schema grows without bound:
 SELECT cron.schedule('pgfc_observe_rollup_gc', '12 3 * * *', $$SELECT pgfc_observe.rollup_retain()$$);
-SELECT cron.schedule('pgfc_observe_gc',     '23 4 1 * *',  $$SELECT pgfc_observe.drop_empty_partitions()$$);
 SELECT cron.schedule('pgfc_govern_retain',  '17 3 * * *',  $$SELECT pgfc_govern.retain()$$);
 ```
 
@@ -322,24 +321,21 @@ loop has not yet completed a cycle may briefly show `emergency`: the control-loo
 honestly reporting "no successful cycle yet," and it clears on the first post-promotion
 `control_tick()`.
 
-The high-volume telemetry tables (`snapshots`, `relation_samples`) are **daily
-`RANGE` partitioned** on an `int4` epoch-day key, and retention is whole-partition
-rotation — never row-by-row `DELETE` — so it reclaims space instantly and leaves zero
-dead tuples (the governor never becomes its own vacuum burden). Two tiers:
+The high-volume telemetry tables (`snapshots`, `relation_samples`) are recycled by a
+**fixed `TRUNCATE`-rotated ring** (FMEA-001): a constant set of `LIST`-by-slot partitions
+created once at install (`slot = collected_day % _ring_slots()`), and `observe()` calls
+`rotate_ring()` before each insert to `TRUNCATE` the slot rolling off. Retention is
+whole-partition rotation — never row-by-row `DELETE`, and never `CREATE`/`DROP` in steady
+state — so it reclaims space instantly, leaves zero dead tuples, *and* adds zero catalog
+churn (the governor never becomes its own vacuum or catalog-bloat burden). The raw window is
+fixed at `(_ring_slots() - 1)` days (8 slots → 7 days), not a per-call interval, and there is
+no separate raw-GC cron. `pgfc_govern.retain()` still prunes the low-volume audit tables by
+time cutoff — decisions and actions (180 days), tick log (180 days), and resolved diagnostics
+(365 days); `policy_history` is kept indefinitely. Those windows are arguments you can
+override. Inspect the ring slots with `SELECT * FROM pgfc_observe._partition_inventory()`, or
+force a sweep with `SELECT pgfc_observe.rotate_ring()`.
 
-- `pgfc_observe.retain()` (nightly) `TRUNCATE`s partitions older than the window
-  (default 3 days), keeping the empty shell.
-- `pgfc_observe.drop_empty_partitions()` (monthly) `DROP`s the long-empty shells
-  (default 30 days); it never drops a partition that still holds data.
-
-`pgfc_observe.observe()` creates each day's partition on demand, so no partition
-pre-creation job is needed. `pgfc_govern.retain()` prunes the low-volume audit tables
-by time cutoff — decisions and actions (180 days), tick log (180 days), and resolved
-diagnostics (365 days); `policy_history` is kept indefinitely. All windows are
-arguments you can override. Inspect partitions with
-`SELECT * FROM pgfc_observe._partition_inventory()`.
-
-Raw samples rotate away within a couple of days, so long-range history lives in three
+Raw samples rotate away within about a week (the ring window), so long-range history lives in three
 aggregate tiers — `rollup_1m`, `rollup_1h`, `rollup_1d` — built by
 `pgfc_observe.rollup()`. It **must run before raw is truncated**, but the real
 guarantee is the raw retention *window*, not cron ordering: as long as `rollup()` runs
@@ -389,18 +385,18 @@ filtered set automatically.
 ### Which role runs the loop
 
 `pg_cron` executes each job as the role that owns it (by default, whoever called
-`cron.schedule`). The loop is not pure DML — it maintains its own storage with DDL:
-`observe_tick()` runs `CREATE TABLE … PARTITION OF` for each new day, `retain()` runs
-`TRUNCATE`, and `drop_empty_partitions()` runs `DROP TABLE`. Those need *ownership* of the
-partitioned telemetry tables, not table grants.
+`cron.schedule`). The loop is not pure DML — it maintains its own storage with DDL: `observe_tick()` calls
+`rotate_ring()`, which `TRUNCATE`s the raw slot rolling off (the fixed ring, FMEA-001), and
+the nightly rollup jobs `CREATE`/`DROP` rollup partitions. Those need *ownership* of the
+telemetry tables, not table grants.
 
 - **Simplest (recommended): own the extension objects.** Run the cron jobs as the role that
   installed the extensions — it owns the `pgfc_observe`/`pgfc_govern` tables, so the partition
   DDL, all reads/writes, and `EXECUTE` on the functions are covered with no extra grants.
 - **A more confined role** must additionally be granted `USAGE` on both schemas, `EXECUTE` on
   their functions, read/write (`SELECT`/`INSERT`/`UPDATE`) on their tables, **and ownership of
-  the partitioned parent tables plus `TRUNCATE`** (for the `CREATE PARTITION OF` / `TRUNCATE` /
-  `DROP` above) — otherwise the first partition roll or nightly `retain()` fails.
+  the partitioned parent tables plus `TRUNCATE`** (for the ring `TRUNCATE` and the rollup
+  `CREATE`/`DROP` above) — otherwise the first ring rotation or nightly rollup GC fails.
 - For **active control** (`advisory_only = false`), the role additionally needs the right to
   run the `ALTER TABLE` that `apply()` issues — i.e. ownership of, or membership in the owning
   role of, each governed table.
@@ -449,8 +445,10 @@ SELECT * FROM pgfc_govern.degrade();   -- prunes only while over budget
 `degrade()` sheds storage in a **fixed order, most disposable first** — raw
 observations → fine (1m) rollups → coarse (1h/1d) rollups → resolved diagnostics →
 decisions/actions — and stops the moment the footprint is back under budget; the
-levels it never reached are reported as `skipped`. Policy and `policy_history` (the
-human-owned record of intent) are **never** pruned. With no `budget_bytes` configured
+levels it never reached are reported as `skipped`. (Since FMEA-001 the raw ring is bounded
+by construction, so its step force-sweeps but cannot shed below the fixed
+`(_ring_slots()-1)`-day floor — keep `budget_bytes` above that floor.) Policy and
+`policy_history` (the human-owned record of intent) are **never** pruned. With no `budget_bytes` configured
 `degrade()` does nothing, so it can never silently destroy telemetry. Drive it off the
 `over_budget` flag, or schedule it after the routine retention jobs:
 
