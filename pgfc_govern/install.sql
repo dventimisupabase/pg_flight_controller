@@ -1163,11 +1163,23 @@ BEGIN
     v_snap := pgfc_observe.observe();
     PERFORM pgfc_govern.classify(v_snap);
     PERFORM pgfc_govern.estimate(v_snap);
+    -- Mutual watchdog (FMEA-003): refresh the health state from the INDEPENDENT fast loop, so a
+    -- wedged control_tick() — which cannot evaluate its own health, since evaluate_health() runs
+    -- inside it — is still detected via control_loop_lag. Best-effort and isolated in a
+    -- subtransaction: observation is the foundation and must never be lost to a health-eval
+    -- hiccup (it simply re-evaluates next tick). The one wedge cause this cannot catch is a
+    -- broken evaluate_health() itself — then both loops' evaluators throw and governor_state
+    -- freezes; pg_cron's cron.job_run_details is the external backstop for that.
+    BEGIN
+        PERFORM pgfc_govern.evaluate_health();
+    EXCEPTION WHEN others THEN
+        NULL;   -- protect the snapshot; the next observe tick re-evaluates
+    END;
     RETURN v_snap;
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.observe_tick() IS
-  'Fast loop (~1 min): observe + classify + estimate; never actuates. Returns the new snapshot id. [subsystem:G1]';
+  'Fast loop (~1 min): observe + classify + estimate, then refresh the governor health state (the mutual-watchdog half of FMEA-003 — the independent loop catches a wedged control_tick() via control_loop_lag). Never actuates. Returns the new snapshot id. [subsystem:G1]';
 
 -- Control loop (~5 min): plan + (apply, only if not advisory_only) + verify.
 CREATE OR REPLACE FUNCTION pgfc_govern.control_tick()
@@ -1704,6 +1716,12 @@ VALUES
   ('health_lag_emergency_secs', 'empirical_default', '3600', 'seconds',
    'Observation lag above which the governor is in emergency — it is effectively flying blind.',
    'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('health_control_lag_degraded_secs', 'empirical_default', '1200', 'seconds',
+   'Control-loop lag (age of the last successfully-completed control_tick) above which the governor is degraded — the control loop is stalling. Must exceed the control cadence with margin so a normal between-cycle gap never trips it (the FMEA-003 heartbeat).',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
+  ('health_control_lag_emergency_secs', 'empirical_default', '3600', 'seconds',
+   'Control-loop lag above which the governor is in emergency — control_tick has stopped completing cycles and actuation has silently ceased (the FMEA-003 heartbeat).',
+   'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
   ('health_failed_degraded', 'empirical_default', '3', 'failed actions/hour',
    'Failed actuation attempts in the last hour above which the governor is degraded.',
    'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
@@ -2115,9 +2133,20 @@ SELECT
     -- Computed in the view (not a control function) so evaluate_health() carries no inline
     -- 100 literal under the P3 drift gate.
     (SELECT round(100 * s.client_backends::numeric / NULLIF(s.max_connections, 0))
-       FROM pgfc_observe.snapshots s ORDER BY s.snapshot_id DESC LIMIT 1)    AS connection_pressure_pct;
+       FROM pgfc_observe.snapshots s ORDER BY s.snapshot_id DESC LIMIT 1)    AS connection_pressure_pct,
+    -- control-loop heartbeat (FMEA-003): the last FULLY-completed cycle. finished_at is set
+    -- only after verify() succeeds, and a hard error rolls the whole tick row back, so
+    -- max(finished_at) is a faithful "last successful control_tick". It stays fresh in
+    -- advisory_only / disabled (those still run the cycle, just don't actuate), aging only on a
+    -- genuine wedge or a stopped control cron. NULL until the first cycle completes (boot):
+    -- absence is not ill health — the evaluate_health() candidate treats NULL as normal,
+    -- mirroring observation_lag. APPENDED AT THE END (not grouped with the tick_log signals
+    -- above) so CREATE OR REPLACE VIEW stays valid on the re-run-install upgrade path:
+    -- PostgreSQL only permits APPENDING columns to an existing view, never inserting mid-list.
+    (SELECT max(finished_at) FROM pgfc_govern.tick_log)                     AS last_successful_tick_at,
+    now() - (SELECT max(finished_at) FROM pgfc_govern.tick_log)             AS control_loop_lag;
 COMMENT ON VIEW pgfc_govern.governor_metrics IS
-  'One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-state evaluator: applied/failed/lock-timeout action counts over 1h/1d windows, observation lag (newest snapshot age), loop durations + tick errors (tick_log), the self-health storage footprint, the oldest retained audit row (retention backlog), the count of oscillating relations (Phase 1.7 F5), and the connection pressure from the newest snapshot (Phase 1.7 F6 load-shedding input). Always returns one row; counts are 0 and freshness signals NULL when nothing has happened yet. [subsystem:G4]';
+  'One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-state evaluator: applied/failed/lock-timeout action counts over 1h/1d windows, observation lag (newest snapshot age), loop durations + tick errors + the control-loop heartbeat (control_loop_lag — age of the last fully-completed cycle, FMEA-003) (tick_log), the self-health storage footprint, the oldest retained audit row (retention backlog), the count of oscillating relations (Phase 1.7 F5), and the connection pressure from the newest snapshot (Phase 1.7 F6 load-shedding input). Always returns one row; counts are 0 and freshness signals NULL when nothing has happened yet. [subsystem:G4]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Failure taxonomy — unified operator surface  (Phase 1.7 F6 — self-protection)
@@ -2153,11 +2182,19 @@ LATERAL (VALUES
      CASE WHEN COALESCE(m.observation_lag > make_interval(secs => pgfc_govern._param('health_lag_degraded_secs')::double precision), false)
           THEN format('observation lag %s — telemetry is stale', m.observation_lag)
           ELSE 'telemetry fresh' END),
-    -- decision: a control cycle errored out (estimation/planning failure)
+    -- decision: the control loop is failing. Two sources, OR'd. (1) A recorded tick error —
+    -- a LATENT out-of-band hook: nothing writes tick_log.error in-band, because recording it
+    -- there would require swallowing the error (blinding pg_cron's external retry/alerting), so
+    -- this clause stays dormant unless an out-of-band recorder ever fills the column (FMEA-003).
+    -- (2) The LIVE production signal: control_loop_lag past the degraded bound — control_tick
+    -- has stopped completing cycles. NULL lag (boot) is fresh, not failing (COALESCE to false).
     ('decision',
-     m.tick_errors_last_day > 0,
+     m.tick_errors_last_day > 0
+       OR COALESCE(m.control_loop_lag > make_interval(secs => pgfc_govern._param('health_control_lag_degraded_secs')::double precision), false),
      CASE WHEN m.tick_errors_last_day > 0
           THEN format('%s control cycle(s) errored in the last day', m.tick_errors_last_day)
+          WHEN COALESCE(m.control_loop_lag > make_interval(secs => pgfc_govern._param('health_control_lag_degraded_secs')::double precision), false)
+          THEN format('no successful control cycle in %s — the control loop is stalled', m.control_loop_lag)
           ELSE 'no cycle errors' END),
     -- actuation: an attempted change failed (lock timeout / permission / conflicting DDL)
     ('actuation',
@@ -2207,6 +2244,7 @@ AS $fn$
 DECLARE
     m          record;
     v_lag      numeric;
+    v_clag     numeric;
     v_current  pgfc_govern.governor_health_state;
     v_computed pgfc_govern.governor_health_state;
     v_reason   text;
@@ -2216,6 +2254,7 @@ DECLARE
 BEGIN
     SELECT * INTO m FROM pgfc_govern.governor_metrics;     -- guaranteed one row (F1)
     v_lag := EXTRACT(EPOCH FROM m.observation_lag);        -- NULL when nothing observed yet
+    v_clag := EXTRACT(EPOCH FROM m.control_loop_lag);      -- NULL when no cycle completed yet
 
     -- Effective daily mutation budget (Phase 1.7 F4 breaker), resolved the same way apply()
     -- does: live policy, falling back to the registry default — so the breaker tracks the
@@ -2235,6 +2274,18 @@ BEGIN
               ELSE 'normal' END::pgfc_govern.governor_health_state,
          CASE WHEN v_lag > pgfc_govern._param('health_lag_degraded_secs')::numeric
               THEN format('observation lag %ss — telemetry is stale', round(v_lag)) END),
+        -- stale control loop (FMEA-003): control_tick() has stopped completing cycles. This
+        -- evaluator runs from observe_tick() too, so a WEDGED control_tick — which cannot
+        -- evaluate its own health (this function runs inside it) — is still caught by the
+        -- INDEPENDENT fast loop. Mirrors the observation-lag ladder (degraded -> emergency); the
+        -- symmetry is the point — control_tick watches observe via observation_lag, observe
+        -- watches control via control_loop_lag. NULL lag (no completed cycle yet — boot, or
+        -- control never scheduled) yields the 'normal' candidate, so absence is not ill health.
+        (CASE WHEN v_clag > pgfc_govern._param('health_control_lag_emergency_secs')::numeric THEN 'emergency'
+              WHEN v_clag > pgfc_govern._param('health_control_lag_degraded_secs')::numeric  THEN 'degraded'
+              ELSE 'normal' END::pgfc_govern.governor_health_state,
+         CASE WHEN v_clag > pgfc_govern._param('health_control_lag_degraded_secs')::numeric
+              THEN format('control loop lag %ss — no successful control cycle', round(v_clag)) END),
         -- repeated actuation failures: a circuit-breaker precursor
         (CASE WHEN m.failed_actions_last_hour > pgfc_govern._param('health_failed_diagnostic')::bigint THEN 'diagnostic'
               WHEN m.failed_actions_last_hour > pgfc_govern._param('health_failed_degraded')::bigint   THEN 'degraded'
@@ -2319,7 +2370,7 @@ BEGIN
 END
 $fn$;
 COMMENT ON FUNCTION pgfc_govern.evaluate_health() IS
-  'Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds (failed actions, lock timeouts, observation lag, storage footprint, the F4 daily-mutation-budget circuit breaker — degraded-level only — the F5 control-oscillation signal — diagnostic — and the F6 connection-pressure load-shedding signal — diagnostic), then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. The state it writes is the input to the F4 apply() authority gate. Returns the effective state. [subsystem:G4]';
+  'Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds (failed actions, lock timeouts, observation lag, the control-loop-lag heartbeat (FMEA-003), storage footprint, the F4 daily-mutation-budget circuit breaker — degraded-level only — the F5 control-oscillation signal — diagnostic — and the F6 connection-pressure load-shedding signal — diagnostic), then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. The state it writes is the input to the F4 apply() authority gate. Returns the effective state. [subsystem:G4]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Human-override surface  (Phase 1.7 F3 — governor self-protection)
