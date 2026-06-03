@@ -63,7 +63,7 @@ Modes worked and found to **fail safe** as built (the reassuring half of the ana
 | FMEA-002 | Medium | Confirmed | both `install.sql` (no `pg_is_in_recovery`) | No standby guard: the loops error every tick on a read-only replica; fail-safe but noisy and a post-failover footgun. | Accepted | [#80](https://github.com/dventimisupabase/pg_flight_controller/issues/80) |
 | FMEA-003 | Medium | Confirmed | `pgfc_govern/install.sql:2025`, `:1171`, `:1143-1191` | Control-loop errors are invisible: `tick_log.error` is never written and a hard error rolls the tick row back, so the tick-error breaker is structurally dead and a wedged `control_tick` keeps the governor `normal`. | Accepted | [#84](https://github.com/dventimisupabase/pg_flight_controller/issues/84) |
 | FMEA-004 | Medium | Confirmed | `pgfc_observe/install.sql` (`retain`/`drop_empty_partitions`/`_ensure_partition`, no `lock_timeout`) | Storage-maintenance DDL took `ACCESS EXCLUSIVE` with no bounded `lock_timeout` — an Invariant-1 gap outside the `apply()` path. | Verified | [#81](https://github.com/dventimisupabase/pg_flight_controller/issues/81) |
-| FMEA-005 | Medium | Confirmed | `pgfc_govern/install.sql:1176-1180`, `:1143-1191` | No per-relation error isolation: one uncaught error in `apply()` aborts the whole cycle (all relations roll back), deterministically and — per FMEA-003 — invisibly. | Accepted | [#82](https://github.com/dventimisupabase/pg_flight_controller/issues/82) |
+| FMEA-005 | Medium | Confirmed | `pgfc_govern/install.sql:1176-1180`, `:1143-1191` | No per-relation error isolation: one uncaught error in `apply()` aborted the whole cycle (all relations rolled back), deterministically and — per FMEA-003 — invisibly. | Verified | [#82](https://github.com/dventimisupabase/pg_flight_controller/issues/82) |
 | FMEA-006 | Low | Confirmed | `pgfc_govern/install.sql:993-994` | `apply()` overwrote a human `ALTER` (made after the planning snapshot) whose value differs from the proposal — it re-checked neither `actuator_state` nor `manage_user_owned`. | Verified | [#83](https://github.com/dventimisupabase/pg_flight_controller/issues/83) |
 | FMEA-007 | Low | Confirmed | `pgfc_govern/install.sql:1150` | `control_tick` takes a **blocking** advisory lock (not `try`) *before* `evaluate_health()`, so under cadence pressure ticks queue (each holding a backend) and F6 load-shedding cannot shed them. | Won't-fix (by-design) | — |
 
@@ -166,17 +166,32 @@ as the `apply()` live-lock-timeout gap).
 
 ### FMEA-005 — No per-relation error isolation in the apply loop
 
-**Severity:** Medium · **Confidence:** Confirmed · **Status:** Accepted ([#82](https://github.com/dventimisupabase/pg_flight_controller/issues/82))
+**Severity:** Medium · **Confidence:** Confirmed · **Status:** Verified (fixed in [#82](https://github.com/dventimisupabase/pg_flight_controller/issues/82))
 
-The apply loop (`pgfc_govern/install.sql:1176-1180`) wraps each `apply()` in no
+The apply loop (`pgfc_govern/install.sql:1176-1180`) wrapped each `apply()` in no
 subtransaction, and `apply()` catches only `lock_not_available`/`insufficient_privilege`. Any
 *other* uncaught error (a corrupted `lock_timeout` registry value making `set_config` throw; a
-future actuator's DDL error) aborts the whole single-transaction cycle — rolling back **all**
+future actuator's DDL error) aborted the whole single-transaction cycle — rolling back **all**
 relations' changes, deterministically every cycle, and invisibly (FMEA-003). This is the flip
 side of the (good) all-or-nothing atomicity: atomicity is right for a *multi-actuator batch*,
-but the per-relation loop has no isolation, so one poison relation denies actuation to all.
-**Recommendation:** wrap each `apply()` (or each relation) in a `BEGIN … EXCEPTION WHEN
-others` subtransaction that records the failure and continues.
+but the per-relation loop had no isolation, so one poison relation denied actuation to all.
+
+**Resolution.** The apply loop now wraps each `apply()` in its own `BEGIN … EXCEPTION WHEN
+others` subtransaction. A poison relation's uncaught error rolls back only that relation's
+attempt — including a half-completed `apply()` whose inner `ALTER` block already released its
+own savepoint, so only a savepoint taken *before* the `apply()` call can unwind it — then the
+loop records the failure and continues, so one bad relation can no longer deny actuation to
+all. The failure is recorded as a `failed` `action_history` row stamped `failure_class =
+'actuation'` (the category is structural — the error arose in the actuation loop — not derivable
+from open-ended error text), carrying the `SQLSTATE`/message as `failure_reason`: now **visible**
+(vs the silent total denial above), surfaced in `failure_taxonomy`, and feeding the failed-action
+breaker exactly like a `lock_timeout` — a genuine, repeating actuation failure trips it visibly,
+and because the breaker's diagnostic state short-circuits `apply()`'s authority gate before this
+error path, it cannot self-amplify. The recording `INSERT` itself can never throw (it runs with
+no savepoint beneath it), so it cannot re-wedge the cycle. Regression test
+`pgfc_govern/tests/24_apply_isolation.sql`: a per-relation DDL failure (an event trigger that
+raises for one relation) is isolated and recorded while a healthy relation in the same cycle
+still actuates — red pre-fix.
 
 ### FMEA-006 — `apply()` can overwrite a human `ALTER` made after the planning snapshot
 
@@ -222,11 +237,11 @@ Failure modes attach to the invariants/mechanisms they stress (extends the Phase
 |---|---|---|
 | Inv 1 — never wait on locks | FMEA-004 (maintenance DDL, no `lock_timeout`) | FMEA-004 **Verified** (#81); skip-under-contention → Phase 3 |
 | Inv 4 — never exceed mutation budgets | crash mid-cycle | Cited-safe (single-txn atomicity) |
-| Inv 6 — every action explainable | FMEA-003 (loop errors unrecorded), FMEA-005 (silent total denial) | Findings |
+| Inv 6 — every action explainable | FMEA-003 (loop errors unrecorded), FMEA-005 (silent total denial) | FMEA-005 **Verified** (#82); FMEA-003 → #84 |
 | F1 — self-monitoring metrics | FMEA-003 (`tick_errors_last_day` structurally 0) | Finding |
 | F2 — health-state machine | worst-of under conflicting signals | Cited-safe |
 | F6 — load shedding | FMEA-007 (lock wait precedes health eval) | Won't-fix |
-| F7 — active-control activation | FMEA-002 (standby), FMEA-005 (poison relation), FMEA-006 (post-snapshot human race) | FMEA-006 **Verified** (#83); 002/005 open |
+| F7 — active-control activation | FMEA-002 (standby), FMEA-005 (poison relation), FMEA-006 (post-snapshot human race) | FMEA-005/006 **Verified** (#82/#83); 002 open |
 
 ## Exit criteria
 
