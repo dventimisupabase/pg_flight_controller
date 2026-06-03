@@ -953,6 +953,10 @@ DECLARE
     v_base_explicit boolean;
     v_base_value    text;
     v_decid bigint;
+    -- FMEA-006 (#83) — actuation-point ownership re-check.
+    v_gov_value  text;       -- the value the governor last set (actuator_state.current_value)
+    v_have_state boolean;    -- does an actuator_state row exist for this (relid, actuator)?
+    v_manage     boolean;    -- policy.manage_user_owned (COALESCE registry default)
     -- Phase 1.7 F4 — authority gate + Invariant-4 mutation budget.
     v_state        pgfc_govern.governor_health_state;
     v_min_interval interval;
@@ -1024,12 +1028,37 @@ BEGIN
     -- inline numeric literals (the per-day window is sourced from the governor_metrics
     -- view, the per-cycle scope from the tick id) so apply() stays clean under the P3
     -- drift gate. An over-budget attempt is refused silently, exactly like the gate above.
-    SELECT min_interval, global_max_changes_per_cycle, daily_mutation_budget
-      INTO v_min_interval, v_max_cycle, v_daily_budget
+    -- Read the active policy once (the same enabled row plan() used, so the two agree on
+    -- manage_user_owned): the Invariant-4 budgets AND the FMEA-006 ownership flag.
+    SELECT min_interval, global_max_changes_per_cycle, daily_mutation_budget, manage_user_owned
+      INTO v_min_interval, v_max_cycle, v_daily_budget, v_manage
       FROM pgfc_govern.policy WHERE enabled ORDER BY policy_name LIMIT 1;
     v_min_interval := COALESCE(v_min_interval, pgfc_govern._param('min_interval')::interval);
     v_max_cycle    := COALESCE(v_max_cycle, pgfc_govern._param('global_max_changes_per_cycle')::integer);
     v_daily_budget := COALESCE(v_daily_budget, pgfc_govern._param('daily_mutation_budget')::integer);
+    v_manage       := COALESCE(v_manage, pgfc_govern._param('manage_user_owned')::boolean);
+
+    -- FMEA-006 (#83): re-check ownership at the ACTUATION point, against the LIVE value.
+    -- COR-001's guard runs in plan(), against a snapshot a cycle earlier; the no-op gate above
+    -- only catches a human value that exactly equals the proposal. A human ALTER landing
+    -- between plan() and here, to a value that DIFFERS from the proposal, would otherwise be
+    -- overwritten this cycle. Mirror COR-001's sf_user_set predicate on the live reloption: the
+    -- governor "owns" the live value only when it has a baseline row, INTRODUCED the option
+    -- (baseline_explicit = false), and the live value still equals what it last set
+    -- (current_value). Any other explicit live value is user-owned; unless manage_user_owned,
+    -- refuse SILENTLY (the decision_log row and the live catalog are the audit trail —
+    -- recording 'failed' would feed the breaker). This read also serves the baseline capture
+    -- below (NEVER overwrite the baseline — preserved by the NOT v_have_state branch there).
+    SELECT baseline_explicit, baseline_value, current_value
+      INTO v_base_explicit, v_base_value, v_gov_value
+      FROM pgfc_govern.actuator_state WHERE relid = p_relid AND actuator = v_act;
+    v_have_state := FOUND;
+    IF NOT v_manage
+       AND v_cur IS NOT NULL
+       AND NOT (v_have_state AND NOT v_base_explicit
+                AND v_cur IS NOT DISTINCT FROM v_gov_value) THEN
+        RETURN false;
+    END IF;
 
     -- per-relation rate limit: one mutation per relation per min_interval
     IF EXISTS (SELECT 1 FROM pgfc_govern.action_history
@@ -1048,10 +1077,11 @@ BEGIN
         RETURN false;
     END IF;
 
-    -- baseline: capture pre-governor state on first touch, never overwrite
-    SELECT baseline_explicit, baseline_value INTO v_base_explicit, v_base_value
-    FROM pgfc_govern.actuator_state WHERE relid = p_relid AND actuator = v_act;
-    IF NOT FOUND THEN
+    -- baseline: capture pre-governor state on first touch, never overwrite. The
+    -- actuator_state row was already read for the FMEA-006 ownership gate above (into
+    -- v_base_explicit / v_base_value / v_have_state); first touch (no row) derives the
+    -- baseline from the live value, exactly as before.
+    IF NOT v_have_state THEN
         v_base_explicit := (v_cur IS NOT NULL);
         v_base_value    := v_cur;
     END IF;

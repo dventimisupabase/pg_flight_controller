@@ -104,9 +104,9 @@ Stages 1–6 are the caller (`control_tick()`); stages 7–17 are the actuator
       a user-owned relation would bypass it — but that requires write access to
       `decision_log` (a caller who could `ALTER` the table directly), the same boundary as
       SEC-002, and **COR-002** records `control_tick()` as the sole sanctioned entrypoint.
-      Not a separate finding. (The related *within-cycle* human-`ALTER` race — where `apply()`
-      overwrites a post-`plan()` human value that differs from the proposal — is treated under
-      **Concurrency** above and deferred to Phase 2 FMEA.)
+      Not a separate finding. (The related human-`ALTER` race — where `apply()` overwrites a
+      human value set after the planning snapshot — is treated under **Concurrency** below and
+      is now closed at the actuation point by FMEA-006, [#83](https://github.com/dventimisupabase/pg_flight_controller/issues/83).)
 - [x] **Audit integrity.**
       **Disposition:** cited-safe. `action_history` is written only on the real outcome —
       `applied` on success (stage 17), `failed` only inside the `lock_not_available` /
@@ -151,16 +151,16 @@ Stages 1–6 are the caller (`control_tick()`); stages 7–17 are the actuator
       when the live value already equals the proposal — the same code path, covered by
       `19_activation`.
 - [x] **Concurrency.**
-      **Disposition:** cited-safe + **COR-002**, with one narrow race deferred to Phase 2.
-      `control_tick` is serialized against itself by `pg_advisory_xact_lock`; loop-ordering
-      (F7) addresses the `observe_tick` race. The live re-read catches the human-`ALTER` race
-      **only when the human set exactly the proposal** (the no-op arbiter compares for
-      equality). A human value set between this cycle's `plan()` and `apply()` that *differs*
-      from the proposal, on a relation `plan()` classified `adjust`, **is overwritten this
-      cycle** — `apply()` consults neither `actuator_state` nor `manage_user_owned`. The
-      window is sub-second and COR-001 protects the human change on the *next* cycle, so it
-      self-heals; full concurrency/interleaving treatment (including this within-cycle race
-      and direct out-of-cycle `apply()`, the latter **COR-002**) is **Phase 2 FMEA** surface.
+      **Disposition:** cited-safe + **COR-002** + **FMEA-006** (closed). `control_tick` is
+      serialized against itself by `pg_advisory_xact_lock`; loop-ordering (F7) addresses the
+      `observe_tick` race. The no-op re-read catches a human-`ALTER` race **only when the human
+      set exactly the proposal**; a human value set after the planning snapshot that *differs*
+      from the proposal was originally overwritten that cycle — now closed by **FMEA-006**
+      ([#83](https://github.com/dventimisupabase/pg_flight_controller/issues/83)): `apply()`
+      re-checks ownership against the live value and refuses unless `manage_user_owned`. The
+      remaining interleavings (direct out-of-cycle `apply()` bypassing the advisory lock, and
+      one poison relation aborting the whole cycle) are **COR-002** and **FMEA-005** — the
+      Phase 2 FMEA surface.
 - [x] **Idempotency / re-entrancy.**
       **Disposition:** cited-safe, tested. Replaying a decision after success is a no-op (the
       live re-read sees the value already applied); a rapid second `apply()` is blocked by
