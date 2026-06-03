@@ -84,6 +84,14 @@ Run tests with:
 ./test.sh 17     # a single version (fast dev loop)
 ```
 
+`test.sh` only does a fresh install (applied twice for idempotency). To exercise the **upgrade** path — install the latest release tag's shape, apply the current `install.sql` over it, and run the suite against the upgraded database — use `upgrade.sh` (CI runs it as a required check, so a schema change that breaks upgrade-from-release is caught):
+
+```bash
+./upgrade.sh                              # latest release tag -> HEAD, all versions
+./upgrade.sh 17                           # a single version
+PGFC_UPGRADE_FROM=v0.2.0 ./upgrade.sh 17  # upgrade from a specific ref
+```
+
 Tests are distributed across extension subdirectories:
 
 - `pgfc_observe/tests/`
