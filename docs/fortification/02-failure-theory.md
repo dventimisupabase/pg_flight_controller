@@ -147,10 +147,11 @@ IF;`. In `observe()` it sits ahead of `_ensure_partition()`'s DDL; in `control_t
 even the advisory lock — so a standby takes no lock and writes nothing, and the loops resume
 automatically on promotion. The check is single-sourced in `pgfc_observe` (the independent base
 layer) so an observe-only install is covered and `pgfc_govern` reuses it cross-schema — the same
-"small helper, single-sourced" move as FMEA-004's `_maintenance_lock_timeout()`. Scope is the
-three high-frequency loops the finding names; the daily maintenance writers (`retain` /
-`drop_empty_partitions` / `rollup`, `govern.retain`) also error on a standby but only once a day
-— noted as a small follow-up, not folded in here.
+"small helper, single-sourced" move as FMEA-004's `_maintenance_lock_timeout()`. The original
+fix scoped only the three high-frequency loops; a follow-up extends the same `_is_standby()`
+guard to the daily maintenance writers (`rollup` / `rollup_retain` / `govern.retain` /
+`degrade`), which otherwise error on a standby once a day — so every scheduled writer in both
+extensions now idles on a replica and resumes on promotion.
 
 **Interaction with the FMEA-003 heartbeat.** On a steady standby both loops no-op, so
 `evaluate_health()` never runs and `control_loop_lag` is never evaluated — no false alarm; a

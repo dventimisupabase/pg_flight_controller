@@ -315,8 +315,9 @@ state and bypass the serialization `control_tick()` provides.
 tick — instead they **idle**: `observe()`, `observe_tick()`, and `control_tick()` check
 `pg_is_in_recovery()` first and no-op (return `NULL`) on a replica, resuming automatically
 when it is promoted. So you can schedule the same cron jobs on every node and only the primary
-acts. (The daily maintenance jobs above are not yet guarded — on a standby they error
-harmlessly once a day until promotion.) Just after a failover, a promoted node whose control
+acts. (The daily maintenance jobs above are guarded the same way — `rollup`, `rollup_retain`,
+`pgfc_govern.retain`, and `degrade` also idle on a replica, so they no longer error once a day.)
+Just after a failover, a promoted node whose control
 loop has not yet completed a cycle may briefly show `emergency`: the control-loop heartbeat is
 honestly reporting "no successful cycle yet," and it clears on the first post-promotion
 `control_tick()`.

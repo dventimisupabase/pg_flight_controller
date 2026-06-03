@@ -1058,6 +1058,10 @@ DECLARE
     d       integer;
     m       integer;
 BEGIN
+    -- FMEA-002 (daily-job follow-up): idle on a read-only standby — the first statement, so a
+    -- nightly rollup on a replica no-ops (returns NULL) instead of erroring. Resumes on promotion.
+    IF pgfc_observe._is_standby() THEN RETURN NULL; END IF;
+
     -- Ensure the partitions covering the lookback window exist on every tier.
     FOR d IN SELECT generate_series(pgfc_observe._epoch_day(now() - p_lookback),
                                     pgfc_observe._epoch_day(now())) LOOP
@@ -1496,6 +1500,10 @@ DECLARE
     r       record;
     v_keep  interval;
 BEGIN
+    -- FMEA-002 (daily-job follow-up): idle on a read-only standby (returns NULL), resuming on
+    -- promotion — the first statement, ahead of any DROP.
+    IF pgfc_observe._is_standby() THEN RETURN NULL; END IF;
+
     -- FMEA-004 (Invariant 1): bound the lock wait; skip a busy partition (the DROP takes
     -- ACCESS EXCLUSIVE). The window check is a pure computation, so only the DROP is guarded.
     PERFORM set_config('lock_timeout', pgfc_observe._maintenance_lock_timeout(), true);
