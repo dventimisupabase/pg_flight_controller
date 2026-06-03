@@ -312,6 +312,16 @@ net. The functions beneath it — `plan()`, and especially `apply()` — are **i
 must not be called directly; calling `apply()` out of cycle would act on a stale health
 state and bypass the serialization `control_tick()` provides.
 
+**Standbys and failover.** The loops write, so on a read-only standby they would error every
+tick — instead they **idle**: `observe()`, `observe_tick()`, and `control_tick()` check
+`pg_is_in_recovery()` first and no-op (return `NULL`) on a replica, resuming automatically
+when it is promoted. So you can schedule the same cron jobs on every node and only the primary
+acts. (The daily maintenance jobs above are not yet guarded — on a standby they error
+harmlessly once a day until promotion.) Just after a failover, a promoted node whose control
+loop has not yet completed a cycle may briefly show `emergency`: the control-loop heartbeat is
+honestly reporting "no successful cycle yet," and it clears on the first post-promotion
+`control_tick()`.
+
 The high-volume telemetry tables (`snapshots`, `relation_samples`) are **daily
 `RANGE` partitioned** on an `int4` epoch-day key, and retention is whole-partition
 rotation — never row-by-row `DELETE` — so it reclaims space instantly and leaves zero
