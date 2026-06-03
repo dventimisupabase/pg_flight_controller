@@ -72,7 +72,7 @@ Modes worked and found to **fail safe** as built (the reassuring half of the ana
 | FMEA-005 | Medium | Confirmed | `pgfc_govern/install.sql:1176-1180`, `:1143-1191` | No per-relation error isolation: one uncaught error in `apply()` aborted the whole cycle (all relations rolled back), deterministically and — per FMEA-003 — invisibly. | Verified | [#82](https://github.com/dventimisupabase/pg_flight_controller/issues/82) |
 | FMEA-006 | Low | Confirmed | `pgfc_govern/install.sql:993-994` | `apply()` overwrote a human `ALTER` (made after the planning snapshot) whose value differs from the proposal — it re-checked neither `actuator_state` nor `manage_user_owned`. | Verified | [#83](https://github.com/dventimisupabase/pg_flight_controller/issues/83) |
 | FMEA-007 | Low | Confirmed | `pgfc_govern/install.sql:1150` | `control_tick` takes a **blocking** advisory lock (not `try`) *before* `evaluate_health()`, so under cadence pressure ticks queue (each holding a backend) and F6 load-shedding cannot shed them. | Won't-fix (by-design) | — |
-| FMEA-008 | Low | Confirmed | `pgfc_govern/install.sql:~762`, `:1296` | `plan()` and the `governor_status` view divide by `policy.aggressiveness` (no `CHECK`); an operator-set `aggressiveness ≤ 0` (advisorily flagged `CRITICAL` by `validate_parameters`, not enforced) is a division-by-zero — `plan()` wedges the control loop, `governor_status` throws on read. | Open | [#96](https://github.com/dventimisupabase/pg_flight_controller/issues/96) |
+| FMEA-008 | Low | Confirmed | `pgfc_govern/install.sql:~762`, `:1296` | `plan()` and the `governor_status` view divide by `policy.aggressiveness` (no `CHECK`); an operator-set `aggressiveness ≤ 0` (advisorily flagged `CRITICAL` by `validate_parameters`, not enforced) is a division-by-zero — `plan()` wedges the control loop, `governor_status` throws on read. | Verified | [#96](https://github.com/dventimisupabase/pg_flight_controller/issues/96) |
 | FMEA-009 | Low | Confirmed | `pgfc_govern/install.sql:1167-1169` | `observe_tick()` runs `observe()`+`classify()`+`estimate()` in one txn with no per-stage isolation; an uncaught `classify()`/`estimate()` exception discards the just-collected snapshot — inconsistent with FMEA-003's subtransaction protection of the same observation. | Open | [#97](https://github.com/dventimisupabase/pg_flight_controller/issues/97) |
 
 ### FMEA-001 — Partition recycling uses create/drop, not a fixed `TRUNCATE` ring
@@ -333,7 +333,7 @@ rather than filed.
 
 ### FMEA-008 — `plan()` / `governor_status` divide by `policy.aggressiveness` with no guard
 
-**Severity:** Low · **Confidence:** Confirmed · **Status:** Open ([#96](https://github.com/dventimisupabase/pg_flight_controller/issues/96))
+**Severity:** Low · **Confidence:** Confirmed · **Status:** Verified (fixed in [#96](https://github.com/dventimisupabase/pg_flight_controller/issues/96))
 
 `policy.aggressiveness` is `double precision NOT NULL DEFAULT 1.0` with **no `CHECK`**, so an
 operator can `UPDATE pgfc_govern.policy SET aggressiveness = 0` at runtime. `plan()` derives the
@@ -354,6 +354,20 @@ chose *advisory* validation over enforcement, and reversing that is a decision f
 maintainer, not an FMEA-pass default. Candidate fixes — a `CHECK (aggressiveness > 0)` on
 `policy` (reject at config time), or `NULLIF`/clamp guards in `plan()` and `governor_status`
 (fail soft). `Low`: operator-reachable, self-inflicted, fail-safe, detected, advisorily warned.
+
+**Resolution.** The fail-soft option, single-sourced. A new
+`pgfc_govern._effective_aggressiveness(double precision)` (the raw value if `> 0`, else the
+registry default) now wraps the divisor at **both** sites — `plan()` (`v_aggr :=
+_effective_aggressiveness(v_aggr)`) and the `governor_status` view's `template / aggressiveness`.
+A non-positive or NULL `aggressiveness` falls back to the default instead of dividing by zero, so
+the control loop keeps planning and the status view keeps returning rows. **Defense-in-depth, not
+enforcement** — no `CHECK` was added, preserving the deliberate advisory-validation design;
+`validate_parameters()` still grades `aggressiveness <= 0` `CRITICAL`, so the operator is still
+loudly told the value is invalid (and now treated as the default). Regression test
+`pgfc_govern/tests/27_aggressiveness_guard.sql`: the helper maps `0`/negative/NULL to the default
+and passes a positive value through; with `aggressiveness = 0` a planned relation's
+`governor_status` target equals its default-`1.0` result and neither `governor_status` nor
+`control_tick()` throws — red pre-fix (division-by-zero at both sites).
 
 ### FMEA-009 — `observe_tick()` has no per-stage isolation; a decide-stage exception drops the snapshot
 
@@ -390,7 +404,7 @@ Failure modes attach to the invariants/mechanisms they stress (extends the Phase
 | F6 — load shedding | FMEA-007 (lock wait precedes health eval) | Won't-fix |
 | F7 — active-control activation | FMEA-002 (standby), FMEA-005 (poison relation), FMEA-006 (post-snapshot human race) | FMEA-002/005/006 **Verified** (#80/#82/#83) |
 | F1 — self-monitoring / observation liveness | FMEA-009 (a `classify()`/`estimate()` exception discards the just-collected snapshot) | `Low`, filed ([#97](https://github.com/dventimisupabase/pg_flight_controller/issues/97)); fail-safe, detected via `observation_lag` |
-| Parameter governance (P1–P3) — advisory vs. enforced | FMEA-008 (`plan()`/`governor_status` divide by `aggressiveness`; `≤ 0` wedges the loop + errors the view) | `Low`, filed ([#96](https://github.com/dventimisupabase/pg_flight_controller/issues/96)); `validate_parameters` flags `CRITICAL` (advisory) |
+| Parameter governance (P1–P3) — advisory vs. enforced | FMEA-008 (`plan()`/`governor_status` divide by `aggressiveness`; `≤ 0` wedges the loop + errors the view) | FMEA-008 **Verified** ([#96](https://github.com/dventimisupabase/pg_flight_controller/issues/96)) — `_effective_aggressiveness` guard (fail-soft, `validate_parameters` still flags `CRITICAL`) |
 
 ## Exit criteria
 
