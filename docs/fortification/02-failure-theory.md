@@ -62,7 +62,7 @@ Modes worked and found to **fail safe** as built (the reassuring half of the ana
 | FMEA-001 | Medium | Confirmed | `pgfc_observe/install.sql:~509`, `:~1397` | Telemetry uses create/drop daily partitions, churning the system catalogs, where the lineage used a fixed `TRUNCATE` ring (zero churn). | Accepted (adopt the ring) | [#79](https://github.com/dventimisupabase/pg_flight_controller/issues/79) |
 | FMEA-002 | Medium | Confirmed | both `install.sql` (no `pg_is_in_recovery`) | No standby guard: the loops error every tick on a read-only replica; fail-safe but noisy and a post-failover footgun. | Accepted | [#80](https://github.com/dventimisupabase/pg_flight_controller/issues/80) |
 | FMEA-003 | Medium | Confirmed | `pgfc_govern/install.sql:2025`, `:1171`, `:1143-1191` | Control-loop errors are invisible: `tick_log.error` is never written and a hard error rolls the tick row back, so the tick-error breaker is structurally dead and a wedged `control_tick` keeps the governor `normal`. | Accepted | [#84](https://github.com/dventimisupabase/pg_flight_controller/issues/84) |
-| FMEA-004 | Medium | Confirmed | `pgfc_observe/install.sql` (`retain`/`drop_empty_partitions`/`_ensure_partition`, no `lock_timeout`) | Storage-maintenance DDL takes `ACCESS EXCLUSIVE` with no bounded `lock_timeout` — an Invariant-1 gap outside the `apply()` path. | Accepted | [#81](https://github.com/dventimisupabase/pg_flight_controller/issues/81) |
+| FMEA-004 | Medium | Confirmed | `pgfc_observe/install.sql` (`retain`/`drop_empty_partitions`/`_ensure_partition`, no `lock_timeout`) | Storage-maintenance DDL took `ACCESS EXCLUSIVE` with no bounded `lock_timeout` — an Invariant-1 gap outside the `apply()` path. | Verified | [#81](https://github.com/dventimisupabase/pg_flight_controller/issues/81) |
 | FMEA-005 | Medium | Confirmed | `pgfc_govern/install.sql:1176-1180`, `:1143-1191` | No per-relation error isolation: one uncaught error in `apply()` aborts the whole cycle (all relations roll back), deterministically and — per FMEA-003 — invisibly. | Accepted | [#82](https://github.com/dventimisupabase/pg_flight_controller/issues/82) |
 | FMEA-006 | Low | Confirmed | `pgfc_govern/install.sql:993-994` | `apply()` overwrote a human `ALTER` (made after the planning snapshot) whose value differs from the proposal — it re-checked neither `actuator_state` nor `manage_user_owned`. | Verified | [#83](https://github.com/dventimisupabase/pg_flight_controller/issues/83) |
 | FMEA-007 | Low | Confirmed | `pgfc_govern/install.sql:1150` | `control_tick` takes a **blocking** advisory lock (not `try`) *before* `evaluate_health()`, so under cadence pressure ticks queue (each holding a backend) and F6 load-shedding cannot shed them. | Won't-fix (by-design) | — |
@@ -132,16 +132,37 @@ swallow-and-record (trading off pg_cron's own retry/alerting).
 
 ### FMEA-004 — Storage-maintenance DDL sets no `lock_timeout` (Invariant-1 gap)
 
-**Severity:** Medium · **Confidence:** Confirmed · **Status:** Accepted ([#81](https://github.com/dventimisupabase/pg_flight_controller/issues/81))
+**Severity:** Medium · **Confidence:** Confirmed · **Status:** Verified (mechanism) — fixed in [#81](https://github.com/dventimisupabase/pg_flight_controller/issues/81)
 
 Invariant 1 requires *all* lock-acquiring operations to use bounded timeouts. `apply()`
-honors it; the observe-side maintenance functions do not — `retain()` (`TRUNCATE`),
+honors it; the observe-side maintenance functions did not — `retain()` (`TRUNCATE`),
 `drop_empty_partitions()` (`DROP`), and `_ensure_partition()` (`CREATE … PARTITION OF`) take
 `ACCESS EXCLUSIVE` and would **wait unboundedly** behind a long reader/writer on a telemetry
 partition (no `lock_timeout`/`set_config` anywhere in `pgfc_observe/install.sql`). **Low blast
-radius** (the governor's own low-contention tables), but a stated hard invariant is unenforced
-on these paths. **Recommendation:** set a bounded `lock_timeout` at the head of each
-maintenance function; treat a timeout as a normal skip-and-retry-next-run outcome.
+radius** (the governor's own low-contention tables), but a stated hard invariant was unenforced
+on these paths.
+
+**Resolution.** A single helper `pgfc_observe._maintenance_lock_timeout()` (mirrors
+`_telemetry_reloptions`, so observe stays independent of `pgfc_govern`'s registry) single-sources
+a bounded value (`5s` — generous next to `apply()`'s `100ms`, since off-peak GC can wait a
+couple of seconds for a transient reader of the governor's own tables, where user-facing
+actuation cannot). Every recurring maintenance function — `_ensure_partition`, `_ensure_part`,
+`retain`, `drop_empty_partitions`, `rollup_retain` — sets it txn-local at the top of its body.
+The three **looping** GC functions additionally wrap each partition's work (the `EXISTS` probe
+*and* the `TRUNCATE`/`DROP`, since both acquire locks) in a per-partition subtransaction that
+catches `lock_not_available` and **skips** that partition (retried next run) rather than
+aborting the whole run's truncates; `_ensure_partition` lets a timeout propagate (observe skips
+that run, retries next minute).
+
+**Scope.** Inv 1 governs the *autonomous cron* path. The install-time DDL — the S2 destructive
+recreate and the `DO $reloptions$` per-partition backfill — is deliberately **not** bounded:
+re-running `install.sql` is the supervised upgrade path, where a human-run migration may block.
+
+**Verification.** `pgfc_observe/tests/13_maintenance_lock_timeout.sql` asserts each function
+leaves a *bounded* `lock_timeout` (baseline the GUC to `0` = unbounded, call, assert it changed)
+— the deterministic mechanism. The per-partition **skip-under-contention** path is exercised
+only by construction; an end-to-end concurrent-lock test is **Phase-3 coverage** (the same shape
+as the `apply()` live-lock-timeout gap).
 
 ### FMEA-005 — No per-relation error isolation in the apply loop
 
@@ -199,7 +220,7 @@ Failure modes attach to the invariants/mechanisms they stress (extends the Phase
 
 | Invariant / mechanism | Stressed by | Disposition |
 |---|---|---|
-| Inv 1 — never wait on locks | FMEA-004 (maintenance DDL, no `lock_timeout`) | Finding (the `apply()` path is already safe) |
+| Inv 1 — never wait on locks | FMEA-004 (maintenance DDL, no `lock_timeout`) | FMEA-004 **Verified** (#81); skip-under-contention → Phase 3 |
 | Inv 4 — never exceed mutation budgets | crash mid-cycle | Cited-safe (single-txn atomicity) |
 | Inv 6 — every action explainable | FMEA-003 (loop errors unrecorded), FMEA-005 (silent total denial) | Findings |
 | F1 — self-monitoring metrics | FMEA-003 (`tick_errors_last_day` structurally 0) | Finding |
