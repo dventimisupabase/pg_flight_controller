@@ -287,7 +287,7 @@ Unified failure-classification surface (Phase 1.7 F6, appendix F): one row per c
 
 ### pgfc_govern.governor_metrics
 
-One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-state evaluator: applied/failed/lock-timeout action counts over 1h/1d windows, observation lag (newest snapshot age), loop durations + tick errors (tick_log), the self-health storage footprint, the oldest retained audit row (retention backlog), the count of oscillating relations (Phase 1.7 F5), and the connection pressure from the newest snapshot (Phase 1.7 F6 load-shedding input). Always returns one row; counts are 0 and freshness signals NULL when nothing has happened yet.
+One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-state evaluator: applied/failed/lock-timeout action counts over 1h/1d windows, observation lag (newest snapshot age), loop durations + tick errors + the control-loop heartbeat (control_loop_lag — age of the last fully-completed cycle, FMEA-003) (tick_log), the self-health storage footprint, the oldest retained audit row (retention backlog), the count of oscillating relations (Phase 1.7 F5), and the connection pressure from the newest snapshot (Phase 1.7 F6 load-shedding input). Always returns one row; counts are 0 and freshness signals NULL when nothing has happened yet.
 
 **Subsystem:** G4
 
@@ -314,6 +314,8 @@ One-row governor self-monitoring substrate (Phase 1.7 F1) for the F2 health-stat
 | `max_connections` | `integer` |
 | `connection_pressure` | `numeric` |
 | `connection_pressure_pct` | `numeric` |
+| `last_successful_tick_at` | `timestamp with time zone` |
+| `control_loop_lag` | `interval` |
 
 ### pgfc_govern.governor_status
 
@@ -483,7 +485,7 @@ Derive hidden state (rates, effectiveness, saturation) into relation_estimate.
 
 ### `pgfc_govern.evaluate_health() → pgfc_govern.governor_health_state`
 
-Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds (failed actions, lock timeouts, observation lag, storage footprint, the F4 daily-mutation-budget circuit breaker — degraded-level only — the F5 control-oscillation signal — diagnostic — and the F6 connection-pressure load-shedding signal — diagnostic), then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. The state it writes is the input to the F4 apply() authority gate. Returns the effective state.
+Compute the governor health state (Phase 1.7 F2) from the governor_metrics substrate against the born-governed transition thresholds (failed actions, lock timeouts, observation lag, the control-loop-lag heartbeat (FMEA-003), storage footprint, the F4 daily-mutation-budget circuit breaker — degraded-level only — the F5 control-oscillation signal — diagnostic — and the F6 connection-pressure load-shedding signal — diagnostic), then apply the F3 operator override as a caution floor (worst of auto and operator_forced); write governor_state and record a state_transitions row on change. The state it writes is the input to the F4 apply() authority gate. Returns the effective state.
 
 **Subsystem:** G4
 
@@ -501,7 +503,7 @@ Operator override (Phase 1.7 F3): force the governor into a more-cautious state 
 
 ### `pgfc_govern.observe_tick() → bigint`
 
-Fast loop (~1 min): observe + classify + estimate; never actuates. Returns the new snapshot id.
+Fast loop (~1 min): observe + classify + estimate, then refresh the governor health state (the mutual-watchdog half of FMEA-003 — the independent loop catches a wedged control_tick() via control_loop_lag). Never actuates. Returns the new snapshot id.
 
 **Subsystem:** G1
 

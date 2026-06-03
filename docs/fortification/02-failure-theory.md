@@ -61,7 +61,7 @@ Modes worked and found to **fail safe** as built (the reassuring half of the ana
 |---|---|---|---|---|---|---|
 | FMEA-001 | Medium | Confirmed | `pgfc_observe/install.sql:~509`, `:~1397` | Telemetry uses create/drop daily partitions, churning the system catalogs, where the lineage used a fixed `TRUNCATE` ring (zero churn). | Accepted (adopt the ring) | [#79](https://github.com/dventimisupabase/pg_flight_controller/issues/79) |
 | FMEA-002 | Medium | Confirmed | both `install.sql` (no `pg_is_in_recovery`) | No standby guard: the loops error every tick on a read-only replica; fail-safe but noisy and a post-failover footgun. | Accepted | [#80](https://github.com/dventimisupabase/pg_flight_controller/issues/80) |
-| FMEA-003 | Medium | Confirmed | `pgfc_govern/install.sql:2025`, `:1171`, `:1143-1191` | Control-loop errors are invisible: `tick_log.error` is never written and a hard error rolls the tick row back, so the tick-error breaker is structurally dead and a wedged `control_tick` keeps the governor `normal`. | Accepted | [#84](https://github.com/dventimisupabase/pg_flight_controller/issues/84) |
+| FMEA-003 | Medium | Confirmed | `pgfc_govern/install.sql:2025`, `:1171`, `:1143-1191` | Control-loop errors are invisible: `tick_log.error` is never written and a hard error rolls the tick row back, so the tick-error breaker is structurally dead and a wedged `control_tick` keeps the governor `normal`. | Verified | [#84](https://github.com/dventimisupabase/pg_flight_controller/issues/84) |
 | FMEA-004 | Medium | Confirmed | `pgfc_observe/install.sql` (`retain`/`drop_empty_partitions`/`_ensure_partition`, no `lock_timeout`) | Storage-maintenance DDL took `ACCESS EXCLUSIVE` with no bounded `lock_timeout` — an Invariant-1 gap outside the `apply()` path. | Verified | [#81](https://github.com/dventimisupabase/pg_flight_controller/issues/81) |
 | FMEA-005 | Medium | Confirmed | `pgfc_govern/install.sql:1176-1180`, `:1143-1191` | No per-relation error isolation: one uncaught error in `apply()` aborted the whole cycle (all relations rolled back), deterministically and — per FMEA-003 — invisibly. | Verified | [#82](https://github.com/dventimisupabase/pg_flight_controller/issues/82) |
 | FMEA-006 | Low | Confirmed | `pgfc_govern/install.sql:993-994` | `apply()` overwrote a human `ALTER` (made after the planning snapshot) whose value differs from the proposal — it re-checked neither `actuator_state` nor `manage_user_owned`. | Verified | [#83](https://github.com/dventimisupabase/pg_flight_controller/issues/83) |
@@ -115,7 +115,7 @@ cron jobs silently begins actuating. **Recovery/recommendation:** an early
 
 ### FMEA-003 — Control-loop errors are invisible to the health model
 
-**Severity:** Medium · **Confidence:** Confirmed · **Status:** Accepted ([#84](https://github.com/dventimisupabase/pg_flight_controller/issues/84))
+**Severity:** Medium · **Confidence:** Confirmed · **Status:** Verified (fixed in [#84](https://github.com/dventimisupabase/pg_flight_controller/issues/84))
 
 `governor_metrics.tick_errors_last_day` counts `tick_log` rows with `error IS NOT NULL`
 (`pgfc_govern/install.sql:2025`), and `evaluate_health()` has a breaker that reads it — but
@@ -129,6 +129,40 @@ actuating. **Backstop:** pg_cron records the failure in `cron.job_run_details` (
 row) and plpgsql has no autonomous transactions, so the fix is *not* "just populate `error`";
 candidates are a `last_successful_tick` heartbeat distinct from `observation_lag`, or
 swallow-and-record (trading off pg_cron's own retry/alerting).
+
+**Resolution.** The fix is the heartbeat candidate, framed as the missing half of a *mutual
+watchdog*: `control_tick()`'s `evaluate_health()` already reads `observation_lag`, so control
+watches observe's liveness — but nothing watched control. `governor_metrics` now exposes
+`control_loop_lag` (`= now() - max(tick_log.finished_at)`); because `finished_at` is set only
+after `verify()` succeeds and a hard error rolls the whole tick row back, `max(finished_at)` is
+a faithful "last fully-completed cycle" with **no schema change**. `evaluate_health()` gains a
+control-loop-lag candidate mirroring the observation-lag ladder (degraded → emergency, on the
+born-governed thresholds `health_control_lag_{degraded,emergency}_secs`); NULL lag (boot, or a
+control loop never scheduled) is `normal`, and the signal stays fresh under
+`advisory_only`/`disabled` (both still run the cycle), so only a genuine wedge or a stopped
+control cron ages it. The **load-bearing** change is that `observe_tick()` now also refreshes
+the health state — isolated in a subtransaction so a health-eval hiccup can never lose the
+observation: a wedged `control_tick()` *cannot evaluate its own health* (`evaluate_health()`
+runs inside it), so detection must come from the independent fast loop. With observe watching
+control, a stalled control loop escalates to degraded/emergency even while `observation_lag`
+stays low — the exact scenario above. The one wedge cause this *cannot* catch is a broken
+`evaluate_health()` itself (then both loops' evaluators throw and `governor_state` freezes at
+its last value); `cron.job_run_details` remains the external backstop for that.
+
+Two corrections to the finding as filed. (1) `evaluate_health()` did **not** have a breaker
+reading `tick_errors_last_day` — there was no such candidate; the only consumer was
+`failure_taxonomy.decision`. This fix *adds* the missing breaker (the heartbeat); it does not
+revive an existing one. (2) On the dead `tick_log.error` column: it stays **unwritten in-band
+by design**. In-band recording would force `control_tick()` to swallow the error (rollback
+erases any row written in the same txn), blinding pg_cron's own retry/alerting — a worse trade
+than keeping the loop loud. So `tick_errors_last_day` remains a *latent out-of-band hook* (an
+external recorder that fills `error` still lights the category), and `failure_taxonomy.decision`
+now ORs it with the live `control_loop_lag` signal — the production path that was previously
+undetectable. Regression test `pgfc_govern/tests/25_control_loop_lag.sql` proves a stalled
+control loop with *fresh observation* escalates via `observe_tick()` (the prover — red pre-fix,
+when `observe_tick` never evaluated health and `evaluate_health` had no control-lag signal),
+plus the degraded/emergency ladder, the NULL-at-boot contract, and the no-flap-at-one-cadence
+guard.
 
 ### FMEA-004 — Storage-maintenance DDL sets no `lock_timeout` (Invariant-1 gap)
 
@@ -237,8 +271,8 @@ Failure modes attach to the invariants/mechanisms they stress (extends the Phase
 |---|---|---|
 | Inv 1 — never wait on locks | FMEA-004 (maintenance DDL, no `lock_timeout`) | FMEA-004 **Verified** (#81); skip-under-contention → Phase 3 |
 | Inv 4 — never exceed mutation budgets | crash mid-cycle | Cited-safe (single-txn atomicity) |
-| Inv 6 — every action explainable | FMEA-003 (loop errors unrecorded), FMEA-005 (silent total denial) | FMEA-005 **Verified** (#82); FMEA-003 → #84 |
-| F1 — self-monitoring metrics | FMEA-003 (`tick_errors_last_day` structurally 0) | Finding |
+| Inv 6 — every action explainable | FMEA-003 (loop errors unrecorded), FMEA-005 (silent total denial) | FMEA-003/005 **Verified** (#84/#82) |
+| F1 — self-monitoring metrics | FMEA-003 (`tick_errors_last_day` structurally 0; no control-loop heartbeat) | FMEA-003 **Verified** (#84) — `control_loop_lag` heartbeat, observe↔control mutual watchdog |
 | F2 — health-state machine | worst-of under conflicting signals | Cited-safe |
 | F6 — load shedding | FMEA-007 (lock wait precedes health eval) | Won't-fix |
 | F7 — active-control activation | FMEA-002 (standby), FMEA-005 (poison relation), FMEA-006 (post-snapshot human race) | FMEA-005/006 **Verified** (#82/#83); 002 open |

@@ -88,14 +88,15 @@ Each control cycle the governor evaluates its own health (Phase 1.7 F2) from tho
 metrics and records it as a single state. The states, in order of increasing caution:
 
 - **`normal`** — full operation; actuation permitted.
-- **`degraded`** — mild trouble (telemetry going stale, a few failed actions, over the
-  storage budget, or the daily mutation budget spent); observe/estimate/diagnose continue
-  and actuation is still **permitted** — degraded is "limited," one breaker-step from
-  suspension, not suspended.
+- **`degraded`** — mild trouble (telemetry going stale, the control loop starting to stall,
+  a few failed actions, over the storage budget, or the daily mutation budget spent);
+  observe/estimate/diagnose continue and actuation is still **permitted** — degraded is
+  "limited," one breaker-step from suspension, not suspended.
 - **`diagnostic`** — repeated failures, a lock-timeout storm, or control oscillation (a
   setting flapping); **actuation is suspended** (observation and diagnosis continue).
-- **`emergency`** — the governor is effectively flying blind (observation badly stale);
-  minimal observation and health reporting only, **no actuation**.
+- **`emergency`** — the governor is effectively flying blind (observation badly stale) or
+  its control loop has stopped completing cycles entirely; minimal observation and health
+  reporting only, **no actuation**.
 - **`disabled`** — nothing acts; history is preserved. Reached **only** via the operator
   override (`disable()`); the automatic evaluator never gets there.
 
@@ -107,9 +108,9 @@ permit it (subject to the mutation budget below). A withheld actuation is declin
 silently — it is never recorded as a failed action, which would otherwise feed the
 failed-action breaker and amplify itself. Refusing to *tighten* a setting never reduces
 freeze safety: the prior setting and PostgreSQL's own anti-wraparound autovacuum remain in
-place. The automatic evaluator reaches `emergency` via stale observation and `diagnostic`
-via failed actions, lock timeouts, control oscillation, or load shedding under connection
-pressure (all below).
+place. The automatic evaluator reaches `emergency` via stale observation or a stalled control
+loop, and `diagnostic` via failed actions, lock timeouts, control oscillation, or load
+shedding under connection pressure (all below).
 
 ### Control-oscillation detection (Phase 1.7 F5)
 
@@ -155,6 +156,31 @@ absence of data is not load.
 
 ```sql
 SELECT client_backends, max_connections, connection_pressure
+FROM pgfc_govern.governor_metrics;
+```
+
+### Control-loop heartbeat (FMEA-003)
+
+`observe_tick()` and `control_tick()` are separate cron jobs, so observation can stay fresh
+while the control loop is wedged — and because `evaluate_health()` runs *inside*
+`control_tick()`, a wedged control loop cannot flag its own ill health. The two loops are
+therefore **mutual watchdogs**: `control_tick()` watches observation freshness
+(`observation_lag`), and `observe_tick()` refreshes the health state too, watching the control
+loop's own freshness — `control_loop_lag`, the age of the last *fully-completed* control cycle
+(`max(tick_log.finished_at)`, which a hard error rolls back, so it only counts cycles that
+actually finished). A control loop that stops completing cycles drives the governor `degraded`,
+then `emergency`, even while observation is perfectly fresh — so a silent cessation of
+actuation becomes visible instead of leaving the governor stuck at `normal`.
+
+The lag is `NULL` (not ill health) until the first cycle completes, and stays fresh under
+`advisory_only` / `disabled` (both still run the cycle, they just don't actuate), so only a
+genuine wedge or a stopped control cron ages it. A wedge is also recorded externally by
+pg_cron in `cron.job_run_details`.
+
+<!-- doctest -->
+
+```sql
+SELECT last_successful_tick_at, control_loop_lag
 FROM pgfc_govern.governor_metrics;
 ```
 
