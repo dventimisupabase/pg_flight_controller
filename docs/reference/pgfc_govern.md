@@ -387,6 +387,12 @@ Base (pre-aggressiveness) target dead-tuple fraction for a workload class, read 
 
 **Subsystem:** G1
 
+### `pgfc_govern._effective_aggressiveness(p_raw double precision) → double precision`
+
+Guard the aggressiveness divisor (FMEA-008): the raw value if > 0, else the registry default — so a non-positive policy.aggressiveness (flagged CRITICAL by validate_parameters) cannot divide-by-zero in plan() or governor_status.
+
+**Subsystem:** G1
+
 ### `pgfc_govern._failure_class(p_failure_reason text) → text`
 
 Failure taxonomy (Phase 1.7 F6): map a recorded failure_reason to its appendix-F category (observation/decision/actuation/resource/safety). Single source of the mapping; apply() stamps action_history.failure_class through it. IMMUTABLE pure lookup; NULL for an unknown reason.

@@ -61,6 +61,7 @@ From any object: its **home subsystem** is the heading it sits under, and its **
 - [`pgfc_govern.relation_estimate`](pgfc_govern.md#pgfc_governrelation_estimate) — table
 - [`pgfc_govern.tick_log`](pgfc_govern.md#pgfc_governtick_log) — table
 - [`pgfc_govern._class_target`](pgfc_govern.md#pgfc_govern_class_targetp_kind-text--double-precision) — function
+- [`pgfc_govern._effective_aggressiveness`](pgfc_govern.md#pgfc_govern_effective_aggressivenessp_raw-double-precision--double-precision) — function
 - [`pgfc_govern._sf_grid`](pgfc_govern.md#pgfc_govern_sf_grid--double-precision) — function
 - [`pgfc_govern.apply`](pgfc_govern.md#pgfc_governapplyp_tick_id-bigint-p_relid-oid--boolean) — function
 - [`pgfc_govern.classify`](pgfc_govern.md#pgfc_governclassifyp_snapshot_id-bigint--integer) — function

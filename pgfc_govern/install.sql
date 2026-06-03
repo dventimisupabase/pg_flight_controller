@@ -377,6 +377,24 @@ $fn$;
 COMMENT ON FUNCTION pgfc_govern._class_target(text) IS
   'Base (pre-aggressiveness) target dead-tuple fraction for a workload class, read from the registry (Phase 1.6 P2). [subsystem:G1]';
 
+-- Guard the aggressiveness divisor (FMEA-008, #96). policy.aggressiveness has no CHECK, so an
+-- operator can set it <= 0 (or it is NULL with no enabled policy); the class target is
+-- `template / aggressiveness`, so a non-positive value is a divide-by-zero / sign inversion that
+-- would wedge plan() and throw the governor_status view. Single-source the guard here: the raw
+-- value if > 0, else the registry default. Defense-in-depth, NOT enforcement — validate_parameters()
+-- still grades <= 0 as CRITICAL, so the operator is loudly warned; the control loop and the status
+-- view simply stay up at the default rather than failing. (A CHECK would enforce instead, but that
+-- reverses the deliberate advisory-validation design; left to the maintainer per FMEA-008.)
+CREATE OR REPLACE FUNCTION pgfc_govern._effective_aggressiveness(p_raw double precision)
+RETURNS double precision IMMUTABLE LANGUAGE sql
+    SET search_path = pgfc_govern, pgfc_observe, pg_catalog
+AS $fn$
+    SELECT CASE WHEN p_raw > 0 THEN p_raw
+                ELSE pgfc_govern._param('aggressiveness')::double precision END
+$fn$;
+COMMENT ON FUNCTION pgfc_govern._effective_aggressiveness(double precision) IS
+  'Guard the aggressiveness divisor (FMEA-008): the raw value if > 0, else the registry default — so a non-positive policy.aggressiveness (flagged CRITICAL by validate_parameters) cannot divide-by-zero in plan() or governor_status. [subsystem:G1]';
+
 -- Update relation_estimate for every relation in snapshot p_snapshot_id. Reads
 -- indicators from pgfc_observe.maintenance_debt (no re-derivation of thresholds) and
 -- raw samples only for cross-snapshot deltas. Returns rows written.
@@ -699,7 +717,9 @@ DECLARE
 BEGIN
     SELECT aggressiveness, manage_user_owned INTO v_aggr, v_manage
       FROM pgfc_govern.policy WHERE enabled ORDER BY policy_name LIMIT 1;
-    v_aggr   := COALESCE(v_aggr, pgfc_govern._param('aggressiveness')::double precision);
+    -- FMEA-008 (#96): guard the divisor — a non-positive or NULL aggressiveness falls back to the
+    -- registry default rather than dividing by zero below (which would wedge this control loop).
+    v_aggr   := pgfc_govern._effective_aggressiveness(v_aggr);
     v_manage := COALESCE(v_manage, pgfc_govern._param('manage_user_owned')::boolean);
 
     INSERT INTO pgfc_govern.decision_log
@@ -1293,7 +1313,7 @@ SELECT rc.relid, rc.schemaname, rc.relname, rc.kind,
        re.f_trigger_ewma AS observed_dead_fraction,          -- diagnostic (biased)
        LEAST(GREATEST(
            pgfc_govern._class_target(rc.kind::text)
-           / COALESCE(p.aggressiveness, pgfc_govern._param('aggressiveness')::double precision),
+           / pgfc_govern._effective_aggressiveness(p.aggressiveness),   -- FMEA-008: never /0
            pgfc_govern._param('sf_min')::double precision),
            pgfc_govern._param('sf_max')::double precision)    AS target_dead_fraction,
        re.vacuum_debt_ratio, re.freeze_debt, re.saturation_cause,
