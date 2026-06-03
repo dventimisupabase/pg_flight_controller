@@ -444,31 +444,34 @@ full per-object docs live in the generated reference
 
 ### O2. Storage and retention
 
-- **Responsibility:** Bounded, bloat-free persistence for telemetry — raw samples kept only
-  a few days, aggregated into long-range rollups, and reclaimed by whole-partition rotation
-  rather than row deletes. *(Home of finding FMEA-001.)*
+- **Responsibility:** Bounded, bloat-free persistence for telemetry — raw samples kept about
+  a week in a fixed `TRUNCATE`-rotated ring (zero dead tuples *and* zero catalog churn),
+  aggregated into long-range rollups, and reclaimed by whole-partition rotation rather than
+  row deletes. *(Home of finding FMEA-001, resolved.)*
 - **Role:** The durable layer of `pgfc_observe`, between the collector that writes samples
   ([O1](#o1-collection)) and the readers that serve state ([O3](#o3-derived-state-and-readers)).
-- **Objects:** high-volume raw tables `relation_samples` and `snapshots` (daily
-  `RANGE`-partitioned); rollup tiers `rollup_1m`/`rollup_1h`/`rollup_1d` (1m daily-, 1h/1d
-  monthly-partitioned). Partition lifecycle: `_ensure_partition` (on-demand day partitions,
-  called hot by the collector), `_partition_inventory`, and the key encoders
-  `_epoch_day`/`_epoch_month`/`_month_start`. Raw GC: `retain` (`TRUNCATE` partitions older
-  than the window, ~3 days) and `drop_empty_partitions` (`DROP` long-empty shells). Rollup
-  pipeline: `rollup` and `_rollup_coarsen` (cascade raw into the tiers with
-  sample-count-weighted aggregates), `rollup_retain` (cascading per-tier `DROP`),
-  `_rollup_inventory`, and `current_rollup` (reads a tier carrying the last bucket forward).
-  `_telemetry_reloptions` supplies the static, aggressive autovacuum reloptions applied to
-  every telemetry partition (self-maintenance). See the
+- **Objects:** high-volume raw tables `relation_samples` and `snapshots`, recycled by a fixed
+  `LIST`-by-slot ring (FMEA-001: `slot = collected_day % _ring_slots()`, a constant partition
+  set created once at install); rollup tiers `rollup_1m`/`rollup_1h`/`rollup_1d` (1m daily-,
+  1h/1d monthly-`RANGE`-partitioned). Raw ring: `_ring_slots` (the fixed slot count / retention
+  knob), `rotate_ring` (`TRUNCATE`s the slot rolling off — called hot by the collector,
+  inline, zero catalog churn), and `_partition_inventory`. Rollup partition lifecycle:
+  `_ensure_part` (on-demand rollup partitions) and the key encoders
+  `_epoch_day`/`_epoch_month`/`_month_start`. Rollup pipeline: `rollup` and `_rollup_coarsen`
+  (cascade raw into the tiers with sample-count-weighted aggregates), `rollup_retain`
+  (cascading per-tier `DROP`), `_rollup_inventory`, and `current_rollup` (reads a tier carrying
+  the last bucket forward). `_telemetry_reloptions` supplies the static, aggressive autovacuum
+  reloptions applied to every telemetry partition (self-maintenance). See the
   [reference](../reference/pgfc_observe.md) and [source](../../pgfc_observe/install.sql).
 - **Consumers / cross-links:** read by [O3](#o3-derived-state-and-readers), which derives
   current and historical state from these tables (including `current_rollup`'s carry-forward
   reads).
-- **Feedback wanted:** is the partition-recycling strategy sound — create/drop vs. a fixed
-  `TRUNCATE` ring — see
-  [FMEA-001](../fortification/02-failure-theory.md#fmea-001--partition-recycling-uses-createdrop-not-a-fixed-truncate-ring)?
-  And is the rollup-before-truncate ordering (raw must be aggregated by `rollup()` before
-  `retain()` truncates its window) safe under skipped or lagging maintenance runs?
+- **Resolved / feedback wanted:** the partition-recycling strategy is settled — the create/drop
+  daily partitions were replaced by a fixed `TRUNCATE`-rotated ring
+  ([FMEA-001](../fortification/02-failure-theory.md#fmea-001--partition-recycling-uses-createdrop-not-a-fixed-truncate-ring),
+  zero catalog churn). Still worth a look: the rollup-before-recycle ordering — raw must be
+  aggregated by `rollup()` before its slot recycles — is safe under skipped/lagging
+  maintenance because the `(_ring_slots()-1)`-day window leaves margin; is that margin enough?
 - ↑ [pgfc_observe](#41-pgfc_observe) · → read by [O3](#o3-derived-state-and-readers).
 
 ### O3. Derived state and readers

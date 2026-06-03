@@ -14,11 +14,13 @@
 --   2. add a matching `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` in the
 --      "Additive upgrades" section near the end — for existing installs on re-run.
 --
--- S2 EXCEPTION to additive-only: snapshots/relation_samples are now daily RANGE
--- partitioned, which cannot be created in place from the Phase-0 ordinary tables.
--- Telemetry is disposable, so the "Destructive recreate" block below drops the old
--- (non-partitioned) shape ONCE. This is a deliberate, one-time exception (see the
--- design's "Migration stance"); it does NOT extend to pgfc_govern's audit tables.
+-- S2 / FMEA-001 EXCEPTION to additive-only: snapshots/relation_samples are LIST-partitioned
+-- into a FIXED TRUNCATE-rotated RING — a constant set of per-slot partitions created ONCE at
+-- install, recycled by rotate_ring() with TRUNCATE (zero steady-state catalog churn). A
+-- table's partitioning strategy cannot be changed in place, so the "Destructive recreate"
+-- block below drops any non-ring shape ONCE: the Phase-0 ordinary tables OR the earlier S2
+-- daily-RANGE tables. Telemetry is disposable, so this is a deliberate, one-time exception
+-- (see the design's "Migration stance"); it does NOT extend to pgfc_govern's audit tables.
 
 CREATE SCHEMA IF NOT EXISTS pgfc_observe;
 COMMENT ON SCHEMA pgfc_observe IS
@@ -74,8 +76,8 @@ COMMENT ON FUNCTION pgfc_observe._month_start(integer) IS
 -- insurance on a high-txn cluster). The governor never samples or actuates these
 -- tables anyway — S5's own-schema and extension-owned filters exclude them — so this
 -- is purely about predictable self-maintenance, not defeating self-actuation.
--- One source of truth, used by _ensure_partition()/_ensure_part() (new partitions)
--- and the additive-upgrade backfill (existing partitions).
+-- One source of truth, used by the install-time ring slot creation and _ensure_part()
+-- (new partitions) and the additive-upgrade backfill (existing partitions).
 CREATE OR REPLACE FUNCTION pgfc_observe._telemetry_reloptions()
 RETURNS text IMMUTABLE LANGUAGE sql AS $$
     SELECT 'autovacuum_vacuum_scale_factor=0, autovacuum_vacuum_threshold=1000, '
@@ -100,42 +102,71 @@ $$;
 COMMENT ON FUNCTION pgfc_observe._maintenance_lock_timeout() IS
   'Bounded txn-local lock_timeout for the maintenance DDL (FMEA-004, Invariant 1). [subsystem:O2]';
 
+-- Number of fixed LIST partitions in the raw-telemetry ring (FMEA-001). The ring recycles
+-- storage by TRUNCATE — never create/drop — so this count IS the steady-state partition
+-- footprint of each raw table, constant forever (the finding's "zero catalog churn"). With
+-- daily rotation (slot = collected_day % _ring_slots()) the raw retention window quantizes to
+-- (_ring_slots() - 1) whole days: the current day plus the previous _ring_slots()-1 are
+-- retained, and the day rolling off is TRUNCATEd before its slot is reused. 8 → a 7-day raw
+-- window: ≥ the prior retain('3 days') contract (so it never shrinks the governor's control
+-- memory) and aligned with rollup_1m's 7-day tier, leaving generous margin for rollup() to
+-- aggregate a day before its slot recycles. This is the ring's single knob; because it sizes
+-- the partition set, changing it requires a destructive re-partition (re-run on a fresh ring).
+-- IMMUTABLE: a fixed code constant, usable in the slot column DEFAULT. Single-sourced here
+-- (mirrors _telemetry_reloptions / _maintenance_lock_timeout) so observe stays self-contained.
+CREATE OR REPLACE FUNCTION pgfc_observe._ring_slots()
+RETURNS integer IMMUTABLE LANGUAGE sql AS $$
+    SELECT 8
+$$;
+COMMENT ON FUNCTION pgfc_observe._ring_slots() IS
+  'Fixed LIST-partition count of the raw-telemetry ring (FMEA-001); raw retention = (_ring_slots()-1) days with daily rotation. [subsystem:O2]';
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Destructive recreate  (Phase 1.5 S2 — one-time; see header)
 -- ─────────────────────────────────────────────────────────────────────────────
--- Phase 0 created snapshots/relation_samples as ordinary tables; S2 makes them
--- partitioned. A table cannot be ALTERed into a partitioned table in place, so drop
--- the old shape. Guarded on relkind <> 'p' so it fires at most once: on a fresh
--- install nothing exists; after S2 the tables are partitioned ('p') and are left
--- untouched, keeping this file idempotent. CASCADE also drops dependent cross-schema
--- views (notably pgfc_govern.catalog_health) — if pgfc_govern is installed, re-run
+-- Phase 0 created snapshots/relation_samples as ordinary tables; S2 made them daily-RANGE
+-- partitioned; FMEA-001 makes them LIST-partitioned into the fixed ring. A table's
+-- partitioning strategy cannot be changed in place, so drop any shape that is NOT the ring.
+-- Guarded on "exists AND not LIST-partitioned" so it fires at most once per transition: it
+-- DROPs the Phase-0 ordinary table (no pg_partitioned_table row) and the S2 RANGE table
+-- (partstrat 'r'), but leaves a ring table (partstrat 'l') untouched — keeping this file
+-- idempotent (the harness applies it twice). CASCADE also drops dependent cross-schema views
+-- (notably pgfc_govern.catalog_health) — if pgfc_govern is installed, re-run
 -- pgfc_govern/install.sql afterward to restore them.
 DO $recreate$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                WHERE n.nspname = 'pgfc_observe' AND c.relname = 'relation_samples'
-                 AND c.relkind <> 'p') THEN
+                 AND NOT EXISTS (SELECT 1 FROM pg_partitioned_table pt
+                                  WHERE pt.partrelid = c.oid AND pt.partstrat = 'l')) THEN
         DROP TABLE pgfc_observe.relation_samples CASCADE;
     END IF;
     IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                WHERE n.nspname = 'pgfc_observe' AND c.relname = 'snapshots'
-                 AND c.relkind <> 'p') THEN
+                 AND NOT EXISTS (SELECT 1 FROM pg_partitioned_table pt
+                                  WHERE pt.partrelid = c.oid AND pt.partstrat = 'l')) THEN
         DROP TABLE pgfc_observe.snapshots CASCADE;
     END IF;
 END
 $recreate$;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Tables  (daily RANGE partitioned on collected_day — Phase 1.5 S2)
+-- Tables  (LIST-partitioned into the fixed TRUNCATE-rotated ring — Phase 1.5 S2 / FMEA-001)
 -- ─────────────────────────────────────────────────────────────────────────────
 
 -- One row per observe() run: timestamp + cluster/GUC context, pg_class health,
 -- and the xmin removability horizons, shared by all that run's relation samples.
 CREATE TABLE IF NOT EXISTS pgfc_observe.snapshots (
     snapshot_id              bigint GENERATED ALWAYS AS IDENTITY,
-    -- collected_day is the daily RANGE partition key and must be part of the PK.
-    -- snapshot_id stays globally unique (single IDENTITY sequence), so views may
-    -- still join on snapshot_id alone.
+    -- slot is the LIST partition key of the fixed ring (FMEA-001): slot = collected_day %
+    -- _ring_slots(), so each UTC day maps to one of the _ring_slots() permanent partitions
+    -- and rotate_ring() recycles the day rolling off by TRUNCATE (never DROP). It must be in
+    -- the PK (the partition key). snapshot_id stays globally unique (single IDENTITY sequence,
+    -- never reset by those TRUNCATEs), so views may still join on snapshot_id alone.
+    -- collected_day is kept as a plain column — the BRIN index, rollup() pruning, and human
+    -- reads still use the calendar day; the DEFAULT keeps ad-hoc/test inserts self-consistent.
+    slot                     smallint    NOT NULL
+                                 DEFAULT (pgfc_observe._epoch_day(now()) % pgfc_observe._ring_slots())::smallint,
     collected_day            integer     NOT NULL DEFAULT pgfc_observe._epoch_day(now()),
     collected_at             timestamptz NOT NULL DEFAULT now(),
     datname                  name        NOT NULL DEFAULT current_database(),
@@ -169,20 +200,23 @@ CREATE TABLE IF NOT EXISTS pgfc_observe.snapshots (
     oldest_xmin_owner_detail  text,
     oldest_catalog_xmin_age   bigint,
     oldest_catalog_xmin_owner text,
-    PRIMARY KEY (collected_day, snapshot_id)
-) PARTITION BY RANGE (collected_day);
+    PRIMARY KEY (slot, snapshot_id)
+) PARTITION BY LIST (slot);
 COMMENT ON TABLE pgfc_observe.snapshots IS
-  'Header row per observe() run: timestamp + cluster/GUC + cluster load signals (client_backends/max_connections — the F6 load-shedding stress input) + pg_class health + xmin horizons. Daily RANGE partitioned on collected_day. [subsystem:O2]';
+  'Header row per observe() run: timestamp + cluster/GUC + cluster load signals (client_backends/max_connections — the F6 load-shedding stress input) + pg_class health + xmin horizons. LIST-partitioned into the fixed ring by slot, the collected_day modulo the ring slot count (FMEA-001). [subsystem:O2]';
 
 -- One row per relation per snapshot. Additive-only: new columns are nullable;
 -- existing columns are never dropped or renamed.
--- No FK to snapshots: retention is whole-partition TRUNCATE/DROP (S2), and a
--- row-level ON DELETE CASCADE both goes unused by that and would block TRUNCATE of a
--- referenced partition. Integrity instead holds by construction — observe() writes
--- the header then its samples in one transaction. collected_day mirrors the parent
--- snapshot's day (set by observe()) and is the partition key, so it is in the PK.
+-- No FK to snapshots: retention is whole-partition TRUNCATE (the ring, FMEA-001), and a
+-- row-level ON DELETE CASCADE both goes unused by that and would block TRUNCATE of a slot
+-- partition. Integrity instead holds by construction — observe() writes the header then its
+-- samples in one transaction, stamping both with the same slot/collected_day. slot mirrors
+-- the parent snapshot's slot (set by observe()) and is the LIST partition key, so it is in
+-- the PK; collected_day is carried alongside for the BRIN index and rollup() time-pruning.
 CREATE TABLE IF NOT EXISTS pgfc_observe.relation_samples (
     snapshot_id          bigint NOT NULL,
+    slot                 smallint NOT NULL
+                             DEFAULT (pgfc_observe._epoch_day(now()) % pgfc_observe._ring_slots())::smallint,
     collected_day        integer NOT NULL DEFAULT pgfc_observe._epoch_day(now()),
     relid                oid    NOT NULL,
     schemaname           name   NOT NULL,
@@ -220,23 +254,48 @@ CREATE TABLE IF NOT EXISTS pgfc_observe.relation_samples (
     total_size_bytes     bigint,
     -- rollback baseline for the governor: the table's explicit autovacuum reloptions
     reloptions           text[],
-    PRIMARY KEY (collected_day, snapshot_id, relid)
-) PARTITION BY RANGE (collected_day);
+    PRIMARY KEY (slot, snapshot_id, relid)
+) PARTITION BY LIST (slot);
 COMMENT ON TABLE pgfc_observe.relation_samples IS
-  'Per-relation observed state for one snapshot. reloptions is the governor rollback baseline. Daily RANGE partitioned on collected_day. [subsystem:O2]';
+  'Per-relation observed state for one snapshot. reloptions is the governor rollback baseline. LIST-partitioned into the fixed ring by slot, the collected_day modulo the ring slot count (FMEA-001). [subsystem:O2]';
 
 CREATE INDEX IF NOT EXISTS relation_samples_relid_idx
     ON pgfc_observe.relation_samples (relid, snapshot_id DESC);
 
--- BRIN (not btree) on the partition key. A btree on a high-insert telemetry table
--- bloats — exactly the failure mode this system exists to manage — whereas BRIN is
--- tiny and effectively bloat-free. Cross-partition time-range queries are served by
--- partition pruning; the BRIN backs ad-hoc range scans on the parent at near-zero
--- storage cost. Created on the partitioned parents, so every partition inherits it.
+-- BRIN (not btree) on collected_day. A btree on a high-insert telemetry table bloats —
+-- exactly the failure mode this system exists to manage — whereas BRIN is tiny and
+-- effectively bloat-free. collected_day is no longer the partition key (slot is), but each
+-- slot holds exactly one day, so within a slot the BRIN summarises a single value: it backs
+-- rotate_ring()'s "is this slot out of window?" probe (collected_day < cutoff) and ad-hoc
+-- time-range scans on the parent at near-zero storage cost. Created on the partitioned
+-- parents, so every slot partition inherits it.
 CREATE INDEX IF NOT EXISTS snapshots_collected_day_brin
     ON pgfc_observe.snapshots USING brin (collected_day);
 CREATE INDEX IF NOT EXISTS relation_samples_collected_day_brin
     ON pgfc_observe.relation_samples USING brin (collected_day);
+
+-- Create the fixed ring of slot partitions ONCE, here at install. Idempotent (IF NOT
+-- EXISTS), so re-running install.sql is a no-op that adds no churn. This is the ONLY place
+-- raw partitions are ever created — rotate_ring() never creates, only TRUNCATEs (FMEA-001).
+-- _telemetry_reloptions() are set at creation so every slot carries the static autovacuum
+-- knobs. Deliberately NOT bounded by _maintenance_lock_timeout(): install is the supervised
+-- path and a fresh empty table takes ACCESS EXCLUSIVE instantly (FMEA-004's scope note).
+DO $slots$
+DECLARE
+    s integer;
+BEGIN
+    FOR s IN 0 .. pgfc_observe._ring_slots() - 1 LOOP
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS pgfc_observe.snapshots_s%s '
+            'PARTITION OF pgfc_observe.snapshots FOR VALUES IN (%s) WITH (%s)',
+            s, s, pgfc_observe._telemetry_reloptions());
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS pgfc_observe.relation_samples_s%s '
+            'PARTITION OF pgfc_observe.relation_samples FOR VALUES IN (%s) WITH (%s)',
+            s, s, pgfc_observe._telemetry_reloptions());
+    END LOOP;
+END
+$slots$;
 
 -- Last observed state per relation — the O(1) "did this change?" side table (S3).
 -- One row per live relation, holding exactly the columns that form the change
@@ -510,84 +569,101 @@ COMMENT ON FUNCTION pgfc_observe.removability_horizons() IS
   'Oldest xmin data/catalog removability horizons with attributed owner class. [subsystem:O3]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Partition management  (Phase 1.5 S2)
+-- Partition management — the fixed TRUNCATE-rotated ring  (Phase 1.5 S2 / FMEA-001)
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- Create the daily partition for p_day (default: today) on both telemetry tables if
--- it does not already exist. O(1): the partition name is derived deterministically
--- from the day, so this is a single catalog lookup + (at most) two CREATEs — no scan
--- of existing partitions. observe() calls it every run so the current day's partition
--- always exists before insert. Idempotent (IF NOT EXISTS); the duplicate_table catch
--- makes it race-safe if two observe() runs overlap at a day boundary.
-CREATE OR REPLACE FUNCTION pgfc_observe._ensure_partition(
+-- Advance the ring for day p_day (default: today): TRUNCATE every slot holding data older
+-- than the (slots-1)-day window, recycling storage with ZERO catalog churn — no CREATE/DROP,
+-- unlike the old daily-RANGE _ensure_partition/retain/drop (FMEA-001). observe() calls this
+-- before each insert; it is also the public manual sweep. Cheap and idempotent: under the
+-- one-day-per-slot invariant a slot holds a single collected_day, so the probe "any row <
+-- cutoff?" classifies the whole slot, and a slot already holding the current/in-window day is
+-- a no-op — repeated same-day calls do nothing. After a gap (observe stopped a while) it also
+-- clears slots that intermediate, un-observed days left holding stale data, so a resumed loop
+-- never reads an out-of-window sample as current.
+--
+-- Lock discipline (FMEA-004, Invariant 1): bounded txn-local lock_timeout. The slot p_day will
+-- WRITE into this run is correctness-critical — mixing the day rolling off with the new day in
+-- one slot is never allowed — so its TRUNCATE lets a lock_timeout PROPAGATE (observe() skips
+-- this run and retries next minute, exactly as the old _ensure_partition did). The other slots
+-- are a defensive sweep: a busy one is SKIPPED in a subtransaction and retried next run.
+CREATE OR REPLACE FUNCTION pgfc_observe.rotate_ring(
     p_day integer DEFAULT pgfc_observe._epoch_day(now()))
-RETURNS void LANGUAGE plpgsql
+RETURNS bigint   -- number of slots truncated (that held out-of-window data)
+LANGUAGE plpgsql
     SET search_path = pgfc_observe, pg_catalog
 AS $fn$
 DECLARE
-    v_suffix text := to_char(to_timestamp(p_day * 86400) AT TIME ZONE 'UTC', 'YYYYMMDD');
+    v_slots  integer := pgfc_observe._ring_slots();
+    v_cutoff integer := p_day - (v_slots - 1);   -- oldest in-window day; < cutoff is stale
+    v_cur    integer := p_day % v_slots;         -- the slot this day writes into
+    v_count  bigint  := 0;
+    v_stale  boolean;
+    r        record;
 BEGIN
-    -- FMEA-004: bound the lock wait (the CREATE PARTITION OF takes ACCESS EXCLUSIVE on the
-    -- parent). A timeout propagates → observe() skips this run and retries next minute.
     PERFORM set_config('lock_timeout', pgfc_observe._maintenance_lock_timeout(), true);
-    BEGIN
-        EXECUTE format(
-            'CREATE TABLE IF NOT EXISTS pgfc_observe.snapshots_p%s '
-            'PARTITION OF pgfc_observe.snapshots FOR VALUES FROM (%s) TO (%s) '
-            'WITH (%s)',
-            v_suffix, p_day, p_day + 1, pgfc_observe._telemetry_reloptions());
-    EXCEPTION WHEN duplicate_table THEN NULL;   -- concurrent run created it first
-    END;
-    BEGIN
-        EXECUTE format(
-            'CREATE TABLE IF NOT EXISTS pgfc_observe.relation_samples_p%s '
-            'PARTITION OF pgfc_observe.relation_samples FOR VALUES FROM (%s) TO (%s) '
-            'WITH (%s)',
-            v_suffix, p_day, p_day + 1, pgfc_observe._telemetry_reloptions());
-    EXCEPTION WHEN duplicate_table THEN NULL;
-    END;
+    FOR r IN SELECT partition, slot FROM pgfc_observe._partition_inventory() LOOP
+        EXECUTE format('SELECT EXISTS (SELECT 1 FROM pgfc_observe.%I WHERE collected_day < %s)',
+                       r.partition, v_cutoff)
+            INTO v_stale;
+        CONTINUE WHEN NOT v_stale;               -- in-window (or empty): nothing to recycle
+        IF r.slot = v_cur THEN
+            -- The slot about to be written. Truncate-or-skip-the-run: a propagating
+            -- lock_timeout aborts observe()'s rotate call, so it can never mix days in a slot.
+            EXECUTE format('TRUNCATE TABLE pgfc_observe.%I', r.partition);
+            v_count := v_count + 1;
+        ELSE
+            BEGIN
+                EXECUTE format('TRUNCATE TABLE pgfc_observe.%I', r.partition);
+                v_count := v_count + 1;
+            EXCEPTION WHEN lock_not_available THEN
+                NULL;                            -- busy; defensive sweep retries next run
+            END;
+        END IF;
+    END LOOP;
+    RETURN v_count;
 END
 $fn$;
-COMMENT ON FUNCTION pgfc_observe._ensure_partition(integer) IS
-  'Create the daily partition for p_day (default today) on both telemetry tables if missing; O(1) and race-safe. [subsystem:O2]';
+COMMENT ON FUNCTION pgfc_observe.rotate_ring(integer) IS
+  'Advance the fixed ring for p_day (default today): TRUNCATE slots holding out-of-window days; zero catalog churn (FMEA-001). Called by observe() before each insert; also the manual sweep. [subsystem:O2]';
 
--- One row per existing child partition of the telemetry tables, with its day, decoded
--- UTC range, estimated row count (pg_class.reltuples), and on-disk size. Backs the GC
--- functions and operator inspection. Reads pg_inherits, so it reflects live state.
+-- FMEA-001 upgrade: the prior _partition_inventory() returned a `day` + range_* row type; the
+-- ring version returns `slot` instead. CREATE OR REPLACE cannot change a function's return
+-- type, so an upgrade must DROP the old one first. CASCADE also drops self_health (the only
+-- dependent — a view, recreated below); a fresh install no-ops. Must precede the recreate.
+DROP FUNCTION IF EXISTS pgfc_observe._partition_inventory() CASCADE;
+
+-- One row per slot partition of the raw telemetry ring, with its slot number, estimated
+-- row count (pg_class.reltuples), and on-disk size. Backs rotate_ring(), self_health, the
+-- reloptions backfill, and operator inspection. Catalog-only (reads pg_inherits + parses the
+-- LIST bound), so it is cheap and reflects live state; the calendar day a slot currently
+-- holds is in the partition's own collected_day column for anyone who needs it.
 CREATE OR REPLACE FUNCTION pgfc_observe._partition_inventory()
-RETURNS TABLE (parent text, partition text, day integer,
-               range_start timestamptz, range_end timestamptz,
+RETURNS TABLE (parent text, partition text, slot integer,
                approx_rows bigint, size_bytes bigint)
 LANGUAGE sql STABLE AS $fn$
-    SELECT parent, partition, day,
-           to_timestamp( day::bigint      * 86400) AS range_start,
-           to_timestamp((day::bigint + 1) * 86400) AS range_end,
-           approx_rows, size_bytes
-    FROM (
-        SELECT p.relname::text AS parent,
-               c.relname::text AS partition,
-               (regexp_match(pg_get_expr(c.relpartbound, c.oid),
-                             'FROM \((\d+)\)'))[1]::integer AS day,
-               GREATEST(c.reltuples, 0)::bigint AS approx_rows,
-               pg_total_relation_size(c.oid)    AS size_bytes
-        FROM pg_inherits i
-        JOIN pg_class c     ON c.oid = i.inhrelid
-        JOIN pg_class p     ON p.oid = i.inhparent
-        JOIN pg_namespace n ON n.oid = p.relnamespace
-        WHERE n.nspname = 'pgfc_observe'
-          AND p.relname IN ('snapshots', 'relation_samples')
-    ) s
-    ORDER BY parent, day;
+    SELECT p.relname::text AS parent,
+           c.relname::text AS partition,
+           (regexp_match(pg_get_expr(c.relpartbound, c.oid), 'IN \(\D*(\d+)'))[1]::integer AS slot,
+           GREATEST(c.reltuples, 0)::bigint AS approx_rows,
+           pg_total_relation_size(c.oid)    AS size_bytes
+    FROM pg_inherits i
+    JOIN pg_class c     ON c.oid = i.inhrelid
+    JOIN pg_class p     ON p.oid = i.inhparent
+    JOIN pg_namespace n ON n.oid = p.relnamespace
+    WHERE n.nspname = 'pgfc_observe'
+      AND p.relname IN ('snapshots', 'relation_samples')
+    ORDER BY p.relname, slot;
 $fn$;
 COMMENT ON FUNCTION pgfc_observe._partition_inventory() IS
-  'Child partitions of the telemetry tables with day, decoded range, est. rows, and size. [subsystem:O2]';
+  'Slot partitions of the raw telemetry ring with slot number, est. rows, and size (FMEA-001). [subsystem:O2]';
 
 -- Generic single-partition ensure used by the rollup job (S4): create the partition of
 -- p_parent covering int key p_key if missing. p_span ('day'|'month') only selects the
 -- human-readable name suffix — the RANGE bound is always [p_key, p_key+1) in that span's
--- unit. Idempotent (IF NOT EXISTS) and race-safe (duplicate_table caught), matching
--- _ensure_partition. The raw tables keep their own _ensure_partition (called hot by
--- observe()); this serves the rollup parents, whose keys are days (1m) or months (1h/1d).
+-- unit. Idempotent (IF NOT EXISTS) and race-safe (duplicate_table caught). This serves only
+-- the rollup parents, whose keys are days (1m) or months (1h/1d); the raw tables use the fixed
+-- ring (rotate_ring), created once at install, not on-demand partitions (FMEA-001).
 CREATE OR REPLACE FUNCTION pgfc_observe._ensure_part(
     p_parent text, p_key integer, p_span text)
 RETURNS void LANGUAGE plpgsql
@@ -672,18 +748,19 @@ DECLARE
     v_day         integer := pgfc_observe._epoch_day(now());
     v_tat_expr    text;   -- total_autovacuum_time: real column on PG18+, else NULL
 BEGIN
-    -- FMEA-002: idle on a read-only standby — the first statement, ahead of _ensure_partition's
+    -- FMEA-002: idle on a read-only standby — the first statement, ahead of rotate_ring's
     -- DDL (a standby physically cannot mutate the catalog, so without this every cron tick
     -- errors). Resumes automatically on promotion.
     IF pgfc_observe._is_standby() THEN RETURN NULL; END IF;
 
-    -- Make sure today's partition exists before either insert (O(1), idempotent).
-    PERFORM pgfc_observe._ensure_partition(v_day);
+    -- Advance the ring before either insert: TRUNCATE the slot rolling off so today's slot
+    -- holds only today (FMEA-001). A propagating lock_timeout here skips this run (retry next).
+    PERFORM pgfc_observe.rotate_ring(v_day);
 
     -- Snapshot header: GUC defaults + pg_class catalog health. (xmin horizons are
     -- populated by a later increment; they default NULL here.)
     INSERT INTO pgfc_observe.snapshots (
-        collected_day,
+        slot, collected_day,
         server_version_num, def_vac_scale_factor, def_vac_threshold,
         def_ana_scale_factor, def_ana_threshold, def_vac_cost_limit,
         def_vac_cost_delay, def_freeze_max_age, def_mxid_freeze_max_age,
@@ -694,7 +771,7 @@ BEGIN
         oldest_xmin_age, oldest_xmin_owner, oldest_xmin_owner_detail,
         oldest_catalog_xmin_age, oldest_catalog_xmin_owner)
     SELECT
-        v_day,
+        (v_day % pgfc_observe._ring_slots())::smallint, v_day,
         current_setting('server_version_num')::int,
         current_setting('autovacuum_vacuum_scale_factor')::float8,
         current_setting('autovacuum_vacuum_threshold')::bigint,
@@ -833,7 +910,7 @@ BEGIN
         ),
         ins AS (
             INSERT INTO pgfc_observe.relation_samples (
-                snapshot_id, collected_day, relid, schemaname, relname,
+                snapshot_id, slot, collected_day, relid, schemaname, relname,
                 n_live_tup, n_dead_tup, n_mod_since_analyze, n_ins_since_vacuum,
                 n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd,
                 last_autovacuum, last_autoanalyze,
@@ -842,7 +919,7 @@ BEGIN
                 relfrozenxid_age, relminmxid_age, relfrozenxid, relminmxid,
                 relation_size_bytes, total_size_bytes, reloptions)
             SELECT
-                $1, $2, chg.relid, chg.schemaname, chg.relname,
+                $1, ($2 %% pgfc_observe._ring_slots())::smallint, $2, chg.relid, chg.schemaname, chg.relname,
                 chg.n_live_tup, chg.n_dead_tup, chg.n_mod_since_analyze, chg.n_ins_since_vacuum,
                 chg.n_tup_ins, chg.n_tup_upd, chg.n_tup_del, chg.n_tup_hot_upd,
                 chg.last_autovacuum, chg.last_autoanalyze,
@@ -1303,17 +1380,19 @@ COMMENT ON FUNCTION pgfc_observe.storage_budget() IS
   'Per-logical-relation on-disk bytes + dead tuples for the pgfc_observe schema (S6); child partitions folded into their parent. [subsystem:O4]';
 
 -- Single-row self-maintenance summary: is the storage model holding? total footprint,
--- aggregate dead tuples (should be ~0 — rotation, not DELETE), and partition counts /
--- oldest raw partition so an operator sees rotation is actually happening.
+-- aggregate dead tuples (should be ~0 — rotation, not DELETE), partition counts (the raw
+-- ring is FIXED at 2 × _ring_slots(), so a constant raw_partitions IS health — FMEA-001),
+-- and the oldest retained raw instant so an operator sees the ring is actually rotating
+-- (it should track ~(_ring_slots()-1) days behind now, never older).
 CREATE OR REPLACE VIEW pgfc_observe.self_health AS
 SELECT
-    (SELECT COALESCE(sum(bytes), 0)       FROM pgfc_observe.storage_budget()) AS total_bytes,
-    (SELECT COALESCE(sum(dead_tuples), 0) FROM pgfc_observe.storage_budget()) AS total_dead_tuples,
-    (SELECT count(*)        FROM pgfc_observe._partition_inventory())          AS raw_partitions,
-    (SELECT count(*)        FROM pgfc_observe._rollup_inventory())             AS rollup_partitions,
-    (SELECT min(range_start) FROM pgfc_observe._partition_inventory())         AS oldest_raw_partition;
+    (SELECT COALESCE(sum(bytes), 0)       FROM pgfc_observe.storage_budget())  AS total_bytes,
+    (SELECT COALESCE(sum(dead_tuples), 0) FROM pgfc_observe.storage_budget())  AS total_dead_tuples,
+    (SELECT count(*)          FROM pgfc_observe._partition_inventory())        AS raw_partitions,
+    (SELECT count(*)          FROM pgfc_observe._rollup_inventory())           AS rollup_partitions,
+    (SELECT min(collected_at) FROM pgfc_observe.snapshots)                     AS oldest_raw_partition;
 COMMENT ON VIEW pgfc_observe.self_health IS
-  'One-row self-maintenance summary for pgfc_observe (S6): total bytes, aggregate dead tuples, partition counts, oldest raw partition. [subsystem:O4]';
+  'One-row self-maintenance summary for pgfc_observe (S6): total bytes, aggregate dead tuples, partition counts (raw ring fixed at 2×_ring_slots), oldest retained raw instant. [subsystem:O4]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Parameter registry  (Phase 1.6 — parameter governance, P1)
@@ -1359,14 +1438,11 @@ VALUES
   ('last_state_fillfactor', 'implementation_convenience', '70', 'percent',
    'fillfactor on relation_last_state so its per-minute updates stay HOT.',
    'design review (S3)', 'maintainer', false, NULL),
-  ('retain_raw_days', 'operator_policy', '3', 'days',
-   'Default raw-telemetry retention window before partitions are truncated.',
-   'MVP estimate — not yet benchmarked', 'operator', true, 'retain() argument'),
-  ('drop_empty_partition_days', 'operator_policy', '30', 'days',
-   'Default age before empty (truncated) partition shells are dropped.',
-   'MVP estimate — not yet benchmarked', 'operator', true, 'drop_empty_partitions() argument'),
+  ('ring_slots', 'implementation_convenience', '8', 'slots',
+   'Fixed LIST-partition count of the raw-telemetry ring (FMEA-001); raw retention = (ring_slots-1) days with daily rotation, recycled by TRUNCATE (rotate_ring) with zero catalog churn. Not a runtime override — changing it requires a destructive re-partition.',
+   'design review (FMEA-001) — MVP estimate, not yet benchmarked', 'maintainer', false, '_ring_slots()'),
   ('rollup_lookback', 'operator_policy', '3 days', 'interval',
-   'Default rollup() lookback window; must cover at least one raw-retention window.',
+   'Default rollup() lookback; need only exceed the rollup cadence so no raw bucket is missed before its slot recycles (the (ring_slots-1)-day raw window leaves margin).',
    'MVP estimate — not yet benchmarked', 'operator', true, 'rollup() argument'),
   ('retain_rollup_1m_days', 'operator_policy', '7', 'days',
    'Default retention for the fine (1m) rollup tier.',
@@ -1388,91 +1464,17 @@ COMMENT ON FUNCTION pgfc_observe._parameter_registry() IS
   'Provenance registry of pgfc_observe governed constants (Phase 1.6) — an inspection/documentation surface. observe has no control-logic literals to single-source; pgfc_govern.parameter_registry unions this into the operator-facing view. [subsystem:O5]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Retention — two-tier partition GC  (Phase 1.5 S2)
+-- Raw retention — the fixed ring rotates inline  (Phase 1.5 S2 / FMEA-001)
 -- ─────────────────────────────────────────────────────────────────────────────
--- Retention is whole-partition rotation, never row-by-row DELETE: that produces zero
--- dead tuples and zero bloat, so the governor never becomes its own vacuum burden.
---   Tier 1 — retain()                : nightly TRUNCATE of out-of-window partitions
---                                      (instant space reclaim; the empty shell stays)
---   Tier 2 — drop_empty_partitions() : monthly DROP of the long-empty shells
--- Two tiers because TRUNCATE reclaims space cheaply and often, while DROP changes the
--- partition set (briefly locks the parent), so it is batched rarely. Schedule e.g.:
---   SELECT cron.schedule('pgfc_observe_retain', '7 3 * * *',
---                        $$ SELECT pgfc_observe.retain() $$);
---   SELECT cron.schedule('pgfc_observe_gc', '23 4 1 * *',
---                        $$ SELECT pgfc_observe.drop_empty_partitions() $$);
-
--- Tier 1: TRUNCATE every partition whose whole day is older than `keep`. Truncating an
--- already-empty shell is skipped, so the count reflects partitions that held data.
-CREATE OR REPLACE FUNCTION pgfc_observe.retain(keep interval DEFAULT '3 days')
-RETURNS bigint   -- number of partitions truncated (that had data)
-LANGUAGE plpgsql
-    SET search_path = pgfc_observe, pg_catalog
-AS $fn$
-DECLARE
-    v_cutoff integer := pgfc_observe._epoch_day(now() - keep);
-    v_count  bigint := 0;
-    v_has    boolean;
-    r        record;
-BEGIN
-    -- FMEA-004 (Invariant 1): bound the lock wait. The EXISTS probe (AccessShare) and the
-    -- TRUNCATE (ACCESS EXCLUSIVE) both acquire locks, so both sit inside the per-partition
-    -- subtransaction: a partition busy under a long reader/writer is SKIPPED (not counted,
-    -- retried next run) instead of waiting forever or aborting the whole run's truncates.
-    PERFORM set_config('lock_timeout', pgfc_observe._maintenance_lock_timeout(), true);
-    FOR r IN SELECT partition, day FROM pgfc_observe._partition_inventory()
-             WHERE day < v_cutoff LOOP
-        BEGIN
-            EXECUTE format('SELECT EXISTS (SELECT 1 FROM pgfc_observe.%I)', r.partition)
-                INTO v_has;
-            IF v_has THEN
-                EXECUTE format('TRUNCATE TABLE pgfc_observe.%I', r.partition);
-                v_count := v_count + 1;
-            END IF;
-        EXCEPTION WHEN lock_not_available THEN
-            NULL;   -- partition busy; skip, retry next run
-        END;
-    END LOOP;
-    RETURN v_count;
-END
-$fn$;
-COMMENT ON FUNCTION pgfc_observe.retain(interval) IS
-  'Tier-1 GC: TRUNCATE telemetry partitions older than keep (default 3 days). Returns partitions truncated. [subsystem:O2]';
-
--- Tier 2: DROP partitions older than `keep` that are already empty (so a DROP never
--- destroys live data — a not-yet-truncated old partition is left for retain()).
-CREATE OR REPLACE FUNCTION pgfc_observe.drop_empty_partitions(keep interval DEFAULT '30 days')
-RETURNS bigint   -- number of empty partitions dropped
-LANGUAGE plpgsql
-    SET search_path = pgfc_observe, pg_catalog
-AS $fn$
-DECLARE
-    v_cutoff integer := pgfc_observe._epoch_day(now() - keep);
-    v_count  bigint := 0;
-    v_has    boolean;
-    r        record;
-BEGIN
-    -- FMEA-004 (Invariant 1): bound the lock wait; skip a busy partition (EXISTS probe and
-    -- DROP both inside the per-partition subtransaction). See retain() for the rationale.
-    PERFORM set_config('lock_timeout', pgfc_observe._maintenance_lock_timeout(), true);
-    FOR r IN SELECT partition, day FROM pgfc_observe._partition_inventory()
-             WHERE day < v_cutoff LOOP
-        BEGIN
-            EXECUTE format('SELECT EXISTS (SELECT 1 FROM pgfc_observe.%I)', r.partition)
-                INTO v_has;
-            IF NOT v_has THEN
-                EXECUTE format('DROP TABLE pgfc_observe.%I', r.partition);
-                v_count := v_count + 1;
-            END IF;
-        EXCEPTION WHEN lock_not_available THEN
-            NULL;   -- partition busy; skip, retry next run
-        END;
-    END LOOP;
-    RETURN v_count;
-END
-$fn$;
-COMMENT ON FUNCTION pgfc_observe.drop_empty_partitions(interval) IS
-  'Tier-2 GC: DROP empty telemetry partitions older than keep (default 30 days). Returns partitions dropped. [subsystem:O2]';
+-- Raw retention is whole-partition rotation, never row-by-row DELETE: zero dead tuples,
+-- zero bloat, so the governor never becomes its own vacuum burden. The ring (FMEA-001) goes
+-- further and adds zero CATALOG churn: rotate_ring() (defined above, near observe()) recycles
+-- the slot rolling off with TRUNCATE, and observe() calls it before every insert — so raw GC
+-- is INLINE and needs no scheduled job. There is no separate retain()/drop_empty_partitions()
+-- cron anymore, and no empty shells to drop, because the slot set is fixed for the life of the
+-- install. rotate_ring() is also exposed as a manual sweep; the raw window is fixed by
+-- _ring_slots() (= (_ring_slots()-1) days), not a per-call interval. Only the coarse rollup
+-- tiers still rotate on a schedule (below) — they remain RANGE-partitioned (lower volume).
 
 -- Rollup retention (S4): cascading per-tier windows — the finer the tier, the shorter it
 -- lives (1m 7 d, 1h 90 d, 1d 365 d; all overridable). Whole-partition DROP, never row-by-row
@@ -1517,13 +1519,12 @@ COMMENT ON FUNCTION pgfc_observe.rollup_retain(interval, interval, interval) IS
   'Cascading rollup GC (S4): DROP rollup partitions past their per-tier window (1m 7d / 1h 90d / 1d 365d). Returns partitions dropped. [subsystem:O2]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Bootstrap: ensure the current day's partition exists so a fresh install accepts
--- inserts immediately (observe() re-ensures on every run). Idempotent.
+-- Bootstrap: the raw ring's slot partitions are created once in the tables section above
+-- (the fixed ring, FMEA-001), so a fresh install accepts raw inserts immediately — no raw
+-- bootstrap call is needed. The rollup parents still need their current partition created so
+-- a fresh install can rollup() right away (rollup() re-ensures the lookback every run).
+-- Idempotent.
 -- ─────────────────────────────────────────────────────────────────────────────
-SELECT pgfc_observe._ensure_partition();
-
--- Bootstrap the current rollup partitions too (S4), so a fresh install can rollup()
--- immediately; rollup() re-ensures the lookback window on every run. Idempotent.
 SELECT pgfc_observe._ensure_part('rollup_1m', pgfc_observe._epoch_day(now()),   'day');
 SELECT pgfc_observe._ensure_part('rollup_1h', pgfc_observe._epoch_month(now()), 'month');
 SELECT pgfc_observe._ensure_part('rollup_1d', pgfc_observe._epoch_month(now()), 'month');
@@ -1548,13 +1549,22 @@ ALTER TABLE pgfc_observe.relation_samples ADD COLUMN IF NOT EXISTS relminmxid  x
 ALTER TABLE pgfc_observe.snapshots ADD COLUMN IF NOT EXISTS client_backends bigint;
 ALTER TABLE pgfc_observe.snapshots ADD COLUMN IF NOT EXISTS max_connections integer;
 
--- S6: static autovacuum reloptions. New partitions get them in their WITH clause
--- (via _telemetry_reloptions in _ensure_partition/_ensure_part), but partitions
--- created before S6 won't — parent reloptions never propagate to children. Backfill
--- every existing raw and rollup partition idempotently (ALTER SET is a no-op when the
--- options already match). The partitioned parents themselves have no storage, so they
--- are skipped; the bootstrapped current-day partitions below are created with the
--- options already set.
+-- FMEA-001: the daily-RANGE GC functions were replaced by the fixed ring (rotate_ring), so
+-- they are no longer CREATEd above. Removing a CREATE does NOT drop an existing function, so
+-- on an UPGRADE these would survive as orphans — and retain()/drop_empty_partitions() were
+-- publicly documented with cron schedules, so their now-broken bodies (they read a `day`
+-- column _partition_inventory() no longer returns) would error every night. Drop them
+-- explicitly. Idempotent: a no-op on a fresh install where they never existed.
+DROP FUNCTION IF EXISTS pgfc_observe.retain(interval);
+DROP FUNCTION IF EXISTS pgfc_observe.drop_empty_partitions(interval);
+DROP FUNCTION IF EXISTS pgfc_observe._ensure_partition(integer);
+
+-- S6: static autovacuum reloptions. New partitions get them in their WITH clause (the ring
+-- slot creation and _ensure_part both pass _telemetry_reloptions), but partitions created
+-- before S6 won't — parent reloptions never propagate to children. Backfill every existing
+-- raw and rollup partition idempotently (ALTER SET is a no-op when the options already match).
+-- The partitioned parents themselves have no storage, so they are skipped; the ring slots and
+-- the bootstrapped rollup partitions are created with the options already set.
 DO $reloptions$
 DECLARE
     r record;

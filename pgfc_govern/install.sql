@@ -1480,18 +1480,27 @@ COMMENT ON VIEW pgfc_govern.self_health IS
 -- Graceful-degrade prune order. When the governor's own footprint exceeds the budget,
 -- shed storage in a FIXED order from most to least disposable —
 --   raw → fine rollups → coarse rollups → routine diagnostics → actions → policy(never)
--- — stopping as soon as the footprint is back under budget. Each level reuses the
--- existing prune primitive with a tighter-than-routine window (this is pressure
--- relief, not the daily job). Levels reached while already under budget are recorded
--- as skipped, so the order is always auditable; policy_history is NEVER pruned (it is
--- the human-owned record of intent) and is reported last as 'preserved'.
+-- — stopping as soon as the footprint is back under budget. The growable levels (rollups,
+-- audit) reuse their prune primitive with a tighter-than-routine window (pressure relief,
+-- not the daily job). RAW is special since FMEA-001: it is a FIXED TRUNCATE-rotated ring,
+-- bounded by construction (2 × _ring_slots() partitions, (_ring_slots()-1) days), so it can
+-- no longer be shed below that floor — this step just force-sweeps any out-of-window slot
+-- observe() has not yet recycled (rotate_ring()). One consequence: a budget set BELOW the raw
+-- ring floor is unsatisfiable (degrade sheds everything else and stays over) — set the budget
+-- above the fixed raw footprint. Levels reached while already under budget are recorded as
+-- skipped, so the order is always auditable; policy_history is NEVER pruned (it is the
+-- human-owned record of intent) and is reported last as 'preserved'.
 --
 -- pgfc_observe has no separate "derived state" table to prune (S3's relation_last_state
 -- is a reconstructable cache, not durable history), so that documented tier is absent
 -- here; the order is otherwise exactly as specified.
+--
+-- Drop the prior 6-arg signature so removing keep_raw (the ring window is fixed, not a
+-- per-call interval) REPLACES rather than overloads it (two all-defaulted overloads would
+-- make degrade() ambiguous). Idempotent.
+DROP FUNCTION IF EXISTS pgfc_govern.degrade(bigint, interval, interval, interval, interval, interval);
 CREATE OR REPLACE FUNCTION pgfc_govern.degrade(
     p_budget_bytes     bigint   DEFAULT NULL,   -- NULL => read storage_config
-    keep_raw           interval DEFAULT '1 day',
     keep_rollup_fine   interval DEFAULT '2 days',
     keep_rollup_coarse interval DEFAULT '30 days',
     keep_diagnostics   interval DEFAULT '30 days',
@@ -1514,13 +1523,14 @@ BEGIN
 
     SELECT COALESCE(sum(bytes), 0) INTO v_total FROM pgfc_govern.storage_budget();
 
-    -- 1. Raw observations (most disposable).
+    -- 1. Raw observations. Bounded by the fixed ring (FMEA-001): force-sweep any out-of-window
+    --    slot observe() has not yet recycled — there is no in-window raw to shed (the ring
+    --    floor is (_ring_slots()-1) days), so 'swept' reports the sweep ran, not deep relief.
     v_step := v_step + 1;
     IF v_total > v_budget THEN
-        PERFORM pgfc_observe.retain(keep_raw);
-        PERFORM pgfc_observe.drop_empty_partitions(keep_raw);
+        PERFORM pgfc_observe.rotate_ring();
         SELECT COALESCE(sum(bytes), 0) INTO v_total FROM pgfc_govern.storage_budget();
-        RETURN QUERY SELECT v_step, 'raw'::text, 'pruned'::text, v_total;
+        RETURN QUERY SELECT v_step, 'raw'::text, 'swept'::text, v_total;
     ELSE
         RETURN QUERY SELECT v_step, 'raw'::text, 'skipped:under_budget'::text, v_total;
     END IF;
@@ -1570,8 +1580,8 @@ BEGIN
     RETURN QUERY SELECT v_step, 'policy'::text, 'preserved'::text, v_total;
 END
 $fn$;
-COMMENT ON FUNCTION pgfc_govern.degrade(bigint, interval, interval, interval, interval, interval) IS
-  'Graceful-degrade prune order (S6): shed storage raw→fine→coarse rollups→diagnostics→actions until under budget; policy is never pruned. No-op when no budget is configured. Returns the ordered prune log. [subsystem:G6]';
+COMMENT ON FUNCTION pgfc_govern.degrade(bigint, interval, interval, interval, interval) IS
+  'Graceful-degrade prune order (S6): shed storage raw (force-sweep the fixed ring, FMEA-001) → fine → coarse rollups → diagnostics → actions until under budget; policy is never pruned. No-op when no budget is configured; a budget below the fixed raw-ring floor is unsatisfiable. Returns the ordered prune log. [subsystem:G6]';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Parameter registry  (Phase 1.6 — parameter governance, P1)

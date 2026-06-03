@@ -181,14 +181,13 @@ govern — [G1](README.md#g1-control-loop-ooda), [G2](README.md#g2-policy-and-in
 | `rollup_1m` | table (partitioned) | O2 |
 | `rollup_1h` | table (partitioned) | O2 |
 | `rollup_1d` | table (partitioned) | O2 |
-| `_ensure_partition()` | function | O2 |
+| `_ring_slots()` | function | O2 |
+| `rotate_ring()` | function | O2 |
 | `_ensure_part()` | function | O2 |
 | `_partition_inventory()` | function | O2 |
 | `_epoch_day()` | function | O2 |
 | `_epoch_month()` | function | O2 |
 | `_month_start()` | function | O2 |
-| `retain()` | function | O2 |
-| `drop_empty_partitions()` | function | O2 |
 | `rollup()` | function | O2 |
 | `rollup_retain()` | function | O2 |
 | `_rollup_coarsen()` | function | O2 |
