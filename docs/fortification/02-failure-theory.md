@@ -1,6 +1,6 @@
 # Phase 2 — Failure theory (FMEA)
 
-**Status:** In progress (first pass complete) — modes enumerated and dispositioned, findings
+**Status:** In progress (first + second pass complete) — modes enumerated and dispositioned, findings
 filed. Closes when every `Critical`/`High` mode is `Verified`/`Won't-fix` and the actionable
 findings have regression coverage (much of that is shared with Phase 3).
 
@@ -54,6 +54,12 @@ Modes worked and found to **fail safe** as built (the reassuring half of the ana
 | **NULL snapshot fields** (boot / pre-feature columns) | `COALESCE` defaults throughout `estimate()`/`plan()`/`governor_metrics`; a NULL newest-estimate snapshot makes `plan()` plan nothing — safe. | `pgfc_govern/install.sql:~709-712`, `:1170` |
 | **Health-state worst-of** (conflicting signals) | Candidate states ranked by the health enum's native order (`DESC` picks the most cautious); the operator force is a one-directional caution floor; serialized under the `control_tick` advisory lock. | `pgfc_govern/install.sql:~2223`, `:2226-2237` |
 | **Ring `TRUNCATE` racing an `observe()` write** (data-loss angle) | Safe by construction (FMEA-001): `rotate_ring()` runs **inside** `observe()`, in the same transaction and before the insert, and `TRUNCATE`s only a slot whose data is out-of-window (`collected_day < p_day-(slots-1)`) — the day being written is never truncated from under the write. A separate caller's `rotate_ring()` touches only out-of-window slots no in-progress `observe()` is writing. The *lock-wait* angle is bounded by FMEA-004's `_maintenance_lock_timeout`. | `pgfc_observe/install.sql` (`rotate_ring`) |
+| **Decide/orient arithmetic & NULL** (`estimate()`/`classify()`: boot, counter reset, quiet relations, zero/NULL denominators) — *second pass* | Each stage is a single multi-CTE `INSERT … ON CONFLICT` (atomic). Denominators are guarded — `NULLIF(def_mxid_freeze_max_age,0)`, `GREATEST(reltuples,1)`; `dt <= 0` yields a NULL rate (the EWMA holds its prior) and the cycle boundary is the **monotonic** `autovacuum_count`; `ewma()` is NULL-safe (NULL sample → prior, NULL prior/alpha → sample); a missing prior trips the `boot` flag and a counter `reset` is detected and skips the rate. The one ungated divide — `classify` when `classify_floor = 0` (a code-constant, default 50) — is FMEA-009's trigger. | `pgfc_govern/install.sql:432-503` (estimate), `:591-617` (classify) |
+| **Decide-stage overlap & re-run** (two `observe_tick`/`control_tick` runs race; a tick re-runs) — *second pass* | `relation_estimate`/`relation_class` upsert `ON CONFLICT (relid) DO UPDATE` — last-writer-wins, benign and idempotent (re-derived next tick); the diagnostics reconciler dedups open findings (`NOT EXISTS`) and resolves cleared ones, so a re-run neither duplicates nor churns. Extends the first-pass `observe()`-overlap row. | `pgfc_govern/install.sql:531-548`, `:656-663`, `:868-895` |
+| **`verify()`** (close-the-loop stage) — *second pass* | A Phase-1 no-op (`SELECT 0`): no state, no failure surface. Its failure modes are analysed when it is implemented (product Phase 2). | `pgfc_govern/install.sql:1145-1148` |
+| **Clock skew** (NTP step, backward or forward) — *second pass* | Rates use `dt = collected_at − prev`; a backward step (`dt <= 0`) yields a NULL rate (hold), and the cycle boundary is the **monotonic** `autovacuum_count`, immune to the clock. A backward step makes `observation_lag`/`control_loop_lag` negative → below threshold → no false alarm; a forward step inflates them → at worst a spurious `emergency` (caution direction, self-heals). The mutation economy stays bounded: a forward step can soften the rolling-day budget, but `global_max_changes_per_cycle` counts within one cycle (clock-independent) and **every** mutation is independently no-op/ownership re-checked (COR-001/FMEA-006) — skew can never produce a *wrong* or unbounded change, only a bounded rate wobble. | `pgfc_govern/install.sql:440`, `:463`; `apply()` budget gates |
+| **Crash-restart / recovery** — *second pass* | Extends "crash mid-cycle": both loops are single transactions (atomic), so recovery finds no torn state. The `UNLOGGED` `relation_last_state` is empty after a crash and self-heals (the next `observe()` re-samples once); logged audit/state tables and the IDENTITY sequences survive. `control_loop_lag` is stale at restart → the first `observe_tick` records a degraded/emergency transition then `normal` once a cycle completes — the same honest, self-healing pair as FMEA-002's repromotion edge. | `pgfc_govern/install.sql:1143-1191`; `relation_last_state` (UNLOGGED) |
+| **Privilege loss mid-operation** (cron role loses `ALTER`/table rights) — *second pass* | `apply()`'s `ALTER` failure is caught as `insufficient_privilege` → a recorded `failed` action (cited-safe `apply()`-failure + FMEA-005 isolation). Losing write rights on a govern/observe table instead makes the stage throw → the loop aborts and rolls back (no torn state), and the gap is detected via `observation_lag`/`control_loop_lag` (→ emergency). No silent wrong actuation. | `pgfc_govern/install.sql` (`apply()` catch); detection via the F1/FMEA-003 lags |
 
 ## Findings
 
@@ -66,6 +72,8 @@ Modes worked and found to **fail safe** as built (the reassuring half of the ana
 | FMEA-005 | Medium | Confirmed | `pgfc_govern/install.sql:1176-1180`, `:1143-1191` | No per-relation error isolation: one uncaught error in `apply()` aborted the whole cycle (all relations rolled back), deterministically and — per FMEA-003 — invisibly. | Verified | [#82](https://github.com/dventimisupabase/pg_flight_controller/issues/82) |
 | FMEA-006 | Low | Confirmed | `pgfc_govern/install.sql:993-994` | `apply()` overwrote a human `ALTER` (made after the planning snapshot) whose value differs from the proposal — it re-checked neither `actuator_state` nor `manage_user_owned`. | Verified | [#83](https://github.com/dventimisupabase/pg_flight_controller/issues/83) |
 | FMEA-007 | Low | Confirmed | `pgfc_govern/install.sql:1150` | `control_tick` takes a **blocking** advisory lock (not `try`) *before* `evaluate_health()`, so under cadence pressure ticks queue (each holding a backend) and F6 load-shedding cannot shed them. | Won't-fix (by-design) | — |
+| FMEA-008 | Low | Confirmed | `pgfc_govern/install.sql:~762`, `:1296` | `plan()` and the `governor_status` view divide by `policy.aggressiveness` (no `CHECK`); an operator-set `aggressiveness ≤ 0` (advisorily flagged `CRITICAL` by `validate_parameters`, not enforced) is a division-by-zero — `plan()` wedges the control loop, `governor_status` throws on read. | Open | [#96](https://github.com/dventimisupabase/pg_flight_controller/issues/96) |
+| FMEA-009 | Low | Confirmed | `pgfc_govern/install.sql:1167-1169` | `observe_tick()` runs `observe()`+`classify()`+`estimate()` in one txn with no per-stage isolation; an uncaught `classify()`/`estimate()` exception discards the just-collected snapshot — inconsistent with FMEA-003's subtransaction protection of the same observation. | Open | [#97](https://github.com/dventimisupabase/pg_flight_controller/issues/97) |
 
 ### FMEA-001 — Partition recycling uses create/drop, not a fixed `TRUNCATE` ring
 
@@ -323,6 +331,51 @@ not a realistic steady-state pressure; a `pg_try_advisory_xact_lock` that skips 
 already running is the documented alternative if this ever bites. Recorded per the charter
 rather than filed.
 
+### FMEA-008 — `plan()` / `governor_status` divide by `policy.aggressiveness` with no guard
+
+**Severity:** Low · **Confidence:** Confirmed · **Status:** Open ([#96](https://github.com/dventimisupabase/pg_flight_controller/issues/96))
+
+`policy.aggressiveness` is `double precision NOT NULL DEFAULT 1.0` with **no `CHECK`**, so an
+operator can `UPDATE pgfc_govern.policy SET aggressiveness = 0` at runtime. `plan()` derives the
+class target as `f_template / v_aggr` (`:~762`) and the `governor_status` view divides by
+`COALESCE(aggressiveness, …)` (`:1296`) — both unguarded. **Cause → effect:** `aggressiveness = 0`
+→ division-by-zero. In `plan()` it aborts `control_tick()` (one transaction) → the control loop
+wedges and makes no change; per FMEA-003 the stall is **detected** as `control_loop_lag` grows
+(degraded → emergency). In `governor_status` it throws on read — so the operator's primary status
+view fails exactly when they reach for it to explain the now-quiet governor (the sharper edge).
+**Fail-safe:** yes, by *refusal* (no actuation), and already **advisorily flagged** —
+`validate_parameters()` grades `aggressiveness <= 0` `CRITICAL` ("divide-by-zero / sign
+inversion"). **Detection:** the heartbeat plus `validate_parameters`. **Recovery:** the operator
+restores a positive value. (Negative values don't divide-by-zero — `GREATEST(…, sf_min)` clamps
+them — but `validate_parameters` flags them for the sign inversion.)
+
+**Disposition (filed — maintainer's call).** Not fixed in this pass: the design deliberately
+chose *advisory* validation over enforcement, and reversing that is a decision for the
+maintainer, not an FMEA-pass default. Candidate fixes — a `CHECK (aggressiveness > 0)` on
+`policy` (reject at config time), or `NULLIF`/clamp guards in `plan()` and `governor_status`
+(fail soft). `Low`: operator-reachable, self-inflicted, fail-safe, detected, advisorily warned.
+
+### FMEA-009 — `observe_tick()` has no per-stage isolation; a decide-stage exception drops the snapshot
+
+**Severity:** Low · **Confidence:** Confirmed · **Status:** Open ([#97](https://github.com/dventimisupabase/pg_flight_controller/issues/97))
+
+`observe_tick()` runs `observe()` → `classify()` → `estimate()` in one transaction (`:1167-1169`).
+FMEA-003 deliberately wrapped the *trailing* `evaluate_health()` in a subtransaction so a
+health-eval hiccup can never lose the just-collected observation — but `classify()` and
+`estimate()` run **unguarded**, before it, in the same transaction. **Cause → effect:** an
+uncaught exception in either rolls back the whole tick, discarding the snapshot `observe()`
+already wrote. Triggers are low-probability (the stages are guarded set-based math): the only
+in-code one is `classify` dividing by zero when `classify_floor = 0` (a code-constant, default
+50), plus any exception a future estimator/classifier adds. **Fail-safe:** yes — the lost
+snapshot is **detected** as `observation_lag` grows (→ degraded/emergency) and there is no bad
+actuation — but it is **inconsistent** with FMEA-003's snapshot-protection of the very same loop.
+
+**Disposition (filed — maintainer's call).** A genuine design tension to weigh, not a clear
+bug: snapshot+derived-estimate **atomicity** (a snapshot without its estimate is arguably
+incomplete) versus **preserve-the-observation** (isolate `classify`/`estimate` in a
+subtransaction like `evaluate_health`, re-deriving next tick). The observe-loop analog of
+FMEA-005's per-relation apply-loop isolation. `Low`: fail-safe, detected, low-probability trigger.
+
 ## Traceability (Phase 2 contribution)
 
 Failure modes attach to the invariants/mechanisms they stress (extends the Phase 1 spine):
@@ -336,26 +389,34 @@ Failure modes attach to the invariants/mechanisms they stress (extends the Phase
 | F2 — health-state machine | worst-of under conflicting signals | Cited-safe |
 | F6 — load shedding | FMEA-007 (lock wait precedes health eval) | Won't-fix |
 | F7 — active-control activation | FMEA-002 (standby), FMEA-005 (poison relation), FMEA-006 (post-snapshot human race) | FMEA-002/005/006 **Verified** (#80/#82/#83) |
+| F1 — self-monitoring / observation liveness | FMEA-009 (a `classify()`/`estimate()` exception discards the just-collected snapshot) | `Low`, filed ([#97](https://github.com/dventimisupabase/pg_flight_controller/issues/97)); fail-safe, detected via `observation_lag` |
+| Parameter governance (P1–P3) — advisory vs. enforced | FMEA-008 (`plan()`/`governor_status` divide by `aggressiveness`; `≤ 0` wedges the loop + errors the view) | `Low`, filed ([#96](https://github.com/dventimisupabase/pg_flight_controller/issues/96)); `validate_parameters` flags `CRITICAL` (advisory) |
 
 ## Exit criteria
 
 Per the charter — every enumerated mode dispositioned, all `Critical`/`High` modes
-`Verified`/`Won't-fix`, spine contribution complete. **First-pass status:**
+`Verified`/`Won't-fix`, spine contribution complete. **Status (first + second pass):**
 
-- [x] **Worked this pass:** the `apply()` / `control_tick()` path and the observe-storage
+- [x] **First pass:** the `apply()` / `control_tick()` path and the observe-storage
       path (crash, overlap, upgrade, partition rotation, standby, NULL fields, health worst-of,
       the lock/isolation/visibility findings) — each dispositioned cited-safe or as a finding.
-- [ ] **Deferred to the next pass:** per-stage failure treatment of `estimate()` / `classify()`
-      / `plan()` / `verify()`, and the environmental faults still unworked from the Method list
-      (clock skew, crash-restart/recovery, privilege loss mid-operation).
-- [x] No `Critical`/`High` modes found in the worked surface (the mutation path fails safe) —
-      the hard exit gate is met for what has been analyzed.
+- [x] **Second pass:** per-stage failure treatment of `estimate()` / `classify()` / `plan()` /
+      `verify()` (all cited-safe — guarded, atomic single-statement upserts; `verify()` is a
+      stub), and the environmental faults from the Method list (clock skew, crash-restart/
+      recovery, privilege loss) — each dispositioned cited-safe, with two new `Low` findings
+      (FMEA-008/009) filed.
+- [x] No `Critical`/`High` modes found across **both** passes — the mutation path fails safe
+      (single-txn atomicity) and the decide/orient stages and environmental faults fail safe by
+      **refusal** (a stage exception aborts and is detected, never mis-actuates). The hard exit
+      gate is met.
 - [x] Findings filed: FMEA-001 ([#79](https://github.com/dventimisupabase/pg_flight_controller/issues/79)),
       002 ([#80](https://github.com/dventimisupabase/pg_flight_controller/issues/80)),
       003 ([#84](https://github.com/dventimisupabase/pg_flight_controller/issues/84)),
       004 ([#81](https://github.com/dventimisupabase/pg_flight_controller/issues/81)),
       005 ([#82](https://github.com/dventimisupabase/pg_flight_controller/issues/82)),
-      006 ([#83](https://github.com/dventimisupabase/pg_flight_controller/issues/83));
+      006 ([#83](https://github.com/dventimisupabase/pg_flight_controller/issues/83)),
+      008 ([#96](https://github.com/dventimisupabase/pg_flight_controller/issues/96)),
+      009 ([#97](https://github.com/dventimisupabase/pg_flight_controller/issues/97));
       FMEA-007 Won't-fix.
 - [x] The `Medium` findings reach `Fixed`/`Verified` (regression coverage shared with Phase 3):
       FMEA-001 (#79), 002 (#80), 003 (#84), 004 (#81), 005 (#82) all Verified; 006 (#83, `Low`)
