@@ -579,7 +579,7 @@ RETURNS integer LANGUAGE plpgsql
     SET search_path = pgfc_govern, pgfc_observe, pg_catalog
 AS $fn$
 DECLARE
-    v_floor bigint  := pgfc_govern._param('classify_floor')::bigint;  -- min recent writes before classifying on fractions
+    v_floor bigint  := GREATEST(pgfc_govern._param('classify_floor')::bigint, 1);  -- min recent writes before classifying on fractions; >= 1 so a 0 floor can't 0/0 the write-fraction on a no-write relation (FMEA-009)
     v_large real    := pgfc_govern._param('classify_large')::real;    -- reltuples above which an idle relation is 'archive'
     v_ins_frac  double precision := pgfc_govern._param('classify_append_only_ins_frac')::double precision;
     v_del_frac  double precision := pgfc_govern._param('classify_delete_frac')::double precision;
