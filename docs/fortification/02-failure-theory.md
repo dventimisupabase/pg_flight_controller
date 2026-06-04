@@ -265,7 +265,7 @@ re-running `install.sql` is the supervised upgrade path, where a human-run migra
 leaves a *bounded* `lock_timeout` (baseline the GUC to `0` = unbounded, call, assert it changed)
 — the deterministic mechanism. The per-partition **skip-under-contention** path is exercised
 only by construction; an end-to-end concurrent-lock test is **Phase-3 coverage** (the same shape
-as the `apply()` live-lock-timeout gap).
+as the now-closed `apply()` live-lock-timeout test, `29_apply_lock_timeout`).
 
 ### FMEA-005 — No per-relation error isolation in the apply loop
 

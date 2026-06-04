@@ -7,7 +7,8 @@
 > finding); the four findings are resolved — **COR-001** (High) and **SEC-001** / **SEC-002**
 > (Low) are *Verified* with regression tests, **COR-002** (Low) is *Won't-fix (by-design,
 > documented)*; the traceability spine is filled for the `apply()` path, with one test-coverage
-> gap (the live lock-timeout path) carried forward to Phase 3. Exit criteria met (see end).
+> gap (the live lock-timeout path) carried forward to Phase 3 and now closed there
+> (`29_apply_lock_timeout`). Exit criteria met (see end).
 
 The only place the system mutates the catalog. Everything else observes, estimates,
 decides, or reports — `apply()` is where a decision becomes an `ALTER TABLE`. This phase
@@ -143,8 +144,9 @@ Stages 1–6 are the caller (`control_tick()`); stages 7–17 are the actuator
       `EXECUTE`). A residual `ALTER` error (a value `float8in` accepts but the reloption
       parser rejects) aborts and **cleanly rolls back** the `control_tick` txn — fail-closed,
       and reachable only by a `decision_log` tamper (same boundary as SEC-002). The live
-      lock-timeout exception path is exercised only via *seeded* failure rows (`13`, `18`),
-      not an end-to-end lock contention → **Phase 3 coverage gap** (see traceability).
+      lock-timeout exception path *was* exercised only via *seeded* failure rows (`13`, `18`),
+      not end-to-end contention; **Phase 3 closed that gap** — `29_apply_lock_timeout` drives a
+      real `dblink`-held `ACCESS EXCLUSIVE` lock through `apply()` to a live `lock_timeout`.
 - [x] **No-op / stale-window.**
       **Disposition:** cited-safe, tested. The single live re-read
       (`effective_reloption(v_live, …)`) is the sole arbiter and downgrades `adjust → no-op`
@@ -408,7 +410,7 @@ each holds in code and is backed by a test. (Filled during the review.)
 
 | Invariant / mechanism | Enforced at | Test | Findings |
 |---|---|---|---|
-| Inv 1 — never wait on locks | `apply()` stage 15 (`lock_timeout`, non-blocking) | `13`/`18` (seeded failure rows → metrics/taxonomy); **live lock-timeout path untested → Phase 3 gap** | — |
+| Inv 1 — never wait on locks | `apply()` stage 15 (`lock_timeout`, non-blocking) | `13`/`18` (seeded failure rows → metrics/taxonomy); `29_apply_lock_timeout` (live `dblink` contention → real `lock_timeout`) | — |
 | Inv 3 — never reduce freeze safety | `plan()` freeze floor (refusal to tighten is safe) | `04_plan` (freeze floor → `sf_min`) | — |
 | Inv 4 — never exceed mutation budgets | `apply()` stage 12 (three tiers) | `16_authority_gate` | COR-002 |
 | Inv 6 — every action explainable | `apply()` audit writes (stages 16–17) | `05_loop`, `19_activation` (applied + baseline/revert); `16`/`21` (refusals not misrecorded) | — |
@@ -424,6 +426,6 @@ Per the charter, plus specific to this phase — **all met:**
 - [x] Both checklists fully dispositioned (cited-safe or finding).
 - [x] `/security-review` output reconciled into the Findings table (SEC-001/002, COR-001/002).
 - [x] The traceability seed above completed for the `apply()` path (one Phase-3 coverage gap
-      recorded: the live lock-timeout path).
+      recorded: the live lock-timeout path — since closed by `29_apply_lock_timeout`).
 - [x] All `Critical`/`High` findings `Verified` or `Won't-fix` (with rationale) — COR-001
       (the only High) is Verified.

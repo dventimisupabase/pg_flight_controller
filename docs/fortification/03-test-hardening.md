@@ -1,7 +1,8 @@
 # Phase 3 — Test hardening
 
-**Status:** In progress (planning) — gap inventory built and the concurrent-lock feasibility
-question settled (below); the gap-closing tests follow as their own increments.
+**Status:** In progress — gap inventory built, the concurrent-lock feasibility question settled
+(below), and the first gap-closing increment landed: the live `apply()` lock-timeout test
+(`29_apply_lock_timeout`). The remaining gap-closing tests follow as their own increments.
 
 Not "do the tests pass" but "do the tests exercise the paths that can hurt us." The suite already
 had blind spots — two hazards (loop-ordering, stale-window) were recorded in the `pgfc_govern`
@@ -49,7 +50,7 @@ needs; the gap-closing tests then read like the existing pgTAP files.
 
 | Gap | Source | Evidence | Test approach | Status |
 |---|---|---|---|---|
-| `apply()` live lock-timeout | Phase 1 (COR / `apply()`) | `apply()` takes a non-blocking ~100 ms lock; only *seeded* failure rows are tested — the live-contention path is the [01 doc's](01-security-correctness-apply.md) recorded Phase-3 gap | dblink holds a lock on a governed table; run a non-advisory `control_tick()`/`apply()`; assert a `lock_timeout` `failed` action is recorded (and the breaker / failure taxonomy light) | Open |
+| `apply()` live lock-timeout | Phase 1 (COR / `apply()`) | `apply()` takes a non-blocking ~100 ms lock; only *seeded* failure rows are tested — the live-contention path is the [01 doc's](01-security-correctness-apply.md) recorded Phase-3 gap | dblink holds a lock on a governed table; run a non-advisory `control_tick()`/`apply()`; assert a `lock_timeout` `failed` action is recorded (and the breaker / failure taxonomy light) | **Closed** — `29_apply_lock_timeout`: a dblink-held `ACCESS EXCLUSIVE` lock drives `apply()` to a live `lock_timeout` (`failed`/`actuation`/`timeout`), lighting `governor_metrics` + `failure_taxonomy`; a lock-released control flips the same call to success. Not a defect (the handler was already correct) |
 | Maintenance-DDL skip-under-contention (FMEA-004) | Phase 2 | `rotate_ring` / `_ensure_part` / `rollup_retain` set `_maintenance_lock_timeout` and skip a busy partition in a per-partition subtransaction — "exercised only by construction" | dblink locks a partition; assert the function skips it (return count / inventory reflects the skip) and does **not** error | Open |
 | `rotate_ring` slot skip (FMEA-001) | Phase 2 | the non-current-slot skip on `lock_not_available` in `rotate_ring` | subset of the above: lock a stale slot, assert the sweep skips it (retried next run) | Open |
 | Coverage read of the `apply()` path | Phase 1/2 | each `apply()` branch, gate, budget tier, exception handler; `evaluate_health` transitions; the failure taxonomy | map each branch to a test; add tests for the unmapped ones | Open |
@@ -73,7 +74,8 @@ rationale); every `Critical`/`High` finding from Phases 1–2 has a regression t
 `Verified`). Concretely for this phase:
 
 - [x] Concurrent-lock testing feasibility established (dblink; this doc).
-- [ ] The live lock-timeout and skip-under-contention gaps closed with dblink-based tests.
+- [ ] The live lock-timeout (done — `29_apply_lock_timeout`) and skip-under-contention gaps
+  closed with dblink-based tests.
 - [ ] The `apply()`-path coverage read done and the finding → test map complete.
 - [ ] The true-replica standby gap dispositioned (a replica harness, or accept-with-rationale).
 
