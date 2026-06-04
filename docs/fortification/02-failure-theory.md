@@ -423,7 +423,7 @@ Failure modes attach to the invariants/mechanisms they stress (extends the Phase
 
 | Invariant / mechanism | Stressed by | Disposition |
 |---|---|---|
-| Inv 1 — never wait on locks | FMEA-004 (maintenance DDL, no `lock_timeout`) | FMEA-004 **Verified** (#81); skip-under-contention → Phase 3 |
+| Inv 1 — never wait on locks | FMEA-004 (maintenance DDL, no `lock_timeout`) | FMEA-004 **Verified** (#81); skip-under-contention closed in Phase 3 (`16_maintenance_skip_under_contention`, `29_apply_lock_timeout`) |
 | Inv 4 — never exceed mutation budgets | crash mid-cycle | Cited-safe (single-txn atomicity) |
 | Inv 6 — every action explainable | FMEA-003 (loop errors unrecorded), FMEA-005 (silent total denial) | FMEA-003/005 **Verified** (#84/#82) |
 | F1 — self-monitoring metrics | FMEA-003 (`tick_errors_last_day` structurally 0; no control-loop heartbeat) | FMEA-003 **Verified** (#84) — `control_loop_lag` heartbeat, observe↔control mutual watchdog |
