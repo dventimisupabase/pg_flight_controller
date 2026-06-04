@@ -36,7 +36,7 @@ spine):
 |---|---|---|
 | 1 | Security + correctness — `apply()` path | **Complete** — COR-001 (High) / SEC-001 / SEC-002 Verified; COR-002 Won't-fix (by-design) |
 | 2 | Failure theory (FMEA) | **Complete** — first + second pass (no Critical/High; decide/orient stages + environmental faults worked); FMEA-001..006 + 008 Verified (#79/#80/#84/#81/#82/#83/#96); FMEA-007 + 009 Won't-fix by-design (009 also divide-guarded) (#97) |
-| 3 | Test hardening | **In progress** — gap inventory built; concurrent-lock testing shown feasible in-harness (dblink); the live `apply()` lock-timeout test landed (`29_apply_lock_timeout`); skip-under-contention + coverage-read tests to follow |
+| 3 | Test hardening | **In progress** — gap inventory built; concurrent-lock testing shown feasible in-harness (dblink); the live `apply()` lock-timeout (`29_apply_lock_timeout`) and maintenance-DDL skip-under-contention (`16_maintenance_skip_under_contention`) tests landed; the `apply()`-path coverage read + finding→test map to follow |
 | 4 | Review process | Not started |
 
 ## Where findings go
