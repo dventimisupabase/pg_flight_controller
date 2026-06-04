@@ -249,13 +249,19 @@ on these paths.
 `_telemetry_reloptions`, so observe stays independent of `pgfc_govern`'s registry) single-sources
 a bounded value (`5s` — generous next to `apply()`'s `100ms`, since off-peak GC can wait a
 couple of seconds for a transient reader of the governor's own tables, where user-facing
-actuation cannot). Every recurring maintenance function — `_ensure_partition`, `_ensure_part`,
-`retain`, `drop_empty_partitions`, `rollup_retain` — sets it txn-local at the top of its body.
-The three **looping** GC functions additionally wrap each partition's work (the `EXISTS` probe
-*and* the `TRUNCATE`/`DROP`, since both acquire locks) in a per-partition subtransaction that
-catches `lock_not_available` and **skips** that partition (retried next run) rather than
-aborting the whole run's truncates; `_ensure_partition` lets a timeout propagate (observe skips
-that run, retries next minute).
+actuation cannot). Every recurring maintenance function — `rotate_ring`, `_ensure_part`,
+`rollup_retain` — sets it txn-local at the top of its body (FMEA-001 later folded the raw path
+into the fixed ring, superseding the `retain` / `drop_empty_partitions` / `_ensure_partition`
+this finding first cited). The two **looping** GC functions, `rotate_ring` and `rollup_retain`,
+additionally wrap each partition's *mutating* DDL — the `TRUNCATE` / `DROP` (`ACCESS EXCLUSIVE`)
+— in a per-partition subtransaction that catches `lock_not_available` and **skips** that
+partition (retried next run) rather than aborting the whole run. Each function's read-side step
+(`rotate_ring`'s stale-slot `EXISTS` probe, `rollup_retain`'s `_rollup_inventory()`) takes only
+`ACCESS SHARE`, so it is left unwrapped: compatible with the realistic reader/writer contention
+the skip guards against, and bounded by the same `lock_timeout`. A timeout that *does* propagate
+— `_ensure_part` (single partition, no loop), or `rotate_ring`'s *current*-slot `TRUNCATE` —
+skips the whole observe run (retried next minute), so a day is never mixed into an un-rotated
+slot.
 
 **Scope.** Inv 1 governs the *autonomous cron* path. The install-time DDL — the S2 destructive
 recreate and the `DO $reloptions$` per-partition backfill — is deliberately **not** bounded:
@@ -263,9 +269,12 @@ re-running `install.sql` is the supervised upgrade path, where a human-run migra
 
 **Verification.** `pgfc_observe/tests/13_maintenance_lock_timeout.sql` asserts each function
 leaves a *bounded* `lock_timeout` (baseline the GUC to `0` = unbounded, call, assert it changed)
-— the deterministic mechanism. The per-partition **skip-under-contention** path is exercised
-only by construction; an end-to-end concurrent-lock test is **Phase-3 coverage** (the same shape
-as the now-closed `apply()` live-lock-timeout test, `29_apply_lock_timeout`).
+— the deterministic mechanism. The end-to-end per-partition **skip-under-contention** path is
+closed by `pgfc_observe/tests/16_maintenance_skip_under_contention.sql` (Phase 3): a dblink-held
+`ROW EXCLUSIVE` lock drives `rollup_retain()` and `rotate_ring()` to skip the busy
+partition/slot (it survives, no error), and a lock-released control re-run flips the same call
+to doing the work — the same shape as the `apply()` live-lock-timeout test,
+`29_apply_lock_timeout`.
 
 ### FMEA-005 — No per-relation error isolation in the apply loop
 
