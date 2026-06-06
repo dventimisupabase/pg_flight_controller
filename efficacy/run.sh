@@ -9,6 +9,11 @@
 # Use the direct/session connection (port 5432), not the transaction pooler
 # (port 6543) — pgbench and session-level operations require session mode.
 #
+# Prerequisites:
+#   - pg_cron must be installed on the target database (CREATE EXTENSION pg_cron).
+#     pgfc requires pg_cron but does not install it — that's the operator's
+#     responsibility, matching the pattern established by pg_flight_recorder.
+#
 # Config via env vars (defaults are the smoke config):
 #
 #   EFFICACY_ARM              defaults
@@ -60,7 +65,7 @@ effi_log "Connection OK"
 
 effi_log "Checking pg_cron..."
 effi_psql -c "SELECT 1 FROM pg_extension WHERE extname = 'pg_cron';" | grep -q 1 \
-    || { effi_log "ERROR: pg_cron extension not found"; exit 1; }
+    || { effi_log "ERROR: pg_cron extension not found — run: CREATE EXTENSION pg_cron;"; exit 1; }
 effi_log "pg_cron OK"
 
 # =========================================================================
