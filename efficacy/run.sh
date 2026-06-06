@@ -125,12 +125,12 @@ effi_psql_file "$EFFICACY_DIR/sampler/create-metrics-table.sql"
 
 effi_log "=== Stage 3: Arm setup (arm=$ARM) ==="
 
-ARM_SCRIPT="$EFFICACY_DIR/config/arm-${ARM}.sql"
+ARM_SCRIPT="${EFFICACY_ARM_SCRIPT:-$EFFICACY_DIR/config/arm-${ARM}.sql}"
 if [ ! -f "$ARM_SCRIPT" ]; then
     effi_log "ERROR: arm config not found: $ARM_SCRIPT"
     exit 1
 fi
-effi_psql_file "$ARM_SCRIPT" -v fixture="$FIXTURE"
+effi_psql_file "$ARM_SCRIPT" -v fixture="$FIXTURE" -v sf="${EFFICACY_ORACLE_SF:-0}"
 
 # =========================================================================
 # Stage 4: Baseline

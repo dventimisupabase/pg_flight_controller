@@ -1,10 +1,15 @@
 -- Expert-static arm: per-table autovacuum tuning frozen at t0 (Phase 4 spec).
 -- Reads class targets from the pgfc registry, applies via ALTER TABLE SET.
 -- Requires psql variable :fixture (set by run.sh).
+--
+-- Uses set_config to pass psql variables into the DO block (psql does not
+-- interpolate :variable inside dollar-quoted strings).
+
+SELECT set_config('pgfc._arm_fixture', :'fixture', false);
 
 DO $$
 DECLARE
-    v_fixture text := :'fixture';
+    v_fixture text := current_setting('pgfc._arm_fixture');
     v_table text;
     v_sf double precision;
     v_reltuples real;
