@@ -5,6 +5,7 @@ set -euo pipefail
 
 EFFICACY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$EFFICACY_DIR/.." && pwd)"
+export PROJECT_ROOT
 
 # --- Logging ---
 
