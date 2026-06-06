@@ -1,6 +1,6 @@
 # dbdev metadata for pgfc_govern (renamed to pgfc_govern.control at publish time).
 comment = 'pg_flight_controller: decide and act (autovacuum governor control loop)'
-default_version = '0.1.0'
+default_version = '0.2.0'
 relocatable = false
 schema = 'pgfc_govern'
 requires = 'pgfc_observe'

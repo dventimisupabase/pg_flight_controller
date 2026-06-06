@@ -97,6 +97,14 @@ Tests are distributed across extension subdirectories:
 - `pgfc_observe/tests/`
 - `pgfc_govern/tests/`
 
+## Actuation-path review
+
+Any change touching the actuation path (`apply()`, `control_tick()`, `plan()`,
+`evaluate_health()`) should walk the review checklist in
+[`docs/fortification/04-review-process.md`](docs/fortification/04-review-process.md).
+The fortification analysis (security, FMEA, traceability spine) lives in
+[`docs/fortification/`](docs/fortification/).
+
 ## Code Style
 
 - Follow existing patterns in the relevant `install.sql`
