@@ -9,7 +9,7 @@ own as a monitoring tool.
 
 This is **Phase 0** of the governor: read-only telemetry, useful on its own. It ships
 in the
-[v0.1.0 release](https://github.com/dventimisupabase/pg_flight_controller/releases/tag/v0.1.0).
+[v0.2.0 release](https://github.com/dventimisupabase/pg_flight_controller/releases/tag/v0.2.0).
 For the concepts and the full guide set, see [`docs/`](../docs/index.md).
 
 ## Install

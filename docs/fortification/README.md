@@ -23,21 +23,20 @@ The four phases, in order (each builds on the one before via the shared traceabi
 spine):
 
 1. **[01-security-correctness-apply.md](01-security-correctness-apply.md)** — security
-   review + code review of the `apply()` path. *(detailed)*
+   review + code review of the `apply()` path.
 2. **[02-failure-theory.md](02-failure-theory.md)** — failure-mode analysis (FMEA).
-   *(stub — fleshed out when reached)*
-3. **[03-test-hardening.md](03-test-hardening.md)** — test-suite adequacy. *(stub)*
+3. **[03-test-hardening.md](03-test-hardening.md)** — test-suite adequacy +
+   traceability.
 4. **[04-review-process.md](04-review-process.md)** — the standing review process.
-   *(stub)*
 
 ## Status
 
 | Phase | Title | Status |
 |---|---|---|
 | 1 | Security + correctness — `apply()` path | **Complete** — COR-001 (High) / SEC-001 / SEC-002 Verified; COR-002 Won't-fix (by-design) |
-| 2 | Failure theory (FMEA) | **Complete** — first + second pass (no Critical/High; decide/orient stages + environmental faults worked); FMEA-001..006 + 008 Verified (#79/#80/#84/#81/#82/#83/#96); FMEA-007 + 009 Won't-fix by-design (009 also divide-guarded) (#97) |
-| 3 | Test hardening | **In progress** — gap inventory built; concurrent-lock testing shown feasible in-harness (dblink); the live `apply()` lock-timeout (`29_apply_lock_timeout`) and maintenance-DDL skip-under-contention (`16_maintenance_skip_under_contention`) tests landed; the `apply()`-path coverage read + finding→test map to follow |
-| 4 | Review process | Not started |
+| 2 | Failure theory (FMEA) | **Complete** — first + second pass (no Critical/High; decide/orient stages + environmental faults worked); FMEA-001..006 + 008 Verified; FMEA-007 + 009 Won't-fix by-design (009 also divide-guarded) |
+| 3 | Test hardening | **Complete** — 21-branch `apply()` map, 15-candidate `evaluate_health()` map, 12-finding regression map, full traceability spine; tests `29`–`31` + three accept-with-rationale dispositions; no Phase-3 findings |
+| 4 | Review process | **Complete** — actuation-path review checklist, CI-enforcement posture (existing gates sufficient), reusable assets catalogued |
 
 ## Where findings go
 

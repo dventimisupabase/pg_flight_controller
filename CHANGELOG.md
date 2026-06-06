@@ -6,6 +6,118 @@ section in the same pull request as your change (this is a convention, not a CI 
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-06
+
+Fortification release. Same capabilities as v0.1.0, hardened by a structured
+security review, failure-mode analysis, and test-hardening pass — the governor is
+reviewed and safe for active control (`advisory_only = false`). No new features;
+every change is a safety fix, a test, or documentation.
+
+### Fixed
+
+- **COR-001 (High): ownership guard conflated governor-set with user-set.**
+  `plan()` now cross-checks `actuator_state` so the governor recognizes its own
+  prior actuation and only treats a setting as user-owned when it pre-existed.
+  Continuous control restored under `manage_user_owned = false`. (#66, #75)
+
+- **SEC-001 (Low): `search_path` unpinned on plpgsql functions.** Every plpgsql
+  function in both extensions now pins an explicit `SET search_path` as
+  defense-in-depth. The cron-role privilege model is documented. (#68, #77)
+
+- **SEC-002 (Low): `apply()` interpolated `v_prop` without validation.** `apply()`
+  now parses the proposed value to a number and range-checks it against
+  `[sf_min, sf_max]` before splicing into the `ALTER TABLE`. A crafted
+  `decision_log` row can no longer inject reloptions. (#69, #76)
+
+- **FMEA-001 (Medium): partition recycling used create/drop, not a fixed ring.**
+  `snapshots` and `relation_samples` are now `LIST`-partitioned on a fixed set of
+  ring slots created once at install. `rotate_ring()` replaces
+  `_ensure_partition`/`retain`/`drop_empty_partitions`: zero dead tuples *and* zero
+  catalog churn in steady state. (#79, #93)
+
+- **FMEA-002 (Medium): no standby guard.** A `_is_standby()` seam (wrapping
+  `pg_is_in_recovery()`) is now the first statement of every scheduled writer
+  (`observe()`, `observe_tick()`, `control_tick()`, `retain()`, `degrade()`,
+  `rollup_retain()`). The loops idle on a replica and resume on promotion. (#80,
+  #91, #94)
+
+- **FMEA-003 (Medium): control-loop errors invisible to the health model.**
+  `governor_metrics` now exposes `control_loop_lag` (age of the last
+  fully-completed control cycle). `evaluate_health()` gains a control-loop-lag
+  candidate (degraded → emergency), and `observe_tick()` now also refreshes the
+  health state — the mutual-watchdog design. A wedged `control_tick()` is caught
+  by the independent fast loop. (#84, #89)
+
+- **FMEA-004 (Medium): maintenance DDL set no `lock_timeout`.** A single
+  `_maintenance_lock_timeout()` helper now bounds the lock wait on every recurring
+  maintenance function. The looping GC functions (`rotate_ring`, `rollup_retain`)
+  additionally skip a busy partition in a subtransaction rather than aborting.
+  (#81, #87)
+
+- **FMEA-005 (Medium): no per-relation error isolation in the apply loop.** Each
+  `apply()` call in `control_tick()` now runs in its own subtransaction. A poison
+  relation's error is isolated and recorded; healthy relations in the same cycle
+  still actuate. (#82, #88)
+
+- **FMEA-006 (Low): `apply()` could overwrite a human ALTER made after the
+  planning snapshot.** `apply()` now re-checks ownership against the live
+  reloption before the budget tiers. A post-plan human change is refused unless
+  `manage_user_owned = true`. (#83, #86)
+
+- **FMEA-008 (Low): `plan()` / `governor_status` divide by `aggressiveness` with
+  no guard.** A new `_effective_aggressiveness()` wraps the divisor at both
+  sites — a non-positive or NULL value falls back to the registry default instead
+  of dividing by zero. (#96, #99)
+
+- **FMEA-009 (Low): `classify()` divides by zero when `classify_floor = 0`.**
+  The effective floor is now `GREATEST(classify_floor, 1)`. The residual
+  (observe-loop isolation) is Won't-fix by-design — atomicity gives louder
+  detection than subtransaction swallowing. (#97, #100)
+
+### Added
+
+- **Upgrade gate.** `upgrade.sh` installs the latest release tag's schema, applies
+  the current `install.sql` over it, and runs the full suite. CI runs it as a
+  required check on every PR. (#95)
+
+- **Fortification test suite.** 11 new pgTAP test files (tests 20–31) totaling
+  ~200 new assertions, exercising the safety-critical paths Phases 1–3 surfaced:
+
+  - `21_value_validation` — SEC-002 injection/range defense
+  - `22_search_path` — SEC-001 caller-independence
+  - `23_apply_ownership` — FMEA-006 actuation-point ownership re-check
+  - `24_apply_isolation` — FMEA-005 per-relation error isolation
+  - `25_control_loop_lag` — FMEA-003 mutual-watchdog heartbeat
+  - `26_standby_guard` — FMEA-002 standby guard (both directions)
+  - `27_aggressiveness_guard` — FMEA-008 divisor guard
+  - `28_classify_floor_guard` — FMEA-009 floor guard
+  - `29_apply_lock_timeout` — live dblink-contention lock-timeout path
+  - `30_apply_vanished_relation` — relation-vanished branch
+  - `31_property_tests` — `snap_sf`/`ewma` properties over generated inputs +
+    `classify`/`estimate` adversarial robustness
+
+  Plus `pgfc_observe/16_maintenance_skip_under_contention` (FMEA-004 skip path).
+
+- **Fortification documentation.** `docs/fortification/` — the charter, Phase 1
+  (security + correctness), Phase 2 (FMEA), Phase 3 (test hardening +
+  traceability), and Phase 4 (standing review process). The Phase 4 actuation-path
+  review checklist is referenced from `CLAUDE.md`.
+
+### Breaking
+
+- **Upgrading `pgfc_observe` across FMEA-001 destructively recreates the raw
+  telemetry tables** (the `RANGE` → `LIST` ring transition). Re-running
+  `pgfc_observe/install.sql` over a pre-ring install drops and recreates
+  `snapshots` and `relation_samples`. This is a one-time transition; subsequent
+  re-runs are non-destructive.
+
+### Notes
+
+- **FMEA-007** (blocking advisory lock before health eval) and **COR-002**
+  (authority gate reads last-written state) are **Won't-fix by-design** — see the
+  Phase 2 doc for rationale.
+- The project is pre-1.0. dbdev publishing is tracked in #37.
+
 ## [0.1.0] - 2026-05-31
 
 First tagged release. `pgfc_observe` (telemetry) and `pgfc_govern` (control loop)
