@@ -120,32 +120,52 @@ where both move (large tables). The per-table view is what survives the PROB-001
 
 | ID | Statement | Evidence | Confidence | Bearing on verdict | Status | Link |
 |---|---|---|---|---|---|---|
-| RUBRIC-001 | Fixed fractional targets can degrade the space outcome purely from table growth (scale drift), even when the proxy is "healthy" | Phase 1 scale-drift analysis; the 1M→1B example (0.20 fraction = 200M dead tuples at 1B rows, ruinous as space) | Strong | Qualifies — the space band needs a growth-aware component, not just a fractional threshold; the per-class targets may need an absolute dead-tuple-count cap for large tables | Open | — |
+| RUBRIC-001 | Fixed fractional targets are scale-blind: at large table sizes they can degrade space, inflate autovacuum cost, and indirectly harm latency/throughput — all while the proxy reads "healthy" | Phase 1 scale-drift analysis; the 1M→1B example (0.20 fraction = 200M dead tuples at 1B rows) | Strong | Qualifies — the experiment must measure the cost and indirect-outcome effects of fractional targets at scale, not just the space effect; the per-class targets may need an absolute dead-tuple-count cap for large tables | Open | — |
 
 ### RUBRIC-001 — Fractional targets are scale-blind
 
 The six per-class targets are dead-tuple *fractions*. At 1M rows, a 0.20 fraction (the
-`oltp` / `mixed` target) means 200K dead tuples — negligible space. At 1B rows, the same
-0.20 fraction means 200M dead tuples — potentially gigabytes of wasted space, even though
-the proxy says "healthy."
+`oltp` / `mixed` target) means 200K dead tuples — negligible space, a quick vacuum. At
+1B rows, the same 0.20 fraction means 200M dead tuples — the proxy says "healthy" but
+three things go wrong:
 
-This is a concrete instance of the proxy-outcome gap: the proxy (fraction) is within band,
-but the outcome (space) is degraded. It also connects directly to the Phase 1 scale-drift
-observation — table growth makes a correct fractional target produce an incorrect space
-outcome.
+1. **Space.** 200M dead tuples is potentially gigabytes of wasted on-disk footprint,
+   cold cache, and slower sequential scans. The direct space-outcome gap.
+
+2. **Autovacuum cost.** When autovacuum finally wakes up — triggered at 200M dead
+   tuples — it faces a massive workload. Even with cost-based throttling
+   (`autovacuum_vacuum_cost_delay` / `autovacuum_vacuum_cost_limit`), the throttling
+   bounds the *rate* but not the *duration*. A 200M-tuple vacuum at the default cost
+   limit runs for a very long time, consuming sustained I/O, shared-buffer churn, and
+   a worker slot for the entire duration.
+
+3. **Indirect latency/throughput impact.** That sustained vacuum I/O competes with the
+   workload for disk bandwidth, shared buffers, and CPU. The outcome signals (p95
+   latency, throughput) degrade not because of the dead tuples themselves but because
+   of the *cost of cleaning them up* — the vacuum the fractional target demanded.
+   This is a cost-to-outcome confounder the charter's threats-to-validity register
+   already names ("more aggressive vacuuming costs I/O; under an I/O ceiling the net
+   effect of 'act more' can be negative").
+
+All three effects are concrete instances of the proxy-outcome gap: the proxy (fraction)
+is within band, but the outcomes (space, latency, throughput) are degraded — space
+directly, and latency/throughput indirectly through the vacuum-cost channel.
 
 **Bearing on the experiment.** The space outcome band (above) is defined in terms of
-percentage growth beyond the ideal, which is growth-aware by construction — a table that
-is 50% over its ideal size is unhealthy regardless of its dead-tuple fraction. But the
-*per-class proxy targets* (the system's own steering goals) are purely fractional. This
-means the system can steer the proxy into its "healthy" band while the space outcome is in
-its "unhealthy" band, on a large enough table.
+percentage growth beyond the ideal, which is growth-aware by construction. But the cost
+ceiling (≤ 2× the defaults arm's autovacuum I/O) and the outcome bands (≤ 10% latency
+regression) must also be measured at scale — a table that is "proxy healthy" but whose
+vacuum runs degrade latency by 30% has failed the outcome band through the cost channel.
+The *per-class proxy targets* (the system's own steering goals) are purely fractional,
+so the system can steer the proxy into its "healthy" band while the cost and outcome
+bands are in their "unhealthy" bands, on a large enough table.
 
 **Design constraint for Phase 4.** The fixtures must include at least one large table
 (≥ 100M rows) per active class, so the experiment can observe whether the fractional
-target produces a space-outcome regression at scale. If it does, that is evidence the
-targets need an absolute dead-tuple-count component — a `RESULT` finding, not something
-to fix before the run.
+target produces a space-outcome regression, a cost-ceiling breach, or an indirect
+latency/throughput regression at scale. If it does, that is evidence the targets need
+an absolute dead-tuple-count component — a `RESULT` finding, not something to fix
+before the run.
 
 ## Exit criteria
 

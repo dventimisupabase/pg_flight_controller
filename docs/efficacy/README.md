@@ -60,7 +60,7 @@ The six phases, in order:
 |---|---|---|
 | 1 | Problem and value | **Complete** — testable claim stated; value split into cited-settled (bloat/wraparound/toil) and experimentally-open (continuous vs. static under drift); go, scoped by PROB-001 (lever-movable vs. inhibitor-bound population) |
 | 2 | Health rubric | **Complete** — 4 signal families operationalized (proxy/outcome/cost/safety); per-class bands fixed; proxy-vs-outcome comparison specified as a concrete per-table correlation test; RUBRIC-001 (fractional targets are scale-blind) |
-| 3 | Workload fixtures | Not started |
+| 3 | Workload fixtures | **Complete** — 6 class fixtures with schemas, stationary drivers, drift variants; predicate arithmetic verified against real classify(); FIX-001 (delete\_heavy sustainability); PROB-001 overlay deferred to Phase 4 |
 | 4 | Experimental design | Not started |
 | 5 | Harness and tooling | Not started |
 | 6 | Execution and verdict | Not started (execution-gated) |
