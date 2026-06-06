@@ -31,10 +31,10 @@ unsolved.
 
 ## The testable claim
 
-> Under workloads that shift over time, continuous automated re-tuning of per-table
-> autovacuum scale factors keeps a database healthier — measured by query latency,
-> throughput, disk space, and wraparound headroom — than good static per-table tuning
-> set once by an expert.
+> Under workloads or table sizes that change over time, continuous automated re-tuning
+> of per-table autovacuum scale factors keeps a database healthier — measured by query
+> latency, throughput, disk space, and wraparound headroom — than good static per-table
+> tuning set once by an expert.
 
 This is falsifiable: it fails if (a) the proxy (dead-tuple fraction) moves but the outcome
 signals (latency, throughput, space, wraparound headroom) do not, or (b) the outcome
@@ -81,16 +81,23 @@ establish that *continuously adjusting* settings is better than *setting them we
 A human expert who tunes each table's scale factor for its workload at time `t0` has
 done real work; the pgfc-specific bet is that:
 
-1. The right setting **drifts** as the workload changes (a table that was write-heavy
-   becomes read-mostly; a queue table's throughput doubles; a batch job shifts from
-   nightly to hourly).
+1. The right setting **drifts** — from two independent causes. The obvious one is
+   **workload drift**: a table that was write-heavy becomes read-mostly, a queue
+   table's throughput doubles, a batch job shifts from nightly to hourly. The subtler
+   and arguably more common one is **scale drift**: a table grows from 1 million rows
+   to 1 billion while its workload stays the same, and a `scale_factor = 0.20` that
+   was fine at 1M (triggering at 200K dead tuples) becomes pathologically loose at 1B
+   (triggering at 200M dead tuples). The setting didn't change, the workload didn't
+   change, but the effective trigger point drifted by three orders of magnitude. Both
+   causes make a once-correct setting wrong over time.
 2. A supervisory loop can **track** that drift better than a set-and-forget human.
 3. The tracking produces **outcome** improvement (not just a tidier dead-tuple fraction)
    that justifies running an autonomous actuator against a live catalog.
 
-Each of these is a genuine open question. Point 1 is the premise (workloads drift and
-settings become stale); point 2 is the mechanism (the loop tracks drift); point 3 is the
-payoff (outcomes improve, net of cost). The experiment in Phases 2–6 must test all three.
+Each of these is a genuine open question. Point 1 is the premise (settings become stale
+from workload drift, scale drift, or both); point 2 is the mechanism (the loop tracks
+drift); point 3 is the payoff (outcomes improve, net of cost). The experiment in Phases
+2–6 must test all three.
 
 ## Go/no-go on the open question
 
