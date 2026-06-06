@@ -130,7 +130,7 @@ if [ ! -f "$ARM_SCRIPT" ]; then
     effi_log "ERROR: arm config not found: $ARM_SCRIPT"
     exit 1
 fi
-effi_psql_file "$ARM_SCRIPT"
+effi_psql_file "$ARM_SCRIPT" -v fixture="$FIXTURE"
 
 # =========================================================================
 # Stage 4: Baseline
@@ -299,6 +299,10 @@ effi_psql -c "\copy (SELECT * FROM pgfc_govern.relation_class ORDER BY relname) 
 
 effi_psql -c "\copy (SELECT * FROM pgfc_govern.relation_estimate ORDER BY relid) TO STDOUT CSV HEADER" \
     > "$RESULTS_DIR/relation_estimate.csv"
+
+# Fixture reloptions (records what expert-static/pgfc-active actually applied)
+effi_psql -c "\copy (SELECT relname, reloptions FROM pg_class WHERE relname LIKE 'fix_%' AND relnamespace = 'public'::regnamespace ORDER BY relname) TO STDOUT CSV HEADER" \
+    > "$RESULTS_DIR/fixture_reloptions.csv"
 
 # Run metadata
 cat > "$RESULTS_DIR/run_meta.json" <<EOJSON
