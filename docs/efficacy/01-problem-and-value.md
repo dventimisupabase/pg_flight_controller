@@ -41,7 +41,7 @@ signals (latency, throughput, space, wraparound headroom) do not, or (b) the out
 signals improve but not enough to justify the cost and risk of an autonomous catalog
 actuator, or (c) the lever-movable population (tables whose health the scale factor can
 actually influence) is too small relative to the inhibitor-bound population for actuation
-to matter — see [PROB-001](#prob-001) below.
+to matter — see [PROB-001](#prob-001--the-lever-movable-population-may-be-a-minority) below.
 
 ## The value question, split
 
@@ -98,12 +98,12 @@ payoff (outcomes improve, net of cost). The experiment in Phases 2–6 must test
 
 The open question is real, unresolved, and central to pgfc's reason for existing. The
 RFC's own candid self-assessment confirms it: "active control is unproven end to end"
-(RFC [§7, "What is unbuilt or unvalidated"](#what-is-unbuilt-or-unvalidated)); "the
-parts that are demonstrably real today are observe, estimate, and diagnose; act is the
-unproven claim" (RFC [§1](#1-abstract)). An unproven, central claim is precisely what
+(RFC [§7, "What is unbuilt or unvalidated"](../rfc/README.md#what-is-unbuilt-or-unvalidated));
+"the parts that are demonstrably real today are observe, estimate, and diagnose; act is the
+unproven claim" (RFC [§1](../rfc/README.md#1-abstract)). An unproven, central claim is precisely what
 earns the experimental cost.
 
-**But the experiment must be scoped to survive [PROB-001](#prob-001)** — the finding
+**But the experiment must be scoped to survive [PROB-001](#prob-001--the-lever-movable-population-may-be-a-minority)** — the finding
 that the lever-movable population may be a minority of unhealthy tables. The experiment
 must include both lever-movable and inhibitor-bound tables, and the verdict must not
 credit pgfc for tables no scale-factor lever could help. If 80% of unhealthy tables are
