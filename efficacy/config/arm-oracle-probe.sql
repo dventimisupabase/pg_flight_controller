@@ -1,11 +1,17 @@
 -- Oracle-probe arm: set a single constant autovacuum_vacuum_scale_factor on the
 -- fixture table.  Called once per grid value during the oracle sweep (oracle.sh).
 -- Requires psql variables :fixture and :sf (set by oracle.sh via run.sh).
+--
+-- Uses set_config to pass psql variables into the DO block (psql does not
+-- interpolate :variable inside dollar-quoted strings).
+
+SELECT set_config('pgfc._arm_fixture', :'fixture', false);
+SELECT set_config('pgfc._arm_sf', :'sf'::text, false);
 
 DO $$
 DECLARE
-    v_fixture text := :'fixture';
-    v_sf double precision := :'sf';
+    v_fixture text := current_setting('pgfc._arm_fixture');
+    v_sf double precision := current_setting('pgfc._arm_sf')::double precision;
     v_table text;
 BEGIN
     v_table := CASE v_fixture
