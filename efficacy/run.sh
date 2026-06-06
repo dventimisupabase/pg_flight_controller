@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Efficacy harness — scaffold (Phase 6, increment 1).
+# Efficacy harness (Phase 6, increment 2).
 #
-# Runs a single (arm, scenario, seed) trial against a remote Supabase project.
+# Runs a single (arm, fixture, scenario, seed) trial against a remote Supabase project.
 # Requires DATABASE_URL pointing to the target project.
 #
 #   DATABASE_URL="postgres://..." ./efficacy/run.sh
@@ -17,9 +17,10 @@
 # Config via env vars (defaults are the smoke config):
 #
 #   EFFICACY_ARM              defaults
+#   EFFICACY_FIXTURE          oltp
 #   EFFICACY_SCENARIO         steady
 #   EFFICACY_SEED             1
-#   EFFICACY_PRELOAD_ROWS     1000
+#   EFFICACY_PRELOAD_ROWS     (per-fixture default; override with caution)
 #   EFFICACY_DURATION         300       (seconds)
 #   EFFICACY_SAMPLE_INTERVAL  30        (seconds)
 #   EFFICACY_PGBENCH_CLIENTS  2
@@ -34,13 +35,32 @@ source "$SCRIPT_DIR/lib.sh"
 # --- Config (smoke defaults) ---
 
 ARM="${EFFICACY_ARM:-defaults}"
+FIXTURE="${EFFICACY_FIXTURE:-oltp}"
 SCENARIO="${EFFICACY_SCENARIO:-steady}"
 SEED="${EFFICACY_SEED:-1}"
-PRELOAD_ROWS="${EFFICACY_PRELOAD_ROWS:-1000}"
 DURATION="${EFFICACY_DURATION:-300}"
 SAMPLE_INTERVAL="${EFFICACY_SAMPLE_INTERVAL:-30}"
 PGBENCH_CLIENTS="${EFFICACY_PGBENCH_CLIENTS:-2}"
 PGBENCH_RATE="${EFFICACY_PGBENCH_RATE:-10}"
+
+# Per-fixture preload defaults (Phase 3 specs).
+case "$FIXTURE" in
+    append_only)  DEFAULT_PRELOAD=0      ;;
+    queue)        DEFAULT_PRELOAD=0      ;;
+    delete_heavy) DEFAULT_PRELOAD=5000   ;;
+    oltp)         DEFAULT_PRELOAD=10000  ;;
+    mixed)        DEFAULT_PRELOAD=5000   ;;
+    archive)      DEFAULT_PRELOAD=200000 ;;
+    *) effi_log "ERROR: unknown fixture: $FIXTURE"; exit 1 ;;
+esac
+PRELOAD_ROWS="${EFFICACY_PRELOAD_ROWS:-$DEFAULT_PRELOAD}"
+
+if [ "$FIXTURE" = "archive" ] && [ "$PRELOAD_ROWS" -lt 100001 ]; then
+    effi_log "WARNING: archive fixture requires preload > 100000 for classification (reltuples > classify_large). Got $PRELOAD_ROWS."
+fi
+
+# Map fixture name (underscores) to file path component (hyphens).
+FIXTURE_SLUG="${FIXTURE//_/-}"
 
 RUN_ID="$(effi_run_id "$ARM" "$SCENARIO" "$SEED")"
 RESULTS_DIR="$EFFICACY_DIR/results/$RUN_ID"
@@ -50,6 +70,7 @@ RESULTS_DIR="$EFFICACY_DIR/results/$RUN_ID"
 # =========================================================================
 
 effi_log "=== Stage 1: Validate ==="
+effi_log "  fixture=$FIXTURE  arm=$ARM  scenario=$SCENARIO  seed=$SEED"
 
 if [ -z "${DATABASE_URL:-}" ]; then
     effi_log "ERROR: DATABASE_URL is not set"
@@ -68,6 +89,13 @@ effi_psql -c "SELECT 1 FROM pg_extension WHERE extname = 'pg_cron';" | grep -q 1
     || { effi_log "ERROR: pg_cron extension not found — run: CREATE EXTENSION pg_cron;"; exit 1; }
 effi_log "pg_cron OK"
 
+# Validate fixture file exists
+FIXTURE_FILE="$EFFICACY_DIR/config/fixtures/${FIXTURE_SLUG}.sql"
+if [ ! -f "$FIXTURE_FILE" ]; then
+    effi_log "ERROR: fixture file not found: $FIXTURE_FILE"
+    exit 1
+fi
+
 # =========================================================================
 # Stage 2: Init — install extensions + create fixtures
 # =========================================================================
@@ -82,8 +110,11 @@ effi_log "Installing pgfc_govern (x2 for idempotency)..."
 effi_psql_file "$PROJECT_ROOT/pgfc_govern/install.sql"
 effi_psql_file "$PROJECT_ROOT/pgfc_govern/install.sql"
 
-effi_log "Creating fixtures (preload=$PRELOAD_ROWS rows)..."
-effi_psql_file "$EFFICACY_DIR/config/fixtures.sql" -v rows="$PRELOAD_ROWS"
+effi_log "Dropping stale fixture tables..."
+effi_drop_stale_fixtures
+
+effi_log "Creating fixture: $FIXTURE (preload=$PRELOAD_ROWS rows)..."
+effi_psql_file "$FIXTURE_FILE" -v rows="$PRELOAD_ROWS"
 
 effi_log "Creating efficacy_metrics table..."
 effi_psql_file "$EFFICACY_DIR/sampler/create-metrics-table.sql"
@@ -118,7 +149,7 @@ effi_psql_file "$EFFICACY_DIR/sampler/sample.sql" \
 # Stage 5: Drive workload + sample metrics
 # =========================================================================
 
-effi_log "=== Stage 5: Drive workload (duration=${DURATION}s, clients=$PGBENCH_CLIENTS, rate=$PGBENCH_RATE tps) ==="
+effi_log "=== Stage 5: Drive workload (fixture=$FIXTURE, duration=${DURATION}s) ==="
 
 mkdir -p "$RESULTS_DIR"
 
@@ -150,24 +181,92 @@ mkdir -p "$RESULTS_DIR"
 ) &
 SAMPLER_PID=$!
 
-# pgbench workload driver
-effi_log "Starting pgbench..."
-pgbench "$DATABASE_URL" \
-    -f "$EFFICACY_DIR/drivers/oltp.sql" \
-    -c "$PGBENCH_CLIENTS" \
-    -j "$PGBENCH_CLIENTS" \
-    -T "$DURATION" \
-    -R "$PGBENCH_RATE" \
-    -D rows="$PRELOAD_ROWS" \
-    --log \
-    --log-prefix="$RESULTS_DIR/pgbench_log" \
-    --progress=30 \
-    2>&1 | tee "$RESULTS_DIR/pgbench_stdout.txt"
+# --- Driver dispatch ---
 
-effi_log "pgbench finished, waiting for sampler..."
+effi_run_pgbench_driver() {
+    local driver_dir="$EFFICACY_DIR/drivers/$FIXTURE_SLUG"
+    local pgbench_args=()
+
+    case "${FIXTURE}_${SCENARIO}" in
+        append_only_steady)
+            pgbench_args+=(-f "$driver_dir/stationary.sql@1")
+            ;;
+        append_only_drift)
+            pgbench_args+=(-f "$driver_dir/stationary.sql@1")
+            ;;
+        queue_steady)
+            pgbench_args+=(-f "$driver_dir/insert.sql@100" -f "$driver_dir/delete.sql@95")
+            ;;
+        queue_drift)
+            pgbench_args+=(-f "$driver_dir/insert.sql@200" -f "$driver_dir/delete.sql@190")
+            ;;
+        oltp_steady)
+            pgbench_args+=(-f "$driver_dir/insert.sql@10" -f "$driver_dir/update.sql@150" -f "$driver_dir/delete.sql@5")
+            ;;
+        oltp_drift)
+            pgbench_args+=(-f "$driver_dir/insert.sql@10" -f "$driver_dir/update.sql@450" -f "$driver_dir/delete.sql@5")
+            ;;
+        mixed_steady)
+            pgbench_args+=(-f "$driver_dir/insert.sql@40" -f "$driver_dir/update.sql@20" -f "$driver_dir/delete.sql@15")
+            ;;
+        mixed_drift)
+            pgbench_args+=(-f "$driver_dir/insert.sql@50" -f "$driver_dir/update.sql@20" -f "$driver_dir/delete.sql@45")
+            ;;
+        *)
+            effi_log "ERROR: no pgbench driver for ${FIXTURE}_${SCENARIO}"
+            exit 1
+            ;;
+    esac
+
+    effi_log "Starting pgbench (clients=$PGBENCH_CLIENTS, rate=$PGBENCH_RATE tps)..."
+    pgbench "$DATABASE_URL" \
+        "${pgbench_args[@]}" \
+        -c "$PGBENCH_CLIENTS" \
+        -j "$PGBENCH_CLIENTS" \
+        -T "$DURATION" \
+        -R "$PGBENCH_RATE" \
+        -D rows="$PRELOAD_ROWS" \
+        --log \
+        --log-prefix="$RESULTS_DIR/pgbench_log" \
+        --progress=30 \
+        2>&1 | tee "$RESULTS_DIR/pgbench_stdout.txt"
+}
+
+effi_run_custom_driver() {
+    local driver_dir="$EFFICACY_DIR/drivers/$FIXTURE_SLUG"
+    local script
+
+    case "$SCENARIO" in
+        steady) script="$driver_dir/stationary.sh" ;;
+        drift)  script="$driver_dir/drift.sh" ;;
+        *)
+            effi_log "ERROR: unknown scenario for custom driver: $SCENARIO"
+            exit 1
+            ;;
+    esac
+
+    if [ ! -x "$script" ]; then
+        effi_log "ERROR: driver script not found or not executable: $script"
+        exit 1
+    fi
+
+    effi_log "Starting custom driver: $script"
+    "$script" "$RESULTS_DIR/pgbench_log"
+}
+
+case "$FIXTURE" in
+    append_only|queue|oltp|mixed)
+        effi_run_pgbench_driver
+        ;;
+    delete_heavy|archive)
+        effi_run_custom_driver
+        ;;
+esac
+
+effi_log "Driver finished, waiting for sampler..."
 wait "$SAMPLER_PID" 2>/dev/null || true
 
-# Final sample after pgbench stops
+# Final sample after driver stops
 effi_log "Taking final sample..."
 effi_psql_file "$EFFICACY_DIR/sampler/sample.sql" \
     -v arm="$ARM" -v scenario="$SCENARIO" -v seed="$SEED"
@@ -206,6 +305,7 @@ cat > "$RESULTS_DIR/run_meta.json" <<EOJSON
 {
   "run_id": "$RUN_ID",
   "arm": "$ARM",
+  "fixture": "$FIXTURE",
   "scenario": "$SCENARIO",
   "seed": $SEED,
   "preload_rows": $PRELOAD_ROWS,

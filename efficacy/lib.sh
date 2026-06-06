@@ -33,6 +33,33 @@ effi_psql_file() {
     effi_psql -f "$1" "${@:2}"
 }
 
+# --- Fixture cleanup ---
+
+effi_drop_stale_fixtures() {
+    effi_psql -c "DO \$\$ BEGIN
+      EXECUTE (SELECT coalesce(string_agg('DROP TABLE IF EXISTS ' || quote_ident(tablename) || ' CASCADE', '; '), 'SELECT 1')
+               FROM pg_tables WHERE schemaname = 'public' AND tablename LIKE 'fix_%');
+    END \$\$;"
+}
+
+# --- Custom driver logging ---
+
+effi_epoch_us() {
+    if command -v perl >/dev/null 2>&1; then
+        perl -MTime::HiRes=gettimeofday -e 'my ($s,$us)=gettimeofday; print $s*1000000+$us'
+    else
+        echo "$(date +%s)000000"
+    fi
+}
+
+effi_driver_log() {
+    local log_file="$1" tx_no="$2" t0="$4" t1="$5"
+    local latency_us=$((t1 - t0))
+    local epoch_s=$((t1 / 1000000))
+    local epoch_frac_us=$((t1 % 1000000))
+    printf '0 %d %d 0 %d %d 0\n' "$tx_no" "$latency_us" "$epoch_s" "$epoch_frac_us" >> "$log_file"
+}
+
 # --- Run ID ---
 
 effi_run_id() {
