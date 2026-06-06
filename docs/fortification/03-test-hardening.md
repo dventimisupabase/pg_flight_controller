@@ -1,13 +1,12 @@
 # Phase 3 — Test hardening
 
-**Status:** In progress — gap inventory built, the concurrent-lock feasibility question settled
-(below), and the first three gap-closing increments landed: the live `apply()` lock-timeout test
+**Status:** Complete — all exit criteria met. Gap inventory built, concurrent-lock feasibility
+settled, and four gap-closing increments landed: the live `apply()` lock-timeout test
 (`29_apply_lock_timeout`), the maintenance-DDL skip-under-contention test
-(`16_maintenance_skip_under_contention`, closing the FMEA-004 and `rotate_ring`-slot-skip rows),
-and the `apply()`-path coverage read + finding → test traceability map (the 21-branch `apply()`
-map, 15-candidate `evaluate_health()` map, 12-finding regression map, full traceability spine,
-one new test `30_apply_vanished_relation`, and three accept-with-rationale dispositions). The
-remaining work is property/fuzz (an opportunity, not a known defect).
+(`16_maintenance_skip_under_contention`), the `apply()`-path coverage read + finding → test
+traceability map (`30_apply_vanished_relation` + three accept-with-rationale dispositions), and
+the property/fuzz characterization (`31_property_tests`). No Phase-3 findings — the design
+invariants hold across the generated input space.
 
 Not "do the tests pass" but "do the tests exercise the paths that can hurt us." The suite already
 had blind spots — two hazards (loop-ordering, stale-window) were recorded in the `pgfc_govern`
@@ -60,7 +59,7 @@ needs; the gap-closing tests then read like the existing pgTAP files.
 | `rotate_ring` slot skip (FMEA-001) | Phase 2 | the non-current-slot skip on `lock_not_available` in `rotate_ring` | subset of the above: lock a stale slot, assert the sweep skips it (retried next run) | **Closed** — the `rotate_ring` half of `16_maintenance_skip_under_contention`: a busy non-current stale slot is skipped (0 recycled, the stale row survives), then recycled once the lock is released |
 | Coverage read of the `apply()` path | Phase 1/2 | each `apply()` branch, gate, budget tier, exception handler; `evaluate_health` transitions; the failure taxonomy | map each branch to a test; add tests for the unmapped ones | **Closed** — the full branch map, `evaluate_health` candidate map, and gap disposition are below |
 | Finding → test traceability map | charter | every Phase 1/2 finding + spine row | build the map; rows without a test become explicit gaps | **Closed** — the finding → test map is below; every Phase 1/2 finding has a proving test |
-| Property / fuzz | stub Method | `classify`/`estimate` over generated inputs; `snap_sf` grid boundaries; budget arithmetic edges | property tests over generated inputs (an opportunity, not a known defect) | Open |
+| Property / fuzz | stub Method | `classify`/`estimate` over generated inputs; `snap_sf` grid boundaries; budget arithmetic edges | property tests over generated inputs (an opportunity, not a known defect) | **Closed** — `31_property_tests`: `snap_sf` (grid membership, fixed-point, idempotent, monotonic, range guarantee over 1000 inputs), `ewma` (convex combination over 505 inputs, NULL branches, endpoints), `classify`/`estimate` (diverse write mix robustness, valid enum/domain outputs, manual-source preservation). No findings — all invariants hold |
 | True in-recovery replica (FMEA-002) | Phase 2 | `_is_standby()` end-to-end — "a true in-recovery replica is out of unit-test reach" | **not** dblink-reachable (it needs a real standby, not a lock). Candidate **accept-with-rationale**: the seam + both-direction stub tests (`14`/`26`) already prove the guard logic and its plan-cache propagation; the replica path is environment, out of pgTAP scope. A replica harness is possible but heavy. | **Accepted** — rationale below |
 
 ## `apply()` branch → test map
@@ -236,6 +235,10 @@ rationale); every `Critical`/`High` finding from Phases 1–2 has a regression t
       (`30_apply_vanished_relation`).
 - [x] The true-replica standby gap dispositioned: **accepted** — the seam + stub tests prove
       the guard logic and plan-cache propagation; a real standby harness is disproportionate.
+- [x] Property/fuzz characterization complete (`31_property_tests`): `snap_sf` grid properties
+      (membership, fixed-point, idempotent, monotonic, range) over 1000 inputs; `ewma` convex
+      combination over 505 inputs + NULL branches + endpoints; `classify`/`estimate` adversarial
+      robustness (diverse write mix, domain checks). No findings — all invariants hold.
 
 Note: every Phase 1/2 finding that required a fix is already `Verified` *with* a regression test
 (the one `High`, COR-001, plus the FMEA-001..006 / 008 fixes; FMEA-007 / 009 are by-design
