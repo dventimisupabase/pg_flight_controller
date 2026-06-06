@@ -123,7 +123,7 @@ gen_oracle_best() {
 test_strong_pass() {
     local tmp
     tmp=$(mktemp -d)
-    trap "rm -rf '$tmp'" RETURN
+    trap 'rm -rf "$tmp"' RETURN
 
     local t_base=1000000
     local window_s=30
@@ -180,7 +180,7 @@ test_strong_pass() {
 test_bare_pass() {
     local tmp
     tmp=$(mktemp -d)
-    trap "rm -rf '$tmp'" RETURN
+    trap 'rm -rf "$tmp"' RETURN
 
     local t_base=1000000 window_s=30
 
@@ -231,7 +231,7 @@ test_bare_pass() {
 test_fail_negative_gc() {
     local tmp
     tmp=$(mktemp -d)
-    trap "rm -rf '$tmp'" RETURN
+    trap 'rm -rf "$tmp"' RETURN
 
     local t_base=1000000 window_s=30
 
@@ -279,7 +279,7 @@ test_fail_negative_gc() {
 test_denom_guard() {
     local tmp
     tmp=$(mktemp -d)
-    trap "rm -rf '$tmp'" RETURN
+    trap 'rm -rf "$tmp"' RETURN
 
     local t_base=1000000 window_s=30
 
@@ -332,7 +332,7 @@ test_denom_guard() {
 test_warmup_discard() {
     local tmp
     tmp=$(mktemp -d)
-    trap "rm -rf '$tmp'" RETURN
+    trap 'rm -rf "$tmp"' RETURN
 
     local t_base=1000000 window_s=30
 
@@ -377,7 +377,7 @@ test_warmup_discard() {
 test_cost_ceiling_breach() {
     local tmp
     tmp=$(mktemp -d)
-    trap "rm -rf '$tmp'" RETURN
+    trap 'rm -rf "$tmp"' RETURN
 
     local t_base=1000000 window_s=30
 
@@ -426,7 +426,7 @@ test_cost_ceiling_breach() {
 test_av_frequency_ceiling() {
     local tmp
     tmp=$(mktemp -d)
-    trap "rm -rf '$tmp'" RETURN
+    trap 'rm -rf "$tmp"' RETURN
 
     local t_base=1000000 window_s=30
 
@@ -474,7 +474,7 @@ test_av_frequency_ceiling() {
 test_safety_floor_accelerated() {
     local tmp
     tmp=$(mktemp -d)
-    trap "rm -rf '$tmp'" RETURN
+    trap 'rm -rf "$tmp"' RETURN
 
     local t_base=1000000 window_s=30
 
@@ -526,7 +526,7 @@ test_safety_floor_accelerated() {
 test_safety_floor_not_evaluated() {
     local tmp
     tmp=$(mktemp -d)
-    trap "rm -rf '$tmp'" RETURN
+    trap 'rm -rf "$tmp"' RETURN
 
     local t_base=1000000 window_s=30
 
@@ -577,7 +577,7 @@ test_safety_floor_not_evaluated() {
 test_boundary_strong_pass() {
     local tmp
     tmp=$(mktemp -d)
-    trap "rm -rf '$tmp'" RETURN
+    trap 'rm -rf "$tmp"' RETURN
 
     local t_base=1000000 window_s=30
 
@@ -626,7 +626,7 @@ test_boundary_strong_pass() {
 test_boundary_tiny_negative() {
     local tmp
     tmp=$(mktemp -d)
-    trap "rm -rf '$tmp'" RETURN
+    trap 'rm -rf "$tmp"' RETURN
 
     local t_base=1000000 window_s=30
 
