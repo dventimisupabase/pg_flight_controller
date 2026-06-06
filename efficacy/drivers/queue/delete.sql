@@ -1,0 +1,2 @@
+DELETE FROM fix_queue
+ WHERE ctid = (SELECT ctid FROM fix_queue LIMIT 1 FOR UPDATE SKIP LOCKED);

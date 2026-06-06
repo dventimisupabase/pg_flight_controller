@@ -1,5 +1,5 @@
--- Smoke fixture: oltp (Phase 3 spec).
--- Idempotent: CREATE IF NOT EXISTS + TRUNCATE before preload.
+-- Fixture: oltp (Phase 3 spec).
+-- Update-heavy transactional table.
 
 CREATE TABLE IF NOT EXISTS fix_oltp (
     id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
