@@ -58,21 +58,19 @@ The six phases, in order:
 
 | Phase | Title | Status |
 |---|---|---|
-| 1 | Problem and value | Not started |
+| 1 | Problem and value | **Complete** — testable claim stated; value split into cited-settled (bloat/wraparound/toil) and experimentally-open (continuous vs. static under drift); go, scoped by PROB-001 (lever-movable vs. inhibitor-bound population) |
 | 2 | Health rubric | Not started |
 | 3 | Workload fixtures | Not started |
 | 4 | Experimental design | Not started |
 | 5 | Harness and tooling | Not started |
 | 6 | Execution and verdict | Not started (execution-gated) |
 
-**Planning is unblocked; execution is sequenced.** Phases 1–5 are design work and can be
-done now. Phase 6 (running the experiment) should follow the relevant fortification fixes
-landing — notably [COR-001](../fortification/01-security-correctness-apply.md#findings)
-([#66](https://github.com/dventimisupabase/pg_flight_controller/issues/66)), because the
-self-stabilizing-under-drift thesis can only be tested once continuous control actually
-works. COR-001 is a **bug to be fixed, not a constraint to design around**: this stream
-plans and measures the system *as it is meant to work*, not as a transient defect makes it
-behave.
+**Planning and execution are both unblocked.** The fortification fixes that gated
+execution have landed in
+[v0.2.0](https://github.com/dventimisupabase/pg_flight_controller/releases/tag/v0.2.0) —
+notably [COR-001](../fortification/01-security-correctness-apply.md#findings)
+([#66](https://github.com/dventimisupabase/pg_flight_controller/issues/66)), which
+restored continuous control. Phases 1–5 are design work; Phase 6 runs the experiment.
 
 ## Where results go
 
