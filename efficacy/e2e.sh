@@ -17,6 +17,7 @@
 #   E2E_READINESS_TIMEOUT 300        seconds to wait for project readiness
 #   E2E_SUPABASE_DOMAIN  supabase.green  domain suffix (supabase.green for staging,
 #                                         supabase.com for production)
+#   E2E_WORKER_ID        (internal) worker index, set by e2e-parallel.sh
 #
 #   Campaign pass-through (forwarded to campaign.sh):
 #   CAMPAIGN_PROFILE     profiles/smoke.env
@@ -57,6 +58,9 @@ STATEMENT_TIMEOUT="${E2E_STATEMENT_TIMEOUT:-$((EFFICACY_DURATION + 300))s}"
 
 DB_PASSWORD="$(openssl rand -base64 24 | tr -d '/+=' | head -c 32)"
 
+WORKER_ID="${E2E_WORKER_ID:-}"
+WORKER_TAG="${WORKER_ID:+w${WORKER_ID}-}"
+
 PROJECT_REF=""
 CAMPAIGN_SUCCEEDED=""
 BREADCRUMB_DIR="$EFFICACY_DIR/results"
@@ -84,7 +88,7 @@ retry() {
 
 drop_breadcrumb() {
     local reason="$1" phase="$2"
-    BREADCRUMB_FILE="$BREADCRUMB_DIR/FAILED-$(date -u +%Y%m%dT%H%M%SZ).md"
+    BREADCRUMB_FILE="$BREADCRUMB_DIR/FAILED-${WORKER_TAG}$(date -u +%Y%m%dT%H%M%SZ).md"
     mkdir -p "$BREADCRUMB_DIR"
     cat > "$BREADCRUMB_FILE" <<EOF
 # E2E Campaign Failure
@@ -95,6 +99,7 @@ drop_breadcrumb() {
 
 ## Project
 
+- **Worker:** ${WORKER_ID:-standalone}
 - **Ref:** ${PROJECT_REF:-<not created>}
 - **Region:** $REGION
 - **Name:** $PROJECT_NAME
