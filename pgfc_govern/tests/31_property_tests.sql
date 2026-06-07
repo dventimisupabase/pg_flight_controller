@@ -11,7 +11,7 @@ SELECT plan(20);
 -- ═══════════════════════════════════════════════════════════════════════════════════════
 -- snap_sf(x): scale-factor quantization grid
 -- ═══════════════════════════════════════════════════════════════════════════════════════
--- The grid: {0.01, 0.02, 0.05, 0.10, 0.20, 0.30, 0.50}.
+-- The grid: {0.005, 0.01, 0.02, 0.05, 0.10, 0.20, 0.30, 0.50}.
 
 -- Property 1: snap_sf(x) ∈ grid for ALL inputs.
 -- Sweep 0.001..1.0 in steps of 0.001 (1000 points) — every result must be a grid member.
@@ -53,7 +53,7 @@ SELECT ok(
 
 -- Property 5: monotonic non-decreasing — for any a < b, snap_sf(a) <= snap_sf(b).
 -- Avoids exact midpoints (0.015, 0.035, etc.) where tie-breaking is executor-dependent;
--- steps of 0.001 on a {0.01,0.02,0.05,0.10,0.20,0.30,0.50} grid do not hit midpoints.
+-- steps of 0.001 on a {0.005,0.01,0.02,0.05,0.10,0.20,0.30,0.50} grid do not hit midpoints.
 SELECT ok(
     NOT EXISTS (
         SELECT x FROM generate_series(1, 999) x
@@ -62,7 +62,7 @@ SELECT ok(
     'snap_sf: monotonic non-decreasing over 1000 inputs');
 
 -- Property 6: extreme inputs — negative and large positive.
-SELECT is(pgfc_govern.snap_sf(-1.0), 0.01::double precision,
+SELECT is(pgfc_govern.snap_sf(-1.0), 0.005::double precision,
           'snap_sf: a negative input snaps to sf_min');
 SELECT is(pgfc_govern.snap_sf(100.0), 0.50::double precision,
           'snap_sf: a large positive input snaps to sf_max');

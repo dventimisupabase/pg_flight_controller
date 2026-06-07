@@ -59,7 +59,7 @@ SELECT is((SELECT count(DISTINCT relid) FROM pgfc_govern.decision_log WHERE reli
 -- the empty relation gets a valid (non-garbage) decision: a real SF_GRID value
 SELECT ok((SELECT proposed_value FROM pgfc_govern.decision_log
             WHERE relid=93004 ORDER BY decision_id DESC LIMIT 1)
-          IN ('0.01','0.02','0.05','0.10','0.20','0.30','0.50'),
+          IN ('0.005','0.01','0.02','0.05','0.10','0.20','0.30','0.50'),
           'empty table proposes a valid grid value (no division garbage)');
 
 -- advisory: still nothing applied across the whole loop

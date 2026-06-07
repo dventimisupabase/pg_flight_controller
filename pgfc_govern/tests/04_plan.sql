@@ -88,7 +88,7 @@ SELECT is((SELECT decision FROM pgfc_govern.decision_log WHERE relid=92005 ORDER
 SELECT is((SELECT decision FROM pgfc_govern.decision_log WHERE relid=92006 ORDER BY decision_id DESC LIMIT 1),
           'adjust', 'freeze floor drives toward cleanest => adjust');
 SELECT is((SELECT proposed_value FROM pgfc_govern.decision_log WHERE relid=92006 ORDER BY decision_id DESC LIMIT 1),
-          '0.01', 'freeze floor target is sf_min (0.01)');
+          '0.005', 'freeze floor target is sf_min (0.005)');
 
 -- COR-001 (#66): the ownership guard must distinguish governor-set from user-set.
 -- 92009 carries a reloption the governor itself set and nobody has changed since, so the
