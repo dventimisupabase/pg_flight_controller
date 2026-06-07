@@ -1,5 +1,6 @@
 -- Expert-static arm: per-table autovacuum tuning frozen at t0 (Phase 4 spec).
--- Reads class targets from the pgfc registry, applies via ALTER TABLE SET.
+-- Hardcoded scale factors based on expert consensus (Percona, EDB, AWS, Crunchy,
+-- pganalyze, Keith Fiske, Microsoft Azure).  Independent of the pgfc registry.
 -- Requires psql variable :fixture (set by run.sh).
 -- Explicit advisory_only reset for hermetic arm isolation.
 UPDATE pgfc_govern.policy SET advisory_only = true WHERE policy_name = 'default';
@@ -31,7 +32,14 @@ BEGIN
         RAISE EXCEPTION 'arm=expert-static: unknown fixture: %', v_fixture;
     END IF;
 
-    v_sf := pgfc_govern._class_target(v_fixture);
+    v_sf := CASE v_fixture
+        WHEN 'oltp'         THEN 0.02
+        WHEN 'queue'        THEN 0.005
+        WHEN 'delete_heavy' THEN 0.01
+        WHEN 'mixed'        THEN 0.05
+        WHEN 'append_only'  THEN 0.20
+        WHEN 'archive'      THEN 0.20
+    END;
 
     EXECUTE format(
         'ALTER TABLE %I SET (autovacuum_vacuum_scale_factor = %s)',

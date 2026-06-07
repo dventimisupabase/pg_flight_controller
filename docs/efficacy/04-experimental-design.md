@@ -26,10 +26,12 @@ The **honest competitor** — the charter forbids a strawman ("drift, not rescue
 
 1. Run the stationary driver for each fixture until steady state (stable dead-tuple
    fraction, stable autovacuum cadence — at least 10 autovacuum cycles).
-2. For each table, set `autovacuum_vacuum_scale_factor` to the class target from the
-   registry (`queue` = 0.05, `delete_heavy` = 0.10, `oltp` = 0.20, `mixed` = 0.20,
-   `append_only` = 0.40, `archive` = 0.50) — i.e. the same targets pgfc would steer
-   toward, applied once by a human who knows the workload class.
+2. For each table, set `autovacuum_vacuum_scale_factor` to a hardcoded value based
+   on expert consensus (Percona, EDB, AWS, Crunchy, pganalyze, Keith Fiske,
+   Microsoft Azure): `oltp` = 0.02, `queue` = 0.005, `delete_heavy` = 0.01,
+   `mixed` = 0.05, `append_only` = 0.20, `archive` = 0.20. These are independent
+   of the pgfc governor's own registry — the expert arm represents what a skilled
+   DBA would configure, not what the governor targets.
 3. For large tables (≥ 100M rows), additionally set `autovacuum_vacuum_threshold` to
    cap the absolute dead-tuple count at a reasonable level (e.g. 100K), so the expert
    is not artificially naive about scale drift.
