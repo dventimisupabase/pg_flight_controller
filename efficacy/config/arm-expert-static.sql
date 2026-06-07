@@ -1,6 +1,8 @@
 -- Expert-static arm: per-table autovacuum tuning frozen at t0 (Phase 4 spec).
 -- Reads class targets from the pgfc registry, applies via ALTER TABLE SET.
 -- Requires psql variable :fixture (set by run.sh).
+-- Explicit advisory_only reset for hermetic arm isolation.
+UPDATE pgfc_govern.policy SET advisory_only = true WHERE policy_name = 'default';
 --
 -- Uses set_config to pass psql variables into the DO block (psql does not
 -- interpolate :variable inside dollar-quoted strings).
