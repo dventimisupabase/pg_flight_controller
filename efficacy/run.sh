@@ -181,17 +181,20 @@ mkdir -p "$RESULTS_DIR"
         elapsed=$((elapsed + SAMPLE_INTERVAL))
         tick_count=$((tick_count + 1))
 
-        # Drive the observe loop (production cadence: 1 min)
-        effi_psql -c "SELECT pgfc_govern.observe_tick();" 2>/dev/null || true
+        psql_args=(-c "SELECT pgfc_govern.observe_tick();")
 
-        # Drive the control loop less frequently (production cadence: 5 min)
         if [ $((tick_count % 4)) -eq 0 ]; then
-            effi_psql -c "SELECT pgfc_govern.control_tick();" 2>/dev/null || true
-            effi_log "  control_tick at t+${elapsed}s"
+            psql_args+=(-c "SELECT pgfc_govern.control_tick();")
         fi
 
-        effi_psql_file "$EFFICACY_DIR/sampler/sample.sql" \
-            -v arm="$ARM" -v scenario="$SCENARIO" -v seed="$SEED" 2>/dev/null || true
+        psql_args+=(-f "$EFFICACY_DIR/sampler/sample.sql"
+            -v arm="$ARM" -v scenario="$SCENARIO" -v seed="$SEED")
+
+        effi_psql "${psql_args[@]}" 2>/dev/null || true
+
+        if [ $((tick_count % 4)) -eq 0 ]; then
+            effi_log "  control_tick at t+${elapsed}s"
+        fi
         effi_log "  sampled at t+${elapsed}s"
     done
 ) &
