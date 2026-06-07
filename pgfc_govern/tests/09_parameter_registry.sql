@@ -37,7 +37,7 @@ SELECT is((SELECT count(*) FROM pgfc_govern._parameter_registry()),
 -- Representative as-built control values (recorded by hand in P1; the P3 gate will be what
 -- mechanically ties these to the code — these assertions only pin the recorded values).
 SELECT is((SELECT default_value FROM pgfc_govern._parameter_registry() WHERE parameter_name='sf_min'),
-          '0.01', 'sf_min records the as-built value');
+          '0.005', 'sf_min records the as-built value');
 SELECT is((SELECT default_value FROM pgfc_govern._parameter_registry() WHERE parameter_name='sf_max'),
           '0.50', 'sf_max records the as-built value');
 SELECT is((SELECT default_value FROM pgfc_govern._parameter_registry() WHERE parameter_name='freeze_thr'),
@@ -45,7 +45,7 @@ SELECT is((SELECT default_value FROM pgfc_govern._parameter_registry() WHERE par
 SELECT is((SELECT default_value FROM pgfc_govern._parameter_registry() WHERE parameter_name='target_queue'),
           '0.02', 'target_queue records the as-built class target');
 SELECT is((SELECT default_value FROM pgfc_govern._parameter_registry() WHERE parameter_name='sf_grid'),
-          '{0.01,0.02,0.05,0.10,0.20,0.30,0.50}', 'sf_grid records the as-built grid');
+          '{0.005,0.01,0.02,0.05,0.10,0.20,0.30,0.50}', 'sf_grid records the as-built grid');
 
 -- Override semantics: orthogonal to category. An operator-tunable safety/policy value
 -- names its config home; a fixed safety bound does not.

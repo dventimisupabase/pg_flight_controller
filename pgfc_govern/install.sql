@@ -1638,7 +1638,7 @@ RETURNS TABLE(
 LANGUAGE sql IMMUTABLE AS $fn$
 VALUES
   -- Safety bounds
-  ('sf_min', 'safety_bound', '0.01', 'fraction',
+  ('sf_min', 'safety_bound', '0.005', 'fraction',
    'Floor of the scale-factor actuator range; the governor never sets a table cleaner than this.',
    'safety analysis', 'maintainer', false, NULL),
   ('sf_max', 'safety_bound', '0.50', 'fraction',
@@ -1705,7 +1705,7 @@ VALUES
   ('target_queue', 'empirical_default', '0.02', 'fraction',
    'Target dead-tuple fraction for the queue class (before aggressiveness scaling).',
    'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
-  ('target_delete_heavy', 'empirical_default', '0.10', 'fraction',
+  ('target_delete_heavy', 'empirical_default', '0.02', 'fraction',
    'Target dead-tuple fraction for the delete_heavy class.',
    'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
   ('target_oltp', 'empirical_default', '0.05', 'fraction',
@@ -1714,13 +1714,13 @@ VALUES
   ('target_mixed', 'empirical_default', '0.05', 'fraction',
    'Target dead-tuple fraction for the mixed class.',
    'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
-  ('target_append_only', 'empirical_default', '0.40', 'fraction',
+  ('target_append_only', 'empirical_default', '0.20', 'fraction',
    'Target dead-tuple fraction for the append_only class.',
    'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
-  ('target_archive', 'empirical_default', '0.50', 'fraction',
+  ('target_archive', 'empirical_default', '0.20', 'fraction',
    'Target dead-tuple fraction for the archive class.',
    'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
-  ('sf_grid', 'empirical_default', '{0.01,0.02,0.05,0.10,0.20,0.30,0.50}', 'fraction set',
+  ('sf_grid', 'empirical_default', '{0.005,0.01,0.02,0.05,0.10,0.20,0.30,0.50}', 'fraction set',
    'Quantization grid the scale-factor target snaps to (snap_sf); the spacing is the anti-oscillation deadband.',
    'MVP estimate — not yet benchmarked', 'maintainer', false, NULL),
   -- Operator policy
