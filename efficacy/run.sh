@@ -240,6 +240,7 @@ effi_run_pgbench_driver() {
     effi_log "Starting pgbench (clients=$PGBENCH_CLIENTS, rate=$PGBENCH_RATE tps)..."
     pgbench "$DATABASE_URL" \
         "${pgbench_args[@]}" \
+        --no-vacuum \
         -c "$PGBENCH_CLIENTS" \
         -j "$PGBENCH_CLIENTS" \
         -T "$DURATION" \
