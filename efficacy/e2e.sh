@@ -10,7 +10,7 @@
 #
 #   E2E_ORG_ID           (required) Supabase org to create the project in
 #   E2E_REGION           us-east-1
-#   E2E_SIZE             nano
+#   E2E_SIZE             micro
 #   E2E_PROJECT_NAME     pgfc-efficacy-<timestamp>
 #   E2E_MAX_RETRIES      3           retries per transient step
 #   E2E_RETRY_DELAY      10          seconds between retries
@@ -38,7 +38,7 @@ source "$SCRIPT_DIR/lib.sh"
 
 ORG_ID="${E2E_ORG_ID:?E2E_ORG_ID is required (run: supabase orgs list)}"
 REGION="${E2E_REGION:-us-east-1}"
-SIZE="${E2E_SIZE:-nano}"
+SIZE="${E2E_SIZE:-micro}"
 PROJECT_NAME="${E2E_PROJECT_NAME:-pgfc-efficacy-$(date -u +%Y%m%dT%H%M%SZ)}"
 MAX_RETRIES="${E2E_MAX_RETRIES:-3}"
 RETRY_DELAY="${E2E_RETRY_DELAY:-10}"
