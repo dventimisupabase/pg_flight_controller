@@ -179,8 +179,9 @@ create_project() {
         --output-format json \
         --yes 2>&1) || { echo "$output" >&2; return 1; }
 
-    local ref
-    ref=$(echo "$output" | jq -r '.id // empty') || true
+    local json_line ref
+    json_line=$(echo "$output" | grep '^{' | head -1)
+    ref=$(echo "$json_line" | jq -r '.id // empty') || true
     if [ -z "$ref" ]; then
         effi_log "FATAL: create succeeded but could not parse project ref from output."
         effi_log "  Raw output (may contain a billable project): $output"
