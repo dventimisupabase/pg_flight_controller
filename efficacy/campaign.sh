@@ -14,9 +14,10 @@
 #   CAMPAIGN_FIXTURES    "oltp"
 #   CAMPAIGN_SCENARIOS   "steady drift"
 #   CAMPAIGN_SEEDS       "1 2 3"
-#   CAMPAIGN_SKIP_ORACLE (set to skip oracle sweeps)
+#   CAMPAIGN_SKIP_ORACLE  (set to skip oracle sweeps)
 #   CAMPAIGN_SKIP_ANALYZE (set to skip analysis phase)
-#   CAMPAIGN_DRY_RUN     (set to print matrix without executing)
+#   CAMPAIGN_ANALYZE_ONLY (set to skip Phase 1 and run only Phase 2/3)
+#   CAMPAIGN_DRY_RUN      (set to print matrix without executing)
 
 set -euo pipefail
 
@@ -36,6 +37,12 @@ read -ra SEEDS     <<< "${CAMPAIGN_SEEDS:-1 2 3}"
 DRY_RUN="${CAMPAIGN_DRY_RUN:-}"
 SKIP_ORACLE="${CAMPAIGN_SKIP_ORACLE:-}"
 SKIP_ANALYZE="${CAMPAIGN_SKIP_ANALYZE:-}"
+ANALYZE_ONLY="${CAMPAIGN_ANALYZE_ONLY:-}"
+
+if [ -n "$ANALYZE_ONLY" ] && [ -n "$SKIP_ANALYZE" ]; then
+    effi_log "WARNING: CAMPAIGN_ANALYZE_ONLY and CAMPAIGN_SKIP_ANALYZE are mutually exclusive; ignoring SKIP_ANALYZE"
+    SKIP_ANALYZE=""
+fi
 
 # --- Source profile ---
 
@@ -70,6 +77,10 @@ effi_log "  Duration:  ${EFFICACY_DURATION:-300}s  Sample: ${EFFICACY_SAMPLE_INT
 # =========================================================================
 # Phase 1: Run trials
 # =========================================================================
+
+if [ -n "$ANALYZE_ONLY" ]; then
+    effi_log "=== Skipping Phase 1 (CAMPAIGN_ANALYZE_ONLY set) ==="
+else
 
 effi_log "=== Phase 1: Run trials ==="
 
@@ -128,6 +139,8 @@ if [ -n "$DRY_RUN" ]; then
     effi_log "=== Dry run complete (no trials executed) ==="
     exit 0
 fi
+
+fi  # end ANALYZE_ONLY guard
 
 # =========================================================================
 # Phase 2: Analyze (per seed)
