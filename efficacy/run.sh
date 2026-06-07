@@ -62,7 +62,7 @@ fi
 # Map fixture name (underscores) to file path component (hyphens).
 FIXTURE_SLUG="${FIXTURE//_/-}"
 
-RUN_ID="$(effi_run_id "$ARM" "$SCENARIO" "$SEED")"
+RUN_ID="$(effi_run_id "$ARM" "$FIXTURE" "$SCENARIO" "$SEED")"
 RESULTS_DIR="$EFFICACY_DIR/results/$RUN_ID"
 
 # =========================================================================
@@ -109,6 +109,22 @@ effi_psql_file "$PROJECT_ROOT/pgfc_observe/install.sql"
 effi_log "Installing pgfc_govern (x2 for idempotency)..."
 effi_psql_file "$PROJECT_ROOT/pgfc_govern/install.sql"
 effi_psql_file "$PROJECT_ROOT/pgfc_govern/install.sql"
+
+effi_log "Resetting govern telemetry (trial isolation)..."
+effi_psql <<'SQL'
+TRUNCATE
+  pgfc_govern.action_history,
+  pgfc_govern.tick_log,
+  pgfc_govern.decision_log,
+  pgfc_govern.diagnostics,
+  pgfc_govern.actuator_state,
+  pgfc_govern.relation_estimate,
+  pgfc_govern.relation_class,
+  pgfc_govern.policy_history,
+  pgfc_govern.governor_state,
+  pgfc_govern.state_transitions
+CASCADE;
+SQL
 
 effi_log "Dropping stale fixture tables..."
 effi_drop_stale_fixtures

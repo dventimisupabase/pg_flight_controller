@@ -62,7 +62,69 @@ effi_driver_log() {
 
 # --- Run ID ---
 
+effi_fixture_slug() {
+    echo "${1//_/-}"
+}
+
 effi_run_id() {
-    local arm="${1:?arm}" scenario="${2:?scenario}" seed="${3:?seed}"
-    printf '%s-%s-s%s-%s' "$arm" "$scenario" "$seed" "$(date -u +%Y%m%dT%H%M%SZ)"
+    local arm="${1:?arm}" fixture="${2:?fixture}" scenario="${3:?scenario}" seed="${4:?seed}"
+    local slug
+    slug="$(effi_fixture_slug "$fixture")"
+    printf '%s-%s-%s-s%s-%s' "$arm" "$slug" "$scenario" "$seed" "$(date -u +%Y%m%dT%H%M%SZ)"
+}
+
+effi_find_run() {
+    local arm="${1:?arm}" fixture="${2:?fixture}" scenario="${3:?scenario}" seed="${4:?seed}"
+    python3 -c "
+import json, os, sys
+
+target = {'arm': sys.argv[1], 'fixture': sys.argv[2],
+          'scenario': sys.argv[3], 'seed': int(sys.argv[4])}
+results = os.path.join(sys.argv[5], 'results')
+best = None
+
+for d in sorted(os.listdir(results), reverse=True) if os.path.isdir(results) else []:
+    meta_path = os.path.join(results, d, 'run_meta.json')
+    if not os.path.isfile(meta_path):
+        continue
+    try:
+        m = json.load(open(meta_path))
+    except (json.JSONDecodeError, OSError):
+        continue
+    if (m.get('arm') == target['arm']
+        and m.get('fixture') == target['fixture']
+        and m.get('scenario') == target['scenario']
+        and int(m.get('seed', -1)) == target['seed']):
+        print(os.path.join(results, d))
+        sys.exit(0)
+
+sys.exit(1)
+" "$arm" "$fixture" "$scenario" "$seed" "$EFFICACY_DIR"
+}
+
+effi_find_oracle() {
+    local fixture="${1:?fixture}" scenario="${2:?scenario}" seed="${3:?seed}"
+    python3 -c "
+import json, os, sys
+
+target = {'fixture': sys.argv[1], 'scenario': sys.argv[2], 'seed': int(sys.argv[3])}
+results = os.path.join(sys.argv[4], 'results')
+
+for d in sorted(os.listdir(results), reverse=True) if os.path.isdir(results) else []:
+    meta_path = os.path.join(results, d, 'run_meta.json')
+    best_path = os.path.join(results, d, 'oracle_best.csv')
+    if not os.path.isfile(meta_path) or not os.path.isfile(best_path):
+        continue
+    try:
+        m = json.load(open(meta_path))
+    except (json.JSONDecodeError, OSError):
+        continue
+    if (m.get('fixture') == target['fixture']
+        and m.get('scenario') == target['scenario']
+        and int(m.get('seed', -1)) == target['seed']):
+        print(os.path.join(results, d))
+        sys.exit(0)
+
+sys.exit(1)
+" "$fixture" "$scenario" "$seed" "$EFFICACY_DIR"
 }
