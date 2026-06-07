@@ -21,9 +21,9 @@ SELECT is(pgfc_govern._sf_grid(),
           ARRAY[0.01,0.02,0.05,0.10,0.20,0.30,0.50]::double precision[],
           '_sf_grid returns the canonical grid as a float8 array');
 
-SELECT is(pgfc_govern._class_target('queue'),   0.05::double precision, '_class_target(queue) = 0.05');
+SELECT is(pgfc_govern._class_target('queue'),   0.02::double precision, '_class_target(queue) = 0.02');
 SELECT is(pgfc_govern._class_target('archive'), 0.50::double precision, '_class_target(archive) = 0.50');
-SELECT is(pgfc_govern._class_target('oltp'),    0.20::double precision, '_class_target(oltp) = 0.20');
+SELECT is(pgfc_govern._class_target('oltp'),    0.05::double precision, '_class_target(oltp) = 0.05');
 
 -- snap_sf still snaps to the (now registry-sourced) grid. Non-equidistant inputs only,
 -- so there is no tie-break ambiguity.

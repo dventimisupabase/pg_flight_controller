@@ -76,9 +76,9 @@ SELECT pgfc_govern.plan(1, (SELECT snapshot_id FROM pgfc_observe.snapshots WHERE
 SELECT is((SELECT decision FROM pgfc_govern.decision_log WHERE relid=92001 ORDER BY decision_id DESC LIMIT 1),
           'adjust', 'queue under lax setting => adjust');
 SELECT is((SELECT proposed_value FROM pgfc_govern.decision_log WHERE relid=92001 ORDER BY decision_id DESC LIMIT 1),
-          '0.05', 'queue adjust proposes sf=0.05');
+          '0.02', 'queue adjust proposes sf=0.02');
 SELECT is((SELECT decision FROM pgfc_govern.decision_log WHERE relid=92002 ORDER BY decision_id DESC LIMIT 1),
-          'hold', 'oltp already at target => hold (no-op)');
+          'adjust', 'oltp at PG default (0.20) with target 0.05 => adjust');
 SELECT is((SELECT decision FROM pgfc_govern.decision_log WHERE relid=92003 ORDER BY decision_id DESC LIMIT 1),
           'escalate:io_limited', 'io_limited => escalate, suppress');
 SELECT is((SELECT decision FROM pgfc_govern.decision_log WHERE relid=92004 ORDER BY decision_id DESC LIMIT 1),
@@ -109,8 +109,8 @@ SELECT is((SELECT decision FROM pgfc_govern.decision_log WHERE relid=92011 ORDER
 -- estimated_benefit (P4): populated for an adjust (the tightening), NULL when nothing changes.
 SELECT ok((SELECT estimated_benefit FROM pgfc_govern.decision_log WHERE relid=92001 ORDER BY decision_id DESC LIMIT 1) IS NOT NULL,
           'adjust records an estimated_benefit');
-SELECT ok((SELECT estimated_benefit FROM pgfc_govern.decision_log WHERE relid=92002 ORDER BY decision_id DESC LIMIT 1) IS NULL,
-          'hold records no estimated_benefit (NULL)');
+SELECT ok((SELECT estimated_benefit FROM pgfc_govern.decision_log WHERE relid=92002 ORDER BY decision_id DESC LIMIT 1) IS NOT NULL,
+          'oltp adjust records an estimated_benefit');
 SELECT ok((SELECT estimated_benefit FROM pgfc_govern.decision_log WHERE relid=92004 ORDER BY decision_id DESC LIMIT 1) IS NULL,
           'suppressed records no estimated_benefit (NULL)');
 
