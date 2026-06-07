@@ -43,7 +43,7 @@ SELECT is((SELECT default_value FROM pgfc_govern._parameter_registry() WHERE par
 SELECT is((SELECT default_value FROM pgfc_govern._parameter_registry() WHERE parameter_name='freeze_thr'),
           '0.6', 'freeze_thr records the as-built value');
 SELECT is((SELECT default_value FROM pgfc_govern._parameter_registry() WHERE parameter_name='target_queue'),
-          '0.05', 'target_queue records the as-built class target');
+          '0.02', 'target_queue records the as-built class target');
 SELECT is((SELECT default_value FROM pgfc_govern._parameter_registry() WHERE parameter_name='sf_grid'),
           '{0.01,0.02,0.05,0.10,0.20,0.30,0.50}', 'sf_grid records the as-built grid');
 
