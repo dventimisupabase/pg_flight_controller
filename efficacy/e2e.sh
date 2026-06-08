@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end efficacy campaign lifecycle.
 #
-# Provisions a Supabase project, configures it, runs the full campaign matrix,
-# verifies results landed on local disk, and tears down the project.
+# Provisions a Supabase project, configures it, runs the campaign (or a single
+# trial), verifies results landed on local disk, and tears down the project.
 #
 #   ./efficacy/e2e.sh
 #
@@ -18,6 +18,8 @@
 #   E2E_SUPABASE_DOMAIN  supabase.green  domain suffix (supabase.green for staging,
 #                                         supabase.com for production)
 #   E2E_WORKER_ID        (internal) worker index, set by e2e-parallel.sh
+#   E2E_SINGLE_TRIAL     (internal) run one trial instead of full campaign
+#   E2E_AUTO_TEARDOWN    1           tear down even on failure (default at scale)
 #
 #   Campaign pass-through (forwarded to campaign.sh):
 #   CAMPAIGN_PROFILE     profiles/smoke.env
@@ -28,6 +30,13 @@
 #   CAMPAIGN_SKIP_ORACLE
 #   CAMPAIGN_SKIP_ANALYZE
 #   CAMPAIGN_DRY_RUN
+#
+#   Single-trial mode (E2E_SINGLE_TRIAL=1):
+#   EFFICACY_ARM          arm name (or oracle-probe)
+#   EFFICACY_FIXTURE      fixture name
+#   EFFICACY_SCENARIO     scenario name
+#   EFFICACY_SEED         seed number
+#   EFFICACY_ORACLE_SF    (oracle probes only) sf value
 
 set -euo pipefail
 
@@ -40,11 +49,27 @@ source "$SCRIPT_DIR/lib.sh"
 ORG_ID="${E2E_ORG_ID:?E2E_ORG_ID is required (run: supabase orgs list)}"
 REGION="${E2E_REGION:-us-east-1}"
 SIZE="${E2E_SIZE:-micro}"
-PROJECT_NAME="${E2E_PROJECT_NAME:-pgfc-efficacy-$(date -u +%Y%m%dT%H%M%SZ)}"
+SINGLE_TRIAL="${E2E_SINGLE_TRIAL:-}"
+
+if [ -n "$SINGLE_TRIAL" ] && [ -z "${E2E_PROJECT_NAME:-}" ]; then
+    _slug="${EFFICACY_FIXTURE:-oltp}"
+    _slug="${_slug//_/-}"
+    if [ "${EFFICACY_ARM:-}" = "oracle-probe" ]; then
+        _sf="${EFFICACY_ORACLE_SF:-0}"
+        _sf="${_sf//./-}"
+        PROJECT_NAME="pgfc-probe-${_slug}-${EFFICACY_SCENARIO:-steady}-s${EFFICACY_SEED:-1}-sf${_sf}"
+    else
+        PROJECT_NAME="pgfc-${EFFICACY_ARM:-trial}-${_slug}-${EFFICACY_SCENARIO:-steady}-s${EFFICACY_SEED:-1}"
+    fi
+    unset _slug _sf
+else
+    PROJECT_NAME="${E2E_PROJECT_NAME:-pgfc-efficacy-$(date -u +%Y%m%dT%H%M%SZ)}"
+fi
 MAX_RETRIES="${E2E_MAX_RETRIES:-3}"
 RETRY_DELAY="${E2E_RETRY_DELAY:-10}"
 READINESS_TIMEOUT="${E2E_READINESS_TIMEOUT:-300}"
 SUPABASE_DOMAIN="${E2E_SUPABASE_DOMAIN:-supabase.green}"
+AUTO_TEARDOWN="${E2E_AUTO_TEARDOWN:-}"
 
 PROFILE="${CAMPAIGN_PROFILE:-$EFFICACY_DIR/profiles/smoke.env}"
 if [ ! -f "$PROFILE" ]; then
@@ -108,7 +133,7 @@ drop_breadcrumb() {
 
 EOF
 
-    if [ -n "$PROJECT_REF" ]; then
+    if [ -n "$PROJECT_REF" ] && [ -z "$AUTO_TEARDOWN" ]; then
         cat >> "$BREADCRUMB_FILE" <<EOF
 1. The Supabase project was NOT deleted (preserved for debugging).
 2. To inspect it: \`supabase inspect db --project-ref $PROJECT_REF\`
@@ -118,6 +143,10 @@ EOF
    DATABASE_URL="<connection string for $PROJECT_REF>" \\
        ./efficacy/campaign.sh
    \`\`\`
+EOF
+    elif [ -n "$PROJECT_REF" ]; then
+        cat >> "$BREADCRUMB_FILE" <<EOF
+1. The project was auto-deleted. Re-run this work unit to retry.
 EOF
     else
         cat >> "$BREADCRUMB_FILE" <<EOF
@@ -131,7 +160,23 @@ EOF
 
 cleanup() {
     local exit_code=$?
-    if [ -n "$CAMPAIGN_SUCCEEDED" ] && [ -n "$PROJECT_REF" ]; then
+    if [ -z "$PROJECT_REF" ]; then
+        return
+    fi
+
+    local should_teardown=""
+    if [ -n "$CAMPAIGN_SUCCEEDED" ]; then
+        should_teardown=1
+    elif [ -n "$AUTO_TEARDOWN" ]; then
+        should_teardown=1
+        if [ -z "$BREADCRUMB_FILE" ] && [ $exit_code -ne 0 ]; then
+            drop_breadcrumb "Unexpected exit (code $exit_code)" "unknown"
+        fi
+    elif [ -z "$BREADCRUMB_FILE" ] && [ $exit_code -ne 0 ]; then
+        drop_breadcrumb "Unexpected exit (code $exit_code)" "unknown"
+    fi
+
+    if [ -n "$should_teardown" ]; then
         effi_log "=== Teardown: deleting project $PROJECT_REF ==="
         if retry "delete project" "$MAX_RETRIES" "$RETRY_DELAY" \
             supabase projects delete "$PROJECT_REF" --yes; then
@@ -140,8 +185,6 @@ cleanup() {
             effi_log "WARNING: failed to delete project $PROJECT_REF — delete manually:"
             effi_log "  supabase projects delete $PROJECT_REF --yes"
         fi
-    elif [ -z "$CAMPAIGN_SUCCEEDED" ] && [ -z "$BREADCRUMB_FILE" ] && [ $exit_code -ne 0 ]; then
-        drop_breadcrumb "Unexpected exit (code $exit_code)" "unknown"
     fi
 }
 
@@ -155,6 +198,9 @@ effi_log "  Region:   $REGION"
 effi_log "  Size:     $SIZE"
 effi_log "  Profile:  $(basename "$PROFILE")"
 effi_log "  Timeout:  ${STATEMENT_TIMEOUT}"
+if [ -n "$SINGLE_TRIAL" ]; then
+    effi_log "  Mode:     single-trial (arm=${EFFICACY_ARM:-?}, fixture=${EFFICACY_FIXTURE:-?}, scenario=${EFFICACY_SCENARIO:-?}, seed=${EFFICACY_SEED:-?})"
+fi
 
 effi_require supabase
 effi_require psql
@@ -265,18 +311,31 @@ if ! psql "$DATABASE_URL" -X -q -c "SHOW statement_timeout;" >/dev/null 2>&1; th
 fi
 
 # =========================================================================
-# Phase 4: Run campaign
+# Phase 4: Run campaign (or single trial)
 # =========================================================================
 
-effi_log "=== Phase 4: Run campaign ==="
+if [ -n "$SINGLE_TRIAL" ]; then
+    effi_log "=== Phase 4: Run single trial (arm=${EFFICACY_ARM:-?}) ==="
 
-run_campaign() {
-    "$SCRIPT_DIR/campaign.sh"
-}
+    run_single_trial() {
+        "$SCRIPT_DIR/run.sh"
+    }
 
-if ! retry "campaign" 2 0 run_campaign; then
-    drop_breadcrumb "Campaign failed after 2 attempts" "campaign"
-    exit 1
+    if ! retry "trial" 2 0 run_single_trial; then
+        drop_breadcrumb "Single trial failed (arm=${EFFICACY_ARM:-?}, fixture=${EFFICACY_FIXTURE:-?}, scenario=${EFFICACY_SCENARIO:-?}, seed=${EFFICACY_SEED:-?})" "trial"
+        exit 1
+    fi
+else
+    effi_log "=== Phase 4: Run campaign ==="
+
+    run_campaign() {
+        "$SCRIPT_DIR/campaign.sh"
+    }
+
+    if ! retry "campaign" 2 0 run_campaign; then
+        drop_breadcrumb "Campaign failed after 2 attempts" "campaign"
+        exit 1
+    fi
 fi
 
 # =========================================================================
@@ -285,35 +344,59 @@ fi
 
 effi_log "=== Phase 5: Verify results ==="
 
-read -ra FIXTURES <<< "${CAMPAIGN_FIXTURES:-oltp}"
-read -ra SCENARIOS <<< "${CAMPAIGN_SCENARIOS:-steady drift}"
-read -ra SEEDS <<< "${CAMPAIGN_SEEDS:-1 2 3}"
-read -ra ARMS <<< "${CAMPAIGN_ARMS:-defaults expert-static pgfc-active}"
+if [ -n "$SINGLE_TRIAL" ]; then
+    arm="${EFFICACY_ARM:-defaults}"
+    fixture="${EFFICACY_FIXTURE:-oltp}"
+    scenario="${EFFICACY_SCENARIO:-steady}"
+    seed="${EFFICACY_SEED:-1}"
 
-verify_ok=1
-for fixture in "${FIXTURES[@]}"; do
-    for scenario in "${SCENARIOS[@]}"; do
-        for seed in "${SEEDS[@]}"; do
-            for arm in "${ARMS[@]}"; do
-                if ! effi_find_run "$arm" "$fixture" "$scenario" "$seed" >/dev/null 2>&1; then
-                    effi_log "  MISSING: $arm / $fixture / $scenario / s$seed"
-                    verify_ok=""
-                fi
+    if [ "$arm" = "oracle-probe" ]; then
+        sf="${EFFICACY_ORACLE_SF:-0}"
+        if effi_find_oracle_probe "$fixture" "$scenario" "$seed" "$sf" >/dev/null 2>&1; then
+            effi_log "  Oracle probe result present (sf=$sf)."
+        else
+            drop_breadcrumb "Oracle probe result missing (sf=$sf)" "verify"
+            exit 1
+        fi
+    else
+        if effi_find_run "$arm" "$fixture" "$scenario" "$seed" >/dev/null 2>&1; then
+            effi_log "  Trial result present."
+        else
+            drop_breadcrumb "Trial result missing ($arm / $fixture / $scenario / s$seed)" "verify"
+            exit 1
+        fi
+    fi
+else
+    read -ra FIXTURES <<< "${CAMPAIGN_FIXTURES:-oltp}"
+    read -ra SCENARIOS <<< "${CAMPAIGN_SCENARIOS:-steady drift}"
+    read -ra SEEDS <<< "${CAMPAIGN_SEEDS:-1 2 3}"
+    read -ra ARMS <<< "${CAMPAIGN_ARMS:-defaults expert-static pgfc-active}"
+
+    verify_ok=1
+    for fixture in "${FIXTURES[@]}"; do
+        for scenario in "${SCENARIOS[@]}"; do
+            for seed in "${SEEDS[@]}"; do
+                for arm in "${ARMS[@]}"; do
+                    if ! effi_find_run "$arm" "$fixture" "$scenario" "$seed" >/dev/null 2>&1; then
+                        effi_log "  MISSING: $arm / $fixture / $scenario / s$seed"
+                        verify_ok=""
+                    fi
+                done
             done
         done
     done
-done
 
-if [ -z "$verify_ok" ]; then
-    drop_breadcrumb "Some trial results missing from local disk — see log above" "verify"
-    exit 1
+    if [ -z "$verify_ok" ]; then
+        drop_breadcrumb "Some trial results missing from local disk — see log above" "verify"
+        exit 1
+    fi
+
+    effi_log "  All trial results present on local disk."
 fi
-
-effi_log "  All trial results present on local disk."
 
 # =========================================================================
 # Phase 6: Success → teardown
 # =========================================================================
 
 CAMPAIGN_SUCCEEDED=1
-effi_log "=== Campaign complete. Project $PROJECT_REF will be deleted on exit. ==="
+effi_log "=== Trial complete. Project $PROJECT_REF will be deleted on exit. ==="

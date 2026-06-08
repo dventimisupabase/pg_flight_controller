@@ -128,3 +128,36 @@ for d in sorted(os.listdir(results), reverse=True) if os.path.isdir(results) els
 sys.exit(1)
 " "$fixture" "$scenario" "$seed" "$EFFICACY_DIR"
 }
+
+effi_find_oracle_probe() {
+    local fixture="${1:?fixture}" scenario="${2:?scenario}" seed="${3:?seed}" sf="${4:?sf}"
+    python3 -c "
+import json, os, sys
+
+target = {'arm': 'oracle-probe', 'fixture': sys.argv[1],
+          'scenario': sys.argv[2], 'seed': int(sys.argv[3]),
+          'oracle_sf': float(sys.argv[4])}
+results = os.path.join(sys.argv[5], 'results')
+
+for d in sorted(os.listdir(results), reverse=True) if os.path.isdir(results) else []:
+    meta_path = os.path.join(results, d, 'run_meta.json')
+    if not os.path.isfile(meta_path):
+        continue
+    try:
+        m = json.load(open(meta_path))
+    except (json.JSONDecodeError, OSError):
+        continue
+    sf_val = m.get('oracle_sf')
+    if sf_val is None:
+        continue
+    if (m.get('arm') == target['arm']
+        and m.get('fixture') == target['fixture']
+        and m.get('scenario') == target['scenario']
+        and int(m.get('seed', -1)) == target['seed']
+        and abs(float(sf_val) - target['oracle_sf']) < 1e-9):
+        print(os.path.join(results, d))
+        sys.exit(0)
+
+sys.exit(1)
+" "$fixture" "$scenario" "$seed" "$sf" "$EFFICACY_DIR"
+}
