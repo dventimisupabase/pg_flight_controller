@@ -348,6 +348,7 @@ cat > "$RESULTS_DIR/run_meta.json" <<EOJSON
   "sample_interval_s": $SAMPLE_INTERVAL,
   "pgbench_clients": $PGBENCH_CLIENTS,
   "pgbench_rate": $PGBENCH_RATE,
+  "oracle_sf": ${EFFICACY_ORACLE_SF:-null},
   "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "autovacuum_freeze_max_age": $(effi_psql -tA -c "SHOW autovacuum_freeze_max_age")
 }

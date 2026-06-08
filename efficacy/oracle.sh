@@ -21,6 +21,10 @@
 #   EFFICACY_PGBENCH_CLIENTS  2
 #   EFFICACY_PGBENCH_RATE     10
 #
+# Aggregate-only mode (skip probe execution, aggregate pre-existing results):
+#
+#   ORACLE_AGGREGATE_ONLY=1 ./efficacy/oracle.sh
+#
 # Contract for increment 5 (analysis):
 #   - p95 is in microseconds (µs), per-window, windows numbered from 0
 #   - window size = EFFICACY_SAMPLE_INTERVAL (must match across arms)
@@ -38,6 +42,7 @@ FIXTURE="${EFFICACY_FIXTURE:-oltp}"
 SCENARIO="${EFFICACY_SCENARIO:-steady}"
 SEED="${EFFICACY_SEED:-1}"
 SAMPLE_INTERVAL="${EFFICACY_SAMPLE_INTERVAL:-30}"
+AGGREGATE_ONLY="${ORACLE_AGGREGATE_ONLY:-}"
 
 SF_GRID=(0.005 0.01 0.02 0.05 0.10 0.20 0.30 0.50)
 
@@ -46,45 +51,62 @@ ORACLE_ID="oracle-${FIXTURE_SLUG}-${SCENARIO}-s${SEED}-$(date -u +%Y%m%dT%H%M%SZ
 ORACLE_DIR="$EFFICACY_DIR/results/$ORACLE_ID"
 mkdir -p "$ORACLE_DIR"
 
-# --- Validate ---
-
-if [ -z "${DATABASE_URL:-}" ]; then
-    effi_log "ERROR: DATABASE_URL is not set"
-    exit 1
-fi
-
-effi_log "=== Oracle sweep: ${#SF_GRID[@]} probes (fixture=$FIXTURE, scenario=$SCENARIO, seed=$SEED) ==="
-
 # =========================================================================
-# Phase 1: Run one probe per grid value
+# Phase 1: Run one probe per grid value (or discover pre-existing probes)
 # =========================================================================
 
 PROBE_RUNS=()    # (sf run_id) pairs
 
-for sf in "${SF_GRID[@]}"; do
-    effi_log "--- Probe sf=$sf ---"
+if [ -n "$AGGREGATE_ONLY" ]; then
+    effi_log "=== Oracle aggregate-only: discovering probes (fixture=$FIXTURE, scenario=$SCENARIO, seed=$SEED) ==="
 
-    # Capture the run_id by reading run.sh's output directory.
-    # run.sh creates $EFFICACY_DIR/results/<run_id>/ and prints the path.
-    EFFICACY_ARM="oracle-probe" \
-    EFFICACY_ARM_SCRIPT="$EFFICACY_DIR/config/arm-oracle-probe.sql" \
-    EFFICACY_ORACLE_SF="$sf" \
-    EFFICACY_FIXTURE="$FIXTURE" \
-    EFFICACY_SCENARIO="$SCENARIO" \
-    EFFICACY_SEED="$SEED" \
-        "$SCRIPT_DIR/run.sh" 2>&1 | tee "$ORACLE_DIR/probe-${sf}.log"
+    missing=()
+    for sf in "${SF_GRID[@]}"; do
+        if probe_dir=$(effi_find_oracle_probe "$FIXTURE" "$SCENARIO" "$SEED" "$sf" 2>/dev/null); then
+            run_id=$(basename "$probe_dir")
+            PROBE_RUNS+=("$sf $run_id")
+            effi_log "  Found probe sf=$sf: $run_id"
+        else
+            missing+=("$sf")
+        fi
+    done
 
-    # Extract the result directory from run.sh's log output.
-    RUN_DIR=$(sed -n 's/.*Results in \(.*\) ===.*/\1/p' "$ORACLE_DIR/probe-${sf}.log" | tail -1)
-    if [ -z "$RUN_DIR" ] || [ ! -d "$RUN_DIR" ]; then
-        effi_log "ERROR: no result directory found for probe sf=$sf"
+    if [ ${#missing[@]} -gt 0 ]; then
+        effi_log "ERROR: missing probes for sf values: ${missing[*]}"
         exit 1
     fi
-    RUN_ID=$(basename "$RUN_DIR")
+else
+    # --- Validate ---
 
-    PROBE_RUNS+=("$sf $RUN_ID")
-    effi_log "Probe sf=$sf complete: $RUN_ID"
-done
+    if [ -z "${DATABASE_URL:-}" ]; then
+        effi_log "ERROR: DATABASE_URL is not set"
+        exit 1
+    fi
+
+    effi_log "=== Oracle sweep: ${#SF_GRID[@]} probes (fixture=$FIXTURE, scenario=$SCENARIO, seed=$SEED) ==="
+
+    for sf in "${SF_GRID[@]}"; do
+        effi_log "--- Probe sf=$sf ---"
+
+        EFFICACY_ARM="oracle-probe" \
+        EFFICACY_ARM_SCRIPT="$EFFICACY_DIR/config/arm-oracle-probe.sql" \
+        EFFICACY_ORACLE_SF="$sf" \
+        EFFICACY_FIXTURE="$FIXTURE" \
+        EFFICACY_SCENARIO="$SCENARIO" \
+        EFFICACY_SEED="$SEED" \
+            "$SCRIPT_DIR/run.sh" 2>&1 | tee "$ORACLE_DIR/probe-${sf}.log"
+
+        RUN_DIR=$(sed -n 's/.*Results in \(.*\) ===.*/\1/p' "$ORACLE_DIR/probe-${sf}.log" | tail -1)
+        if [ -z "$RUN_DIR" ] || [ ! -d "$RUN_DIR" ]; then
+            effi_log "ERROR: no result directory found for probe sf=$sf"
+            exit 1
+        fi
+        RUN_ID=$(basename "$RUN_DIR")
+
+        PROBE_RUNS+=("$sf $RUN_ID")
+        effi_log "Probe sf=$sf complete: $RUN_ID"
+    done
+fi
 
 # =========================================================================
 # Phase 2: Compute per-window p95 from each probe
