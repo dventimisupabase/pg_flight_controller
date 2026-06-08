@@ -78,7 +78,7 @@ SELECT is((SELECT decision FROM pgfc_govern.decision_log WHERE relid=92001 ORDER
 SELECT is((SELECT proposed_value FROM pgfc_govern.decision_log WHERE relid=92001 ORDER BY decision_id DESC LIMIT 1),
           '0.02', 'queue adjust proposes sf=0.02');
 SELECT is((SELECT decision FROM pgfc_govern.decision_log WHERE relid=92002 ORDER BY decision_id DESC LIMIT 1),
-          'adjust', 'oltp at PG default (0.20) with target 0.05 => adjust');
+          'adjust', 'oltp at PG default (0.20) with target 0.02 => adjust');
 SELECT is((SELECT decision FROM pgfc_govern.decision_log WHERE relid=92003 ORDER BY decision_id DESC LIMIT 1),
           'escalate:io_limited', 'io_limited => escalate, suppress');
 SELECT is((SELECT decision FROM pgfc_govern.decision_log WHERE relid=92004 ORDER BY decision_id DESC LIMIT 1),
@@ -92,11 +92,11 @@ SELECT is((SELECT proposed_value FROM pgfc_govern.decision_log WHERE relid=92006
 
 -- COR-001 (#66): the ownership guard must distinguish governor-set from user-set.
 -- 92009 carries a reloption the governor itself set and nobody has changed since, so the
--- governor must keep controlling it (here: refine 0.1 -> 0.05), NOT freeze itself out as
+-- governor must keep controlling it (here: refine 0.1 -> 0.02), NOT freeze itself out as
 -- 'suppressed:user_owned'. This is the regression that fails on the pre-fix code.
 SELECT is((SELECT decision FROM pgfc_govern.decision_log WHERE relid=92009 ORDER BY decision_id DESC LIMIT 1),
           'adjust', 'governor recognizes its own prior actuation and keeps controlling (not suppressed:user_owned)');
--- 92010 carries a value a human set AFTER the governor's touch (live 0.3 != governor 0.05),
+-- 92010 carries a value a human set AFTER the governor's touch (live 0.3 != governor 0.02),
 -- so it IS protected under manage_user_owned=false. Guards against an over-correction that
 -- would treat every governor-touched relation as fair game.
 SELECT is((SELECT decision FROM pgfc_govern.decision_log WHERE relid=92010 ORDER BY decision_id DESC LIMIT 1),
