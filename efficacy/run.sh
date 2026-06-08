@@ -21,7 +21,8 @@
 #   EFFICACY_SCENARIO         steady
 #   EFFICACY_SEED             1
 #   EFFICACY_PRELOAD_ROWS     (per-fixture default; override with caution)
-#   EFFICACY_DURATION         300       (seconds)
+#   EFFICACY_DURATION         300       (seconds; used for pgfc-active arm)
+#   EFFICACY_STATIC_DURATION  900       (seconds; used for static arms)
 #   EFFICACY_SAMPLE_INTERVAL  30        (seconds)
 #   EFFICACY_PGBENCH_CLIENTS  2
 #   EFFICACY_PGBENCH_RATE     10        (tps)
@@ -38,10 +39,20 @@ ARM="${EFFICACY_ARM:-defaults}"
 FIXTURE="${EFFICACY_FIXTURE:-oltp}"
 SCENARIO="${EFFICACY_SCENARIO:-steady}"
 SEED="${EFFICACY_SEED:-1}"
-DURATION="${EFFICACY_DURATION:-300}"
+FULL_DURATION="${EFFICACY_DURATION:-300}"
+STATIC_DURATION="${EFFICACY_STATIC_DURATION:-900}"
 SAMPLE_INTERVAL="${EFFICACY_SAMPLE_INTERVAL:-30}"
 PGBENCH_CLIENTS="${EFFICACY_PGBENCH_CLIENTS:-2}"
 PGBENCH_RATE="${EFFICACY_PGBENCH_RATE:-10}"
+
+# Only pgfc-active needs the full duration (governor cadence: observe 60s,
+# control 240s, classification hysteresis 720s, min_interval 3600s).
+# Static arms just need enough time for the metric to stabilize.
+if [ "$ARM" = "pgfc-active" ]; then
+    DURATION="$FULL_DURATION"
+else
+    DURATION="${STATIC_DURATION}"
+fi
 
 # Per-fixture preload defaults (Phase 3 specs).
 case "$FIXTURE" in
