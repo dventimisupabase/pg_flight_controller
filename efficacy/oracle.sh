@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Oracle computation (Phase 6, increment 4).
 #
-# Runs the workload 7 times — once per snap_sf grid value — then selects
+# Runs the workload 8 times — once per snap_sf grid value — then selects
 # the per-window best p95 latency.  The oracle score for each window is
 # the minimum p95 across all probes: the foreknowledge-optimal schedule.
 #
@@ -39,7 +39,7 @@ SCENARIO="${EFFICACY_SCENARIO:-steady}"
 SEED="${EFFICACY_SEED:-1}"
 SAMPLE_INTERVAL="${EFFICACY_SAMPLE_INTERVAL:-30}"
 
-SF_GRID=(0.01 0.02 0.05 0.10 0.20 0.30 0.50)
+SF_GRID=(0.005 0.01 0.02 0.05 0.10 0.20 0.30 0.50)
 
 FIXTURE_SLUG="$(effi_fixture_slug "$FIXTURE")"
 ORACLE_ID="oracle-${FIXTURE_SLUG}-${SCENARIO}-s${SEED}-$(date -u +%Y%m%dT%H%M%SZ)"

@@ -72,7 +72,7 @@ effi_log "  Arms:      ${ARMS[*]}"
 effi_log "  Fixtures:  ${FIXTURES[*]}"
 effi_log "  Scenarios: ${SCENARIOS[*]}"
 effi_log "  Seeds:     ${SEEDS[*]}"
-effi_log "  Duration:  ${EFFICACY_DURATION:-300}s  Sample: ${EFFICACY_SAMPLE_INTERVAL:-30}s  Rate: ${EFFICACY_PGBENCH_RATE:-10} tps"
+effi_log "  Duration:  active=${EFFICACY_DURATION:-300}s  static=${EFFICACY_STATIC_DURATION:-900}s  Sample: ${EFFICACY_SAMPLE_INTERVAL:-30}s  Rate: ${EFFICACY_PGBENCH_RATE:-10} tps"
 
 # =========================================================================
 # Phase 1: Run trials
