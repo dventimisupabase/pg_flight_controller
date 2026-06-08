@@ -16,7 +16,7 @@ SELECT is((SELECT count(*) FROM pgfc_govern.relation_estimate
             WHERE relid = 'public.loop_t'::regclass),
           1::bigint, 'estimate() produced a row for loop_t');
 
--- Force a non-trivial target: classify loop_t as queue (f* = 0.02 vs oltp 0.05).
+-- Force a non-trivial target: classify loop_t as queue (f* = 0.02).
 UPDATE pgfc_govern.relation_class SET kind = 'queue' WHERE relid = 'public.loop_t'::regclass;
 
 -- Control loop, advisory (default): plans, never applies.
